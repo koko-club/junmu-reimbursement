@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import secrets
 import stat
+import tempfile
 import time
 
 
@@ -16,6 +17,7 @@ _SECRET_LENGTH = 32
 _SALT_LENGTH = 16
 _DIGEST_LENGTH = 32
 _SECRET_READ_ATTEMPTS = 100
+_MAX_SCRYPT_MEMORY = 64 * 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -76,10 +78,11 @@ class PasswordHasher:
             or type(r) is not int
             or type(p) is not int
             or n < 2
-            or n > 65536
             or n & (n - 1)
-            or not 1 <= r <= 32
-            or not 1 <= p <= 16
+            or r <= 0
+            or p <= 0
+            or 128 * n * r > _MAX_SCRYPT_MEMORY
+            or r * p >= 2**30
         ):
             raise ValueError("invalid scrypt parameters")
         return {"n": n, "r": r, "p": p}
@@ -93,6 +96,7 @@ class PasswordHasher:
             r=params["r"],
             p=params["p"],
             dklen=_DIGEST_LENGTH,
+            maxmem=_MAX_SCRYPT_MEMORY,
         )
 
 
@@ -100,35 +104,42 @@ def load_or_create_secret(path: str | os.PathLike[str]) -> bytes:
     """Return a 32-byte secret created once at *path* with owner-only access."""
     secret_path = Path(path)
     secret_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    create_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
 
     while True:
         try:
-            descriptor = os.open(secret_path, create_flags, 0o600)
-        except FileExistsError:
-            try:
-                return _read_complete_secret(secret_path)
-            except FileNotFoundError:
-                # The winning creator failed and removed its partial file.
-                continue
+            return _read_complete_secret(secret_path)
+        except FileNotFoundError:
+            pass
 
-        completed = False
+        descriptor = None
+        temporary_path = None
         try:
-            secret = secrets.token_bytes(_SECRET_LENGTH)
+            descriptor, temporary_name = tempfile.mkstemp(
+                prefix=f".{secret_path.name}.",
+                suffix=".tmp",
+                dir=secret_path.parent,
+            )
+            temporary_path = Path(temporary_name)
             os.fchmod(descriptor, 0o600)
+            secret = secrets.token_bytes(_SECRET_LENGTH)
             _write_all(descriptor, secret)
             os.fsync(descriptor)
-            completed = True
-        finally:
+            os.close(descriptor)
+            descriptor = None
             try:
-                os.close(descriptor)
-            except BaseException:
-                if completed:
-                    _remove_created_secret(secret_path)
-                    raise
-            if not completed:
-                _remove_created_secret(secret_path)
-        return secret
+                os.link(temporary_path, secret_path)
+            except FileExistsError:
+                return _read_complete_secret(secret_path)
+            _fsync_directory(secret_path.parent)
+            return secret
+        finally:
+            if descriptor is not None:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+            if temporary_path is not None:
+                _remove_created_secret(temporary_path)
 
 
 def _write_all(descriptor: int, data: bytes) -> None:
@@ -147,8 +158,21 @@ def _remove_created_secret(path: Path) -> None:
         pass
 
 
+def _fsync_directory(directory: Path) -> None:
+    flags = os.O_RDONLY
+    if hasattr(os, "O_DIRECTORY"):
+        flags |= os.O_DIRECTORY
+    descriptor = os.open(directory, flags)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
 def _read_complete_secret(path: Path) -> bytes:
     read_flags = os.O_RDONLY
+    if hasattr(os, "O_NONBLOCK"):
+        read_flags |= os.O_NONBLOCK
     if hasattr(os, "O_NOFOLLOW"):
         read_flags |= os.O_NOFOLLOW
 

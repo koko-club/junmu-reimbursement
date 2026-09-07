@@ -5,6 +5,7 @@ from pathlib import Path
 import stat
 import sys
 import tempfile
+import threading
 import unittest
 from unittest import mock
 
@@ -59,6 +60,24 @@ class PasswordHasherTest(unittest.TestCase):
 
         self.assertTrue(PasswordHasher().verify("correct horse battery staple", material))
 
+    def test_scrypt_allows_budgeted_work_factor_with_explicit_memory_limit(self):
+        hasher = PasswordHasher(n=32768, r=8, p=1)
+
+        material = hasher.hash("correct horse battery staple")
+
+        self.assertTrue(hasher.verify("correct horse battery staple", material))
+
+    def test_scrypt_rejects_parameters_over_memory_budget_in_hash_and_verify(self):
+        with self.assertRaises(ValueError):
+            PasswordHasher(n=65536, r=9, p=1)
+
+        material = PasswordMaterial(
+            digest=b"d" * 32,
+            salt=b"s" * 16,
+            params='{"n":65536,"r":9,"p":1}',
+        )
+        self.assertFalse(PasswordHasher().verify("correct horse battery staple", material))
+
 
 class SecretFileTest(unittest.TestCase):
     def test_secret_is_reused_and_is_private_to_owner(self):
@@ -93,6 +112,73 @@ class SecretFileTest(unittest.TestCase):
 
             self.assertFalse(path.exists())
             close.assert_called_once()
+
+    def test_second_creator_does_not_read_first_secret_before_it_is_committed(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "state" / "secret.bin"
+            first_fsync_started = threading.Event()
+            release_first_fsync = threading.Event()
+            fsync_calls = 0
+            fsync_lock = threading.Lock()
+            original_fsync = os.fsync
+            generated_secrets = iter((b"a" * 32, b"b" * 32))
+
+            def pause_first_fsync(descriptor):
+                nonlocal fsync_calls
+                with fsync_lock:
+                    fsync_calls += 1
+                    call_number = fsync_calls
+                if call_number == 1:
+                    first_fsync_started.set()
+                    self.assertTrue(release_first_fsync.wait(timeout=2))
+                return original_fsync(descriptor)
+
+            with mock.patch("security.secrets.token_bytes", side_effect=lambda _: next(generated_secrets)), \
+                 mock.patch("security.os.fsync", side_effect=pause_first_fsync):
+                with ThreadPoolExecutor(max_workers=2) as executor:
+                    first = executor.submit(load_or_create_secret, path)
+                    self.assertTrue(first_fsync_started.wait(timeout=2))
+                    second = executor.submit(load_or_create_secret, path)
+                    self.assertEqual(second.result(timeout=2), b"b" * 32)
+                    self.assertFalse(first.done())
+                    release_first_fsync.set()
+                    self.assertEqual(first.result(timeout=2), b"b" * 32)
+
+    def test_directory_fsync_failure_preserves_published_secret_for_retry(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "state" / "secret.bin"
+            generated_secrets = iter((b"a" * 32, b"b" * 32))
+
+            with mock.patch("security.secrets.token_bytes", side_effect=lambda _: next(generated_secrets)) as token_bytes:
+                with mock.patch("security._fsync_directory", side_effect=OSError("directory sync failed")):
+                    with self.assertRaisesRegex(OSError, "directory sync failed"):
+                        load_or_create_secret(path)
+
+                self.assertEqual(path.read_bytes(), b"a" * 32)
+                self.assertEqual(load_or_create_secret(path), b"a" * 32)
+
+            token_bytes.assert_called_once_with(32)
+
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "FIFO is not supported on this platform")
+    def test_existing_fifo_is_rejected_without_blocking(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "secret.fifo"
+            os.mkfifo(path, 0o600)
+            finished = threading.Event()
+            captured = []
+
+            def read_fifo():
+                try:
+                    load_or_create_secret(path)
+                except BaseException as error:
+                    captured.append(error)
+                finally:
+                    finished.set()
+
+            thread = threading.Thread(target=read_fifo, daemon=True)
+            thread.start()
+            self.assertTrue(finished.wait(timeout=0.5))
+            self.assertIsInstance(captured[0], ValueError)
 
 
 class AnonymousCsrfSignerTest(unittest.TestCase):
