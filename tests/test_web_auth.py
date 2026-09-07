@@ -1,0 +1,364 @@
+from __future__ import annotations
+
+import unittest
+from unittest import mock
+
+from tests.http_helpers import RunningApp
+
+
+ADMIN_PASSWORD = "administrator1"
+USER_PASSWORD = "correct horse battery staple"
+
+
+class WebAuthenticationTest(unittest.TestCase):
+    def setUp(self):
+        self.running = RunningApp().__enter__()
+        self.client = self.running.client
+
+    def tearDown(self):
+        self.running.__exit__(None, None, None)
+
+    def setup_admin(self):
+        return self.client.post_json(
+            "/api/setup",
+            {
+                "username": "admin",
+                "password": ADMIN_PASSWORD,
+                "real_name": "管理员",
+                "department": "财务部",
+            },
+        )
+
+    def register(self, username="alice", password=USER_PASSWORD):
+        return self.client.post_json(
+            "/api/register",
+            {
+                "username": username,
+                "password": password,
+                "real_name": "张三",
+                "department": "技术部",
+            },
+        )
+
+    def approve_user(self, username="alice"):
+        admin = self.running.users.authenticate("admin", ADMIN_PASSWORD)
+        pending = next(user for user in self.running.users.list_pending(admin.id) if user.username == username)
+        return self.running.users.approve(admin.id, pending.id)
+
+    def test_uninitialized_app_allows_only_setup_health_and_static(self):
+        self.assertEqual(self.client.get("/healthz").status, 200)
+        self.assertEqual(self.client.get("/setup").status, 200)
+        self.assertEqual(self.client.get("/static/app.js").status, 200)
+        for path in ("/", "/login", "/register", "/change-password"):
+            with self.subTest(path=path):
+                response = self.client.get(path, follow_redirects=False)
+                self.assertEqual(response.status, 303)
+                self.assertEqual(response.headers["Location"], "/setup")
+        self.assertEqual(self.client.get("/api/session").status, 403)
+
+    def test_anonymous_csrf_is_required_and_bound_to_each_action(self):
+        missing = self.client.post_json(
+            "/api/setup",
+            {"username": "admin", "password": ADMIN_PASSWORD, "real_name": "A", "department": "D"},
+            csrf=False,
+        )
+        self.assertEqual(missing.status, 403)
+        setup_token = self.client.csrf_for("/api/setup")
+        completed = self.client.post_json(
+            "/api/setup",
+            {"username": "admin", "password": ADMIN_PASSWORD, "real_name": "A", "department": "D"},
+            csrf=setup_token,
+        )
+        self.assertEqual(completed.status, 201)
+
+        login_token = self.client.csrf_for("/api/login")
+        bound = self.client.post_json(
+            "/api/register",
+            {"username": "alice", "password": USER_PASSWORD, "real_name": "A", "department": "D"},
+            csrf=login_token,
+        )
+        self.assertEqual(bound.status, 403)
+        self.assertEqual(self.client.post_json(
+            "/api/login", {"username": "admin", "password": ADMIN_PASSWORD}, csrf=False
+        ).status, 403)
+        self.assertEqual(self.register().status, 201)
+
+    def test_setup_closes_after_first_admin(self):
+        token = self.client.csrf_for("/api/setup")
+        self.assertEqual(self.setup_admin().status, 201)
+        page = self.client.get("/setup", follow_redirects=False)
+        self.assertEqual((page.status, page.headers["Location"]), (303, "/login"))
+        second = self.client.post_json(
+            "/api/setup",
+            {"username": "other", "password": ADMIN_PASSWORD, "real_name": "B", "department": "D"},
+            csrf=token,
+        )
+        self.assertEqual(second.status, 403)
+
+    def test_login_cookie_attributes_and_new_login_replaces_old_session(self):
+        self.setup_admin()
+        first = self.client.post_json(
+            "/api/login", {"username": "admin", "password": ADMIN_PASSWORD}
+        )
+        self.assertEqual(first.status, 200)
+        cookie = first.headers["Set-Cookie"]
+        for attribute in (
+            "reimbursement_session=", "HttpOnly", "SameSite=Lax", "Path=/", "Max-Age=604800"
+        ):
+            self.assertIn(attribute, cookie)
+        self.assertNotIn("Secure", cookie)
+        self.assertEqual(self.client.get("/api/session").status, 200)
+
+        second_client = self.running.new_client()
+        self.assertEqual(second_client.post_json(
+            "/api/login", {"username": "admin", "password": ADMIN_PASSWORD}
+        ).status, 200)
+        self.assertEqual(self.client.get("/api/session").status, 401)
+        self.assertEqual(second_client.get("/api/session").status, 200)
+
+    def test_secure_cookie_is_only_enabled_by_configuration(self):
+        self.running.__exit__(None, None, None)
+        self.running = RunningApp(cookie_secure=True).__enter__()
+        self.client = self.running.client
+        self.setup_admin()
+        response = self.client.post_json(
+            "/api/login", {"username": "admin", "password": ADMIN_PASSWORD}
+        )
+        self.assertIn("Secure", response.headers["Set-Cookie"])
+
+    def test_pending_disabled_and_unknown_accounts_share_login_error(self):
+        self.setup_admin()
+        registration_client = self.running.new_client()
+        registration_client.post_json(
+            "/api/register",
+            {
+                "username": "alice",
+                "password": USER_PASSWORD,
+                "real_name": "张三",
+                "department": "技术部",
+            },
+        )
+        pending = self.client.post_json(
+            "/api/login", {"username": "alice", "password": USER_PASSWORD}
+        )
+        approved = self.approve_user()
+        admin = self.running.users.authenticate("admin", ADMIN_PASSWORD)
+        self.running.users.set_enabled(admin.id, approved.id, False)
+        disabled = self.client.post_json(
+            "/api/login", {"username": "alice", "password": USER_PASSWORD}
+        )
+        unknown = self.client.post_json(
+            "/api/login", {"username": "nobody", "password": USER_PASSWORD}
+        )
+        self.assertEqual((pending.status, disabled.status, unknown.status), (401, 401, 401))
+        self.assertEqual(pending.body, disabled.body)
+        self.assertEqual(disabled.body, unknown.body)
+        self.assertNotIn(b"pending", pending.body.lower())
+        self.assertNotIn(b"disabled", disabled.body.lower())
+
+    def test_session_json_has_profile_and_csrf_without_security_versions(self):
+        self.setup_admin()
+        self.client.post_json("/api/login", {"username": "admin", "password": ADMIN_PASSWORD})
+        response = self.client.get("/api/session")
+        self.assertEqual(response.status, 200)
+        payload = response.json()
+        self.assertEqual(
+            set(payload["user"]),
+            {"id", "username", "real_name", "department", "role", "must_change_password"},
+        )
+        self.assertTrue(payload["csrf_token"])
+        serialized = response.body.lower()
+        for forbidden in (b"password_version", b"status_version", b"password_hash", b"password_salt"):
+            self.assertNotIn(forbidden, serialized)
+
+    def test_forced_change_session_is_restricted(self):
+        self.setup_admin()
+        self.register()
+        approved = self.approve_user()
+        admin = self.running.users.authenticate("admin", ADMIN_PASSWORD)
+        temporary_password = self.running.users.reset_password(admin.id, approved.id)
+        self.assertEqual(self.client.post_json(
+            "/api/login", {"username": "alice", "password": temporary_password}
+        ).status, 200)
+        self.assertEqual(self.client.get("/api/session").status, 200)
+        self.assertEqual(self.client.get("/change-password").status, 200)
+        root = self.client.get("/", follow_redirects=False)
+        self.assertEqual((root.status, root.headers["Location"]), (303, "/change-password"))
+        self.assertEqual(self.client.get("/api/admin/users").status, 403)
+
+    def test_change_password_requires_csrf_clears_cookie_and_revokes_session(self):
+        self.setup_admin()
+        self.register()
+        approved = self.approve_user()
+        admin = self.running.users.authenticate("admin", ADMIN_PASSWORD)
+        temporary_password = self.running.users.reset_password(admin.id, approved.id)
+        self.client.post_json("/api/login", {"username": "alice", "password": temporary_password})
+
+        denied = self.client.post_json(
+            "/api/password/change",
+            {"current_password": temporary_password, "new_password": "replacement password"},
+            csrf=False,
+        )
+        self.assertEqual(denied.status, 403)
+        response = self.client.post_json(
+            "/api/password/change",
+            {"current_password": temporary_password, "new_password": "replacement password"},
+        )
+        self.assertEqual(response.status, 200)
+        self.assertEqual(response.json()["next"], "/login")
+        self.assertIn("Max-Age=0", response.headers["Set-Cookie"])
+        self.assertEqual(self.client.get("/api/session").status, 401)
+
+    def test_logout_requires_session_csrf_and_clears_cookie(self):
+        self.setup_admin()
+        self.client.post_json("/api/login", {"username": "admin", "password": ADMIN_PASSWORD})
+        self.assertEqual(self.client.post_json("/api/logout", {}, csrf=False).status, 403)
+        response = self.client.post_json("/api/logout", {})
+        self.assertEqual(response.status, 200)
+        self.assertIn("Max-Age=0", response.headers["Set-Cookie"])
+        self.assertEqual(self.client.get("/api/session").status, 401)
+
+    def test_html_redirects_follow_roles(self):
+        self.setup_admin()
+        admin_login = self.client.post_json(
+            "/api/login", {"username": "admin", "password": ADMIN_PASSWORD}
+        )
+        self.assertEqual(admin_login.json()["next"], "/admin")
+        self.assertEqual(self.client.get("/", follow_redirects=False).headers["Location"], "/admin")
+        self.assertEqual(self.client.get("/login", follow_redirects=False).headers["Location"], "/admin")
+
+        registration_client = self.running.new_client()
+        registration_client.post_json(
+            "/api/register",
+            {
+                "username": "alice",
+                "password": USER_PASSWORD,
+                "real_name": "张三",
+                "department": "技术部",
+            },
+        )
+        self.approve_user()
+        user_client = self.running.new_client()
+        user_login = user_client.post_json(
+            "/api/login", {"username": "alice", "password": USER_PASSWORD}
+        )
+        self.assertEqual(user_login.json()["next"], "/")
+        self.assertEqual(user_client.get("/").status, 200)
+        self.assertEqual(user_client.get("/login", follow_redirects=False).headers["Location"], "/")
+
+    def test_json_parsing_rejects_size_content_type_syntax_and_non_objects(self):
+        self.setup_admin()
+        login_token = self.client.csrf_for("/api/login")
+        common = [("X-CSRF-Token", login_token)]
+        too_large = self.client.raw_request(
+            "POST",
+            "/api/login",
+            headers=common + [
+                ("Content-Type", "application/json"),
+                ("Content-Length", str(self.running.max_body_bytes + 1)),
+            ],
+        )
+        self.assertEqual(too_large.status, 413)
+        for headers in (common + [("Content-Type", "application/json")],
+                        common + [("Content-Type", "application/json"), ("Content-Length", "invalid")],
+                        common + [("Content-Type", "application/json"), ("Content-Length", "-1")],
+                        common + [("Content-Type", "application/json"), ("Content-Length", "9" * 5000)]):
+            with self.subTest(headers=headers):
+                self.assertEqual(self.client.raw_request("POST", "/api/login", headers=headers).status, 400)
+        ambiguous_lengths = (
+            common + [("Content-Type", "application/json"), ("Content-Length", "+2")],
+            common + [("Content-Type", "application/json"), ("Content-Length", "2"), ("Content-Length", "3")],
+            common + [
+                ("Content-Type", "application/json"),
+                ("Content-Length", "2"),
+                ("Transfer-Encoding", "chunked"),
+            ],
+        )
+        for headers in ambiguous_lengths:
+            with self.subTest(headers=headers):
+                self.assertEqual(
+                    self.client.raw_request("POST", "/api/login", body=b"{}", headers=headers).status,
+                    400,
+                )
+
+        malformed = self.client.request(
+            "POST", "/api/login", body=b"{bad", headers={"Content-Type": "application/json", "X-CSRF-Token": login_token}
+        )
+        non_object = self.client.post_json("/api/login", ["admin", ADMIN_PASSWORD], csrf=login_token)
+        wrong_type = self.client.request(
+            "POST", "/api/login", body=b"{}", headers={"Content-Type": "text/plain", "X-CSRF-Token": login_token}
+        )
+        self.assertEqual(malformed.status, 400)
+        self.assertEqual(non_object.status, 400)
+        self.assertEqual(wrong_type.status, 415)
+        self.assertNotIn(b"traceback", malformed.body.lower())
+
+        self.client.post_json("/api/login", {"username": "admin", "password": ADMIN_PASSWORD})
+        session_csrf = self.client.get("/api/session").json()["csrf_token"]
+        oversized_logout = self.client.raw_request(
+            "POST",
+            "/api/logout",
+            headers=[
+                ("Content-Type", "application/json"),
+                ("Content-Length", str(self.running.max_body_bytes + 1)),
+                ("X-CSRF-Token", session_csrf),
+            ],
+        )
+        self.assertEqual(oversized_logout.status, 413)
+
+    def test_static_traversal_encoded_traversal_and_symlink_escape_are_rejected(self):
+        secret = self.running.root / "secret.js"
+        secret.write_text("secret", encoding="utf-8")
+        (self.running.static_dir / "escape.js").symlink_to(secret)
+        for path in (
+            "/static/../secret.js",
+            "/static/%2e%2e/secret.js",
+            "/static/%252e%252e/secret.js",
+            "/static/escape.js",
+        ):
+            with self.subTest(path=path):
+                self.assertEqual(self.client.get(path).status, 404)
+
+    def test_method_unknown_route_and_security_headers(self):
+        self.assertEqual(self.client.get("/api/setup").status, 405)
+        self.assertEqual(self.client.request("POST", "/healthz", body=b"").status, 405)
+        unsupported = self.client.request("PUT", "/login", body=b"")
+        self.assertEqual(unsupported.status, 405)
+        self.assertEqual(unsupported.headers["Content-Type"], "application/json; charset=utf-8")
+        trace = self.client.request("TRACE", "/login")
+        self.assertEqual(trace.status, 405)
+        self.assertEqual(trace.headers["Content-Type"], "application/json; charset=utf-8")
+        head = self.client.request("HEAD", "/login")
+        self.assertEqual(head.status, 405)
+        self.assertEqual(head.body, b"")
+        self.assertEqual(self.client.get("/does-not-exist").status, 404)
+        self.setup_admin()
+        login = self.client.get("/login")
+        self.assertEqual(login.headers["Cache-Control"], "no-store")
+        self.assertEqual(login.headers["X-Content-Type-Options"], "nosniff")
+        self.client.post_json("/api/login", {"username": "admin", "password": ADMIN_PASSWORD})
+        session = self.client.get("/api/session")
+        self.assertEqual(session.headers["Cache-Control"], "no-store")
+        self.assertEqual(session.headers["X-Content-Type-Options"], "nosniff")
+
+    def test_guard_failures_return_stable_json_without_internal_details(self):
+        with self.assertLogs("web", level="ERROR"):
+            with mock.patch.object(
+                self.running.server.application.user_service,
+                "setup_complete",
+                side_effect=RuntimeError("private database detail"),
+            ):
+                response = self.client.get("/login")
+        self.assertEqual(response.status, 500)
+        self.assertEqual(response.headers["Content-Type"], "application/json; charset=utf-8")
+        self.assertNotIn(b"private database detail", response.body)
+
+    def test_legacy_anonymous_generate_and_filename_download_routes_are_absent(self):
+        self.setup_admin()
+        anonymous = self.running.new_client()
+        self.assertEqual(anonymous.request("POST", "/generate", body=b"").status, 404)
+        self.assertEqual(anonymous.get("/download/report.pdf").status, 404)
+
+
+if __name__ == "__main__":
+    unittest.main()
