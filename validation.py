@@ -18,6 +18,7 @@ _DETAIL_NUMERIC = (
     "lodging",
 )
 _DETAIL_TEXT = ("date", "origin", "destination", "transport")
+_UNSET = object()
 
 
 def _text(value: Any, field: str, required: bool = False) -> str:
@@ -77,14 +78,21 @@ def _detail(row: Any, index: int) -> dict:
     return normalized
 
 
-def validate_payload(raw: dict) -> dict:
+def validate_payload(
+    raw: dict,
+    *,
+    traveler: Any = _UNSET,
+    department: Any = _UNSET,
+) -> dict:
     """Return normalized payload with exactly 11 detail rows or raise ValidationError."""
     if not isinstance(raw, dict):
         raise ValidationError("payload must be an object")
+    trusted_traveler = raw.get("traveler") if traveler is _UNSET else traveler
+    trusted_department = raw.get("department") if department is _UNSET else department
     result = {
         "date": _date(raw.get("date"), "date"),
-        "department": _text(raw.get("department"), "department", required=True),
-        "traveler": _text(raw.get("traveler"), "traveler", required=True),
+        "department": _text(trusted_department, "department", required=True),
+        "traveler": _text(trusted_traveler, "traveler", required=True),
         "reason": _text(raw.get("reason"), "reason", required=True),
         "days": _number(raw.get("days"), "days"),
         "allowance": _number(raw.get("allowance"), "allowance"),

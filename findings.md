@@ -1,6 +1,8 @@
 # Findings
 
 ## Project Context
+- Task 7 started from clean `feature/auth-user-history` HEAD `9f86f6a`; the approved design and implementation plan already define this subtask, so no new design artifact is required.
+- Task 7 scope is limited to trusted validation overrides, atomic generation/history reads, safe owned-file resolution, and application construction wiring. Task 8 HTTP routes and trash/restore/purge writes remain untouched.
 - `/Users/koko/Documents/Codex/在线报销系统` is empty at the start of this feature request.
 - The current working reimbursement app is `/Users/koko/Documents/Codex/其他/reimbursement_form_app_20260903`.
 - The current app is a standard-library Python `ThreadingHTTPServer` with HTML/JS frontend, Excel generation through `openpyxl`/Pillow, and PDF conversion through LibreOffice.
@@ -42,6 +44,15 @@
 - The approved design is documented at `docs/superpowers/specs/2026-09-07-auth-user-history-design.md`.
 
 ## Security Findings
+- Task 7 validation must select trusted `traveler` and `department` values before calling `_text`; otherwise a malicious formula-prefixed client value can block a valid authenticated profile override. Trusted override values themselves still pass `_text(..., required=True)`.
+- The approved Task 7 persistence order is: validate and generate in a unique temporary directory, atomically move that directory to the owner/record destination, then insert only server-computed relative paths. Any later insert failure requires compensating removal of the final directory.
+- The authenticated `users.User` snapshot exposes its owner identifier as `id`; generated history records expose the stored owner as `user_id`.
+- `generator.generate_workbook()` returns immutable `GenerationResult` with a `path` member, while `office.export_pdf()` returns a `Path`. Task 7 must validate those exact contracts without changing either implementation.
+- `Database.transaction()` opens one connection per operation, rolls back body/commit failures, and closes it. The reimbursement insert can use this helper after the filesystem move and compensate by deleting only the just-created final record directory.
+- `create_server()` can construct and expose `server.reimbursement_service` alongside `server.database`; no Task 8 routes are needed and no eager LibreOffice discovery should occur.
+- Task 7 self-review found that injectable UUID values must still be verified as RFC UUID version 4 before any path construction; otherwise a fault/malicious test double could introduce traversal into the temporary directory name.
+- Owned-file containment must validate the `users/<owner>/<record>` directory chain itself, not only descendants; resolving both sides of a symlinked record root would otherwise make an external target appear contained.
+- Owned-file lookup database failures must not expose SQLite/path details through this public authorization boundary; they use the same stable not-found error as owner/path mismatches.
 - Current routes `/`, `/generate`, and `/download/<filename>` have no authentication.
 - Download authorization is currently based only on the filename being inside the shared output directory; adding a login page alone would not isolate users.
 - Per-user history requires durable ownership metadata and server-side checks on both history listing and file download.

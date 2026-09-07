@@ -1,5 +1,38 @@
 # Progress
 
+## 2026-09-08
+- Task 7 started from clean HEAD `9f86f6a`; read the approved design/plan context and applicable TDD/verification workflows.
+- Confirmed the task boundary: implement generation plus read-only history helpers and app construction wiring only; do not add Task 8 routes or lifecycle writes, and do not mark Task 7 complete in the shared plan.
+- Mapped current contracts: `User.id`, `GenerationResult.path`, `export_pdf()->Path`, existing reimbursement schema, and `Database.transaction()` rollback/close behavior.
+- Validation RED: trusted-profile tests fail because `validate_payload()` rejects the new `traveler`/`department` keyword arguments; this is the expected missing-feature boundary.
+- Validation GREEN: all 16 validation tests pass after adding keyword-only trusted profile selection ahead of strict text validation; legacy calls remain unchanged.
+- Reimbursement core RED: `tests.test_reimbursements` fails at import with `ModuleNotFoundError: reimbursements`, proving the service boundary is absent before implementation.
+- Reimbursement core GREEN: the first 5 service tests pass for trusted owner/profile generation, immutable records, ordinary-user enforcement, cross-user filename isolation, and PDF-failure cleanup.
+- Artifact-safety RED: after removing prematurely added untested guards, focused tests fail because `..`, external PDF paths, same-inode outputs, and invalid screenshots are accepted; corrected external/symlink XLSX tests also prove the PDF exporter is reached instead of rejecting at the generator boundary.
+- Artifact-safety GREEN: all 12 service tests pass with regular-file, extension, lexical `..`, symlink-component, resolved-containment, and distinct-inode checks; invalid screenshots are rejected before generator entry and caller files remain intact.
+- Semaphore RED: with generation concurrency configured to one, a second request enters the blocking generator instead of queueing (`second_was_queued=False`).
+- Semaphore queue GREEN: a bounded semaphore at concurrency one queues the second request, keeps peak generator execution at one, and both waiting requests eventually complete.
+- Validation-slot RED: with one generator blocked, a formula-invalid request cannot finish until the slot releases, proving the first minimal lock scope is too broad.
+- Validation-slot GREEN: validation and screenshot checks now complete outside the bounded slot while generator and PDF export remain serialized to the configured limit.
+- Atomicity RED: an injected post-commit database error leaves one row, and pre-existing tmp/final UUID collision directories are deleted; ordinary and partial move failure cleanup plus cleanup-error masking tests already characterize the desired behavior.
+- Atomicity GREEN: work/final ownership flags and an atomic empty-directory reservation preserve pre-existing collision data; uncertain inserts are compensated by exact `(record_id,user_id)` deletion and a conservative absence check before final-directory cleanup.
+- History RED: focused tests cannot import `ReimbursementNotFound`; owner-scoped active/trash queries and safe owned-file resolution do not yet exist.
+- History GREEN: active/trash lists bind owner ID and use stable newest-first ordering; owned-file resolution enforces kind, owner, deletion state, exact record directory containment, regular-file existence, and no symlink/traversal.
+- App-composition RED: `create_server()` returns a server without `reimbursement_service`; no eager soffice lookup occurs before that missing exposure assertion.
+- App-composition GREEN: `create_server()` exposes one reimbursement service on both application and server without eager soffice discovery.
+- Nested/history-resource RED: nested output paths are flattened into missing DB paths, an xlsx lookup accepts a stored PDF, and both list/owned-file read connections remain open after their methods return.
+- Nested/history-resource GREEN: persisted paths retain each output's work-directory-relative path, kind requires matching extension, and both history read methods explicitly close their SQLite connections.
+- Self-review RED: a traversal-like fake UUID reaches the generator, a symlinked record root exposes its external target, and a SQLite lookup error escapes with private details.
+- Self-review GREEN: only UUIDv4 values reach path construction, owned-file checks reject symlinked record roots, and ordinary lookup failures map to the stable not-found error.
+- Focused regression: 73 validation/generator/office/reimbursement tests pass with `ResourceWarning` treated as errors.
+- Full regression: the first sandboxed attempt hit only localhost bind restrictions; the approved outside-sandbox quiet rerun passes all 217 tests in 50.748s with `ResourceWarning` treated as errors, including existing HTTP/auth safety and real LibreOffice end-to-end coverage.
+- Final pre-review verification after test strengthening: focused 74/74, standalone real LibreOffice E2E 1/1, and full suite 218/218 pass with `ResourceWarning` treated as errors; syntax compilation and `git diff --check` also pass.
+- Scope audit confirms no changes to generator, office, templates, web routes, database schema, sessions, or users; Task 8 lifecycle writes and reimbursement HTTP routes remain absent.
+- Pre-commit review found one Important collision bug: a same-owner pre-existing DB row with the generated UUID but no final directory is deleted by broad compensation. A focused regression test reproduces the deletion (`row is None`).
+- Collision review fix GREEN: `_insert` now distinguishes statement rejection from commit uncertainty; only the latter can compensate, and compensation matches all immutable attempted fields. The old same-owner row regression plus three existing DB fault tests pass 4/4.
+- Read-only re-review found no remaining Critical or Important issues and assessed the collision fix ready.
+- Fresh post-review verification: focused 75/75, standalone real LibreOffice E2E 1/1, and full suite 219/219 pass with `ResourceWarning` treated as errors; syntax compilation and `git diff --check` pass.
+
 ## 2026-09-07
 - Read the applicable brainstorming, planning, TDD, and verification workflows.
 - Confirmed the current workspace is empty and located the existing reimbursement app in the prior project directory.

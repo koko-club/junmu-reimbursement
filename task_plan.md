@@ -4,7 +4,7 @@
 在现有差旅报销网页工具基础上增加管理员、普通用户登录、普通用户单会话限制，以及按用户隔离的 Excel/PDF 生成历史。
 
 ## Current Phase
-Task 6 unencodable-username canonicalization follow-up complete and verified; Task 7 has not started.
+Task 7 atomic per-user generation is in progress under strict TDD; Task 8 routes and lifecycle writes remain out of scope.
 
 ## Design Checklist
 - [x] Explore current project location and existing architecture
@@ -38,3 +38,6 @@ Task 6 unencodable-username canonicalization follow-up complete and verified; Ta
 | Sandboxed HTTP test could not bind its temporary localhost port | 1 | Re-ran the same focused test with approved localhost binding and captured the behavioral RED result |
 | Verbose full-suite output did not retain its final summary in the tool capture | 1 | Re-ran the complete suite quietly and captured the definitive 180-test count and zero exit status |
 | Combined surrogate-test patch mismatched escaped Unicode context in `test_users.py` | 1 | Confirmed the patch was atomic with no test changes, then split it into smaller insertions anchored on ASCII-only lines |
+| Task 7 nested-path implementation patch mixed a `progress.md` context line into the `reimbursements.py` block | 1 | Confirmed the patch was atomic, then split implementation and progress updates into exact file-specific patches |
+| Sandboxed Task 7 full suite could not bind temporary localhost ports | 1 | Re-ran the identical 217-test suite outside the sandbox with approved localhost binding and captured a definitive quiet summary |
+| Sandboxed `git add` could not create `.git/index.lock` | 1 | Keep the working tree unchanged and rerun the exact staging command outside the sandbox with approval |

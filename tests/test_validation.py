@@ -59,6 +59,26 @@ class ValidationTest(unittest.TestCase):
         self.assertEqual(result["receipt_count"], 2)
         self.assertEqual(result["rows"][1], {})
 
+    def test_trusted_profile_overrides_untrusted_client_values_before_validation(self):
+        value = payload(department="=CLIENT", traveler=None, date="")
+
+        result = validate_payload(
+            value,
+            traveler=" 王安全 ",
+            department=" 财务部 ",
+        )
+
+        self.assertEqual(result["traveler"], "王安全")
+        self.assertEqual(result["department"], "财务部")
+        self.assertEqual(result["date"], "")
+        self.assertEqual(len(result["rows"]), 11)
+
+    def test_trusted_profile_values_are_strictly_validated(self):
+        for field, value in (("traveler", "@SUM(1,1)"), ("department", "")):
+            overrides = {"traveler": "王安全", "department": "财务部", field: value}
+            with self.subTest(field=field), self.assertRaises(ValidationError):
+                validate_payload(payload(), **overrides)
+
     def test_missing_traveler_is_rejected(self):
         with self.assertRaises(ValidationError):
             validate_payload(payload(traveler=""))

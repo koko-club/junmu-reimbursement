@@ -12,6 +12,7 @@ import time
 
 from config import load_config
 from database import Database
+from reimbursements import ReimbursementService
 from security import AnonymousCsrfSigner, PasswordHasher, load_or_create_secret
 from sessions import SessionService
 from users import UserService
@@ -171,12 +172,14 @@ def create_server(config_path: Path) -> ThreadingHTTPServer:
         password_hasher,
         revoke_sessions=session_service.revoke_user,
     )
+    reimbursement_service = ReimbursementService(database, config)
     application = WebApplication(
         config,
         user_service,
         session_service,
         AnonymousCsrfSigner(secret),
     )
+    application.reimbursement_service = reimbursement_service
 
     class Handler(BaseHTTPRequestHandler):
         server_version = "ReimbursementTool/2.0"
@@ -317,6 +320,7 @@ def create_server(config_path: Path) -> ThreadingHTTPServer:
     server.max_body_bytes = config.max_body_bytes
     server.application = application
     server.database = database
+    server.reimbursement_service = reimbursement_service
     return server
 
 
