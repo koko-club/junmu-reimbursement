@@ -44,6 +44,9 @@
 - The approved design is documented at `docs/superpowers/specs/2026-09-07-auth-user-history-design.md`.
 
 ## Security Findings
+- Task 7 follow-up root cause: `_validated_output()` establishes that the workbook is a controlled regular file before the injected PDF exporter runs, but the exporter can mutate that path before relative paths are captured and the work directory is moved. The trust decision must be repeated for both outputs after exporter return, inside the existing semaphore, immediately before distinct-inode and relative-path checks.
+- Task 7 follow-up root cause: `xlsx_path.name` currently crosses directly into `ReimbursementRecord.display_name` and SQLite. The display metadata boundary must reject empty/dot names, separators, C0 controls, DEL, invalid UTF-8, non-`.xlsx` names, and names above a fixed UTF-8 byte limit while preserving legal Unicode and per-user duplicate display names.
+- The approved follow-up explicitly retains `threading.BoundedSemaphore`; no FIFO queue is required.
 - Task 7 validation must select trusted `traveler` and `department` values before calling `_text`; otherwise a malicious formula-prefixed client value can block a valid authenticated profile override. Trusted override values themselves still pass `_text(..., required=True)`.
 - The approved Task 7 persistence order is: validate and generate in a unique temporary directory, atomically move that directory to the owner/record destination, then insert only server-computed relative paths. Any later insert failure requires compensating removal of the final directory.
 - The authenticated `users.User` snapshot exposes its owner identifier as `id`; generated history records expose the stored owner as `user_id`.

@@ -24,6 +24,7 @@ from validation import validate_image_filename, validate_payload
 
 _LOGGER = logging.getLogger(__name__)
 _PUBLIC_GENERATION_ERROR = "生成报销文件失败，请稍后重试"
+_MAX_DISPLAY_NAME_UTF8_BYTES = 180
 
 
 class ReimbursementGenerationError(RuntimeError):
@@ -119,21 +120,30 @@ class ReimbursementService:
                     payload,
                     image_paths,
                 )
-                xlsx_path = self._validated_output(
+                generated_xlsx_path = self._validated_output(
                     getattr(generation_result, "path", None), work_dir, ".xlsx"
                 )
+                generated_xlsx_metadata = generated_xlsx_path.lstat()
                 configured_soffice = str(self._config.soffice_path or "").strip()
                 soffice_path = (
                     Path(configured_soffice)
                     if configured_soffice
                     else Path(self._soffice_finder(""))
                 )
-                pdf_result = self._pdf_exporter(xlsx_path, work_dir, soffice_path)
+                pdf_result = self._pdf_exporter(
+                    generated_xlsx_path, work_dir, soffice_path
+                )
+                xlsx_path = self._validated_output(
+                    generated_xlsx_path, work_dir, ".xlsx"
+                )
+                if not os.path.samestat(generated_xlsx_metadata, xlsx_path.lstat()):
+                    raise ValueError("generated workbook was replaced")
                 pdf_path = self._validated_output(pdf_result, work_dir, ".pdf")
                 if xlsx_path.samefile(pdf_path):
                     raise ValueError("generated outputs must be different files")
                 xlsx_work_relative = xlsx_path.relative_to(work_dir)
                 pdf_work_relative = pdf_path.relative_to(work_dir)
+                display_name = self._validated_display_name(xlsx_path.name)
 
             owner_root = self._controlled_directory(data_dir / "users", data_dir)
             owner_dir = self._controlled_directory(
@@ -152,7 +162,7 @@ class ReimbursementService:
                 id=record_id,
                 user_id=user.user_id,
                 reimbursement_date=payload["date"],
-                display_name=xlsx_path.name,
+                display_name=display_name,
                 xlsx_path=xlsx_relative,
                 pdf_path=pdf_relative,
                 created_at=created_at,
@@ -337,6 +347,26 @@ class ReimbursementService:
         except ValueError as error:
             raise ValueError("generated output is outside request directory") from error
         return path
+
+    @staticmethod
+    def _validated_display_name(value: object) -> str:
+        """Return a metadata-safe XLSX name capped at 180 UTF-8 bytes."""
+        if (
+            not isinstance(value, str)
+            or value in {"", ".", ".."}
+            or "/" in value
+            or "\\" in value
+            or Path(value).suffix.lower() != ".xlsx"
+            or any(ord(character) < 32 or ord(character) == 127 for character in value)
+        ):
+            raise ValueError("invalid display name")
+        try:
+            encoded = value.encode("utf-8")
+        except UnicodeEncodeError:
+            raise ValueError("invalid display name") from None
+        if len(encoded) > _MAX_DISPLAY_NAME_UTF8_BYTES:
+            raise ValueError("invalid display name")
+        return value
 
     @staticmethod
     def _path_exists(path: Path) -> bool:

@@ -146,6 +146,7 @@ class ReimbursementServiceTest(unittest.TestCase):
         self.assertEqual(count, 0)
         self.assertEqual(list((self.data_dir / "tmp").glob("*")), [])
         self.assertEqual(list((self.data_dir / "users").rglob("*.xlsx")), [])
+        self.assertEqual(list((self.data_dir / "users").rglob("*.pdf")), [])
 
     def _service_with(self, **overrides) -> ReimbursementService:
         arguments = {
@@ -245,6 +246,48 @@ class ReimbursementServiceTest(unittest.TestCase):
         self.assertTrue((self.data_dir / alice_record.xlsx_path).is_file())
         self.assertTrue((self.data_dir / bob_record.xlsx_path).is_file())
 
+    def test_display_name_rejects_unsafe_metadata_values(self):
+        unsafe_names = (
+            "",
+            ".",
+            "..",
+            "folder/name.xlsx",
+            "folder\\name.xlsx",
+            "missing-extension",
+            "\ud800.xlsx",
+            "a" * 176 + ".xlsx",
+            *(f"control-{chr(code)}.xlsx" for code in range(32)),
+            "control-\x7f.xlsx",
+        )
+
+        for name in unsafe_names:
+            with self.subTest(name=repr(name)), self.assertRaises(ValueError):
+                ReimbursementService._validated_display_name(name)
+
+    def test_display_name_accepts_legal_unicode_xlsx_name(self):
+        name = "2026年上海差旅报销单.xlsx"
+
+        self.assertEqual(ReimbursementService._validated_display_name(name), name)
+
+    def test_dangerous_display_name_is_not_persisted_or_logged(self):
+        dangerous_name = "private-token\r\nInjected-Header.xlsx"
+
+        def dangerous_generator(_template, work_dir, _payload, _images):
+            path = Path(work_dir) / dangerous_name
+            path.write_bytes(b"xlsx")
+            return GenerationResult(path, 0, 0)
+
+        service = self._service_with(workbook_generator=dangerous_generator)
+
+        with self.assertLogs("reimbursements", level="ERROR") as captured:
+            with self.assertRaisesRegex(
+                ReimbursementGenerationError, "^生成报销文件失败，请稍后重试$"
+            ):
+                service.generate(self.alice, valid_payload(), [])
+
+        self.assertNotIn(dangerous_name, "\n".join(captured.output))
+        self._assert_no_history_or_artifacts()
+
     def test_pdf_failure_leaves_no_files_or_history(self):
         self.exporter.side_effect = RuntimeError("conversion failed with private path")
 
@@ -337,6 +380,78 @@ class ReimbursementServiceTest(unittest.TestCase):
         self.exporter.side_effect = hard_link_pdf
 
         with self.assertRaises(ReimbursementGenerationError):
+            self.service.generate(self.alice, valid_payload(), [])
+
+        self._assert_no_history_or_artifacts()
+
+    def test_exporter_cannot_replace_workbook_with_symlink_to_external_file(self):
+        external = self.root / "external-after-export.xlsx"
+        external.write_bytes(b"external-target")
+
+        def replace_with_symlink(xlsx_path, work_dir, _soffice):
+            Path(xlsx_path).unlink()
+            Path(xlsx_path).symlink_to(external)
+            pdf = Path(work_dir) / "converted.pdf"
+            pdf.write_bytes(b"pdf")
+            return pdf
+
+        self.exporter.side_effect = replace_with_symlink
+
+        with self.assertRaisesRegex(
+            ReimbursementGenerationError, "^生成报销文件失败，请稍后重试$"
+        ):
+            self.service.generate(self.alice, valid_payload(), [])
+
+        self.assertEqual(external.read_bytes(), b"external-target")
+        self._assert_no_history_or_artifacts()
+
+    def test_exporter_cannot_delete_workbook_before_returning_pdf(self):
+        def delete_workbook(xlsx_path, work_dir, _soffice):
+            Path(xlsx_path).unlink()
+            pdf = Path(work_dir) / "converted.pdf"
+            pdf.write_bytes(b"pdf")
+            return pdf
+
+        self.exporter.side_effect = delete_workbook
+
+        with self.assertRaisesRegex(
+            ReimbursementGenerationError, "^生成报销文件失败，请稍后重试$"
+        ):
+            self.service.generate(self.alice, valid_payload(), [])
+
+        self._assert_no_history_or_artifacts()
+
+    def test_exporter_cannot_replace_workbook_with_directory(self):
+        def replace_with_directory(xlsx_path, work_dir, _soffice):
+            Path(xlsx_path).unlink()
+            Path(xlsx_path).mkdir()
+            pdf = Path(work_dir) / "converted.pdf"
+            pdf.write_bytes(b"pdf")
+            return pdf
+
+        self.exporter.side_effect = replace_with_directory
+
+        with self.assertRaisesRegex(
+            ReimbursementGenerationError, "^生成报销文件失败，请稍后重试$"
+        ):
+            self.service.generate(self.alice, valid_payload(), [])
+
+        self._assert_no_history_or_artifacts()
+
+    def test_exporter_cannot_replace_workbook_with_different_regular_file(self):
+        def replace_with_regular_file(xlsx_path, work_dir, _soffice):
+            original = Path(work_dir) / "renamed-original.xlsx"
+            Path(xlsx_path).replace(original)
+            Path(xlsx_path).write_bytes(b"replacement-xlsx")
+            pdf = Path(work_dir) / "converted.pdf"
+            pdf.write_bytes(b"pdf")
+            return pdf
+
+        self.exporter.side_effect = replace_with_regular_file
+
+        with self.assertRaisesRegex(
+            ReimbursementGenerationError, "^生成报销文件失败，请稍后重试$"
+        ):
             self.service.generate(self.alice, valid_payload(), [])
 
         self._assert_no_history_or_artifacts()

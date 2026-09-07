@@ -1,6 +1,16 @@
 # Progress
 
 ## 2026-09-08
+- Resumed Task 7 at clean HEAD `45fb19b` for two approved P2 follow-ups; confirmed no FIFO work and no Task 7 completion status are in scope.
+- Verified the exporter-mutation gap and unvalidated display-name persistence directly in `ReimbursementService.generate()` before writing production code.
+- Exporter-mutation RED: the focused 3-test run fails because symlink and directory replacements are accepted; deletion already reaches the stable error through a missing-file failure. External target and cleanup assertions are included.
+- Display-name RED: the focused 3-test run reports the missing `_validated_display_name` boundary and proves a CR/LF workbook basename currently succeeds instead of returning the stable public error.
+- Regular-replacement RED: rename-plus-recreate at the original workbook path succeeds after type-only revalidation, proving file identity must also remain stable across export.
+- Task 7 review GREEN: all 7 new focused regressions pass after post-export XLSX/PDF validation, workbook inode continuity checking, and 180-byte strict UTF-8 display-name validation.
+- Reimbursement regression check: all 41 `tests.test_reimbursements` tests pass with `ResourceWarning` treated as an error.
+- Follow-up verification: focused validation/generator/office/reimbursement suite passes 82/82, standalone real LibreOffice E2E passes 1/1, and the complete outside-sandbox suite passes 226/226 with `ResourceWarning` treated as errors.
+- Syntax compilation against every actual root Python module and `git diff --check` both pass. The first compile attempt referenced absent planned module `auth.py`; the corrected command used the enumerated repository modules.
+- Follow-up code review found no Critical or Important issues and confirmed both approved findings are covered; FIFO was explicitly excluded. Task 7 remains in progress.
 - Task 7 started from clean HEAD `9f86f6a`; read the approved design/plan context and applicable TDD/verification workflows.
 - Confirmed the task boundary: implement generation plus read-only history helpers and app construction wiring only; do not add Task 8 routes or lifecycle writes, and do not mark Task 7 complete in the shared plan.
 - Mapped current contracts: `User.id`, `GenerationResult.path`, `export_pdf()->Path`, existing reimbursement schema, and `Database.transaction()` rollback/close behavior.

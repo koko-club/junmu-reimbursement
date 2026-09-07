@@ -4,7 +4,15 @@
 在现有差旅报销网页工具基础上增加管理员、普通用户登录、普通用户单会话限制，以及按用户隔离的 Excel/PDF 生成历史。
 
 ## Current Phase
-Task 7 atomic per-user generation is in progress under strict TDD; Task 8 routes and lifecycle writes remain out of scope.
+Task 7 atomic per-user generation follow-up is in progress under strict TDD; Task 8 routes and lifecycle writes remain out of scope.
+
+## Task 7 Review Follow-up
+- [x] RED: prove an exporter cannot replace, delete, or change the workbook into a non-regular file after its first validation
+- [x] GREEN: revalidate workbook and PDF outputs, preserve workbook identity, and check distinctness inside the semaphore immediately before deriving move paths
+- [x] RED: prove unsafe or non-UTF-8 display names cannot reach logs, storage, or history
+- [x] GREEN: validate a legal `.xlsx` basename against a documented UTF-8 byte limit before persistence
+- [x] Run focused, real LibreOffice end-to-end, full-suite, compile, and diff checks
+- [x] Self-review the scoped follow-up without FIFO queueing or marking Task 7 complete
 
 ## Design Checklist
 - [x] Explore current project location and existing architecture
@@ -41,3 +49,5 @@ Task 7 atomic per-user generation is in progress under strict TDD; Task 8 routes
 | Task 7 nested-path implementation patch mixed a `progress.md` context line into the `reimbursements.py` block | 1 | Confirmed the patch was atomic, then split implementation and progress updates into exact file-specific patches |
 | Sandboxed Task 7 full suite could not bind temporary localhost ports | 1 | Re-ran the identical 217-test suite outside the sandbox with approved localhost binding and captured a definitive quiet summary |
 | Sandboxed `git add` could not create `.git/index.lock` | 1 | Keep the working tree unchanged and rerun the exact staging command outside the sandbox with approval |
+| First follow-up full-suite handoff omitted the final count and exit status | 1 | Re-ran in a persistent terminal session and captured 226 tests, `OK`, and exit status 0 |
+| Follow-up syntax command referenced nonexistent `auth.py` | 1 | Enumerated the repository modules and reran `py_compile` against the actual root Python files |
