@@ -12,6 +12,7 @@ APP_DIR = Path(__file__).resolve().parents[1]
 if str(APP_DIR) not in sys.path:
     sys.path.insert(0, str(APP_DIR))
 
+import users
 from database import Database
 from security import PasswordHasher
 from users import (
@@ -21,6 +22,7 @@ from users import (
     SetupClosed,
     SetupRequired,
     UserNotFound,
+    UserOperationBusy,
     UserService,
     UsernameTaken,
     ValidationError,
@@ -294,40 +296,29 @@ class UserServiceTest(unittest.TestCase):
 
     def test_failed_disable_cannot_undo_later_security_operations(self):
         admin, user = self.register_and_approve()
-        revocation_started = threading.Event()
-        release_failure = threading.Event()
-        captured = []
-
-        def delayed_failure(_user_id):
-            revocation_started.set()
-            self.assertTrue(release_failure.wait(timeout=2))
+        def later_status_writes_then_fail(user_id):
+            with self.database.transaction(immediate=True) as connection:
+                connection.execute(
+                    "UPDATE users SET status = 'active', status_version = status_version + 1 WHERE id = ?",
+                    (user_id,),
+                )
+                connection.execute(
+                    "UPDATE users SET status = 'disabled', status_version = status_version + 1 WHERE id = ?",
+                    (user_id,),
+                )
+            self.service.update_profile(
+                admin.id, user_id, "Concurrent Name", "Concurrent Department"
+            )
             raise RuntimeError("revoke failed")
 
-        first = UserService(
+        failing = UserService(
             self.database,
             PasswordHasher(n=1024, r=8, p=1),
-            revoke_sessions=delayed_failure,
+            revoke_sessions=later_status_writes_then_fail,
         )
-        second = UserService(self.database, PasswordHasher(n=1024, r=8, p=1))
-
-        def disable_then_capture_failure():
-            try:
-                first.set_enabled(admin.id, user.id, False)
-            except BaseException as error:
-                captured.append(error)
-
         with self.assertLogs("users", level="ERROR"):
-            worker = threading.Thread(target=disable_then_capture_failure)
-            worker.start()
-            self.assertTrue(revocation_started.wait(timeout=2))
-            self.assertEqual(second.set_enabled(admin.id, user.id, True).status_version, 2)
-            self.assertEqual(second.set_enabled(admin.id, user.id, False).status_version, 3)
-            second.update_profile(admin.id, user.id, "Concurrent Name", "Concurrent Department")
-            release_failure.set()
-            worker.join(timeout=2)
-
-        self.assertFalse(worker.is_alive())
-        self.assertIsInstance(captured[0], RuntimeError)
+            with self.assertRaisesRegex(RuntimeError, "revoke failed"):
+                failing.set_enabled(admin.id, user.id, False)
         final_user = self.service.get(user.id)
         self.assertEqual(final_user.status, "disabled")
         self.assertEqual(final_user.status_version, 3)
@@ -350,8 +341,6 @@ class UserServiceTest(unittest.TestCase):
             PasswordHasher(n=1024, r=8, p=1),
             revoke_sessions=delayed_failure,
         )
-        second = UserService(self.database, PasswordHasher(n=1024, r=8, p=1))
-
         def reset_then_capture_failure():
             try:
                 first.reset_password(admin.id, user.id)
@@ -362,8 +351,15 @@ class UserServiceTest(unittest.TestCase):
             worker = threading.Thread(target=reset_then_capture_failure)
             worker.start()
             self.assertTrue(revocation_started.wait(timeout=2))
-            self.assertEqual(second.set_enabled(admin.id, user.id, False).status_version, 1)
-            self.assertEqual(second.set_enabled(admin.id, user.id, True).status_version, 2)
+            with self.database.transaction(immediate=True) as connection:
+                connection.execute(
+                    "UPDATE users SET status = 'disabled', status_version = status_version + 1 WHERE id = ?",
+                    (user.id,),
+                )
+                connection.execute(
+                    "UPDATE users SET status = 'active', status_version = status_version + 1 WHERE id = ?",
+                    (user.id,),
+                )
             release_failure.set()
             worker.join(timeout=2)
 
@@ -391,8 +387,6 @@ class UserServiceTest(unittest.TestCase):
             PasswordHasher(n=1024, r=8, p=1),
             revoke_sessions=delayed_failure,
         )
-        second = UserService(self.database, PasswordHasher(n=1024, r=8, p=1))
-
         def disable_then_capture_failure():
             try:
                 first.set_enabled(admin.id, user.id, False)
@@ -403,11 +397,15 @@ class UserServiceTest(unittest.TestCase):
             worker = threading.Thread(target=disable_then_capture_failure)
             worker.start()
             self.assertTrue(revocation_started.wait(timeout=2))
-            second.change_password(
-                user.id,
-                current_password="correct horse battery staple",
-                new_password="concurrent correct horse battery staple",
+            material = PasswordHasher(n=1024, r=8, p=1).hash(
+                "concurrent correct horse battery staple"
             )
+            with self.database.transaction(immediate=True) as connection:
+                connection.execute(
+                    "UPDATE users SET password_hash = ?, password_salt = ?, password_params = ?, "
+                    "password_version = password_version + 1 WHERE id = ?",
+                    (material.digest, material.salt, material.params, user.id),
+                )
             release_failure.set()
             worker.join(timeout=2)
 
@@ -420,6 +418,73 @@ class UserServiceTest(unittest.TestCase):
             self.service.authenticate("alex", "concurrent correct horse battery staple").id,
             user.id,
         )
+
+    def test_reentrant_reset_is_busy_and_failed_outer_reset_restores_password(self):
+        admin, user = self.register_and_approve()
+        nested = []
+
+        def reenter_then_fail(user_id):
+            with self.assertRaises(UserOperationBusy):
+                self.service.reset_password(admin.id, user_id)
+            nested.append("busy")
+            raise RuntimeError("revoke failed")
+
+        failing = UserService(
+            self.database,
+            PasswordHasher(n=1024, r=8, p=1),
+            revoke_sessions=reenter_then_fail,
+        )
+        with mock.patch("users.secrets.token_urlsafe", return_value="outer-temporary") as token:
+            with self.assertLogs("users", level="ERROR"):
+                with self.assertRaisesRegex(RuntimeError, "revoke failed"):
+                    failing.reset_password(admin.id, user.id)
+        self.assertEqual(nested, ["busy"])
+        token.assert_called_once_with(12)
+        self.assertFalse(self.service.get(user.id).must_change_password)
+        self.assertEqual(self.service.authenticate("alex", "correct horse battery staple").id, user.id)
+        with self.assertRaises(AuthenticationFailed):
+            self.service.authenticate("alex", "outer-temporary")
+        with self.assertRaises(AuthenticationFailed):
+            self.service.authenticate("alex", "inner-temporary")
+        self.assertEqual(users._operation_lock_count(), 0)
+
+    def test_security_operations_share_a_nonreentrant_lock_per_database_and_user(self):
+        admin, first_user = self.register_and_approve("first")
+        pending = self.service.register("second", "correct horse battery staple", "Second", "Engineering")
+        second_user = self.service.approve(admin.id, pending.id)
+        revocation_started = threading.Event()
+        release_revocation = threading.Event()
+        captured = []
+
+        def delayed_revoke(_user_id):
+            revocation_started.set()
+            self.assertTrue(release_revocation.wait(timeout=2))
+
+        first_service = UserService(
+            self.database,
+            PasswordHasher(n=1024, r=8, p=1),
+            revoke_sessions=delayed_revoke,
+        )
+        second_service = UserService(self.database, PasswordHasher(n=1024, r=8, p=1))
+
+        def reset_in_background():
+            try:
+                first_service.reset_password(admin.id, first_user.id)
+            except BaseException as error:
+                captured.append(error)
+
+        worker = threading.Thread(target=reset_in_background)
+        worker.start()
+        self.assertTrue(revocation_started.wait(timeout=2))
+        with self.assertRaises(UserOperationBusy):
+            second_service.set_enabled(admin.id, first_user.id, False)
+        self.assertEqual(second_service.set_enabled(admin.id, second_user.id, False).status, "disabled")
+        release_revocation.set()
+        worker.join(timeout=2)
+
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(captured, [])
+        self.assertEqual(users._operation_lock_count(), 0)
 
     def test_get_raises_for_unknown_user_and_lists_have_stable_order(self):
         admin = self.setup_admin()

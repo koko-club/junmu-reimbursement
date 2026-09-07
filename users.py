@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import logging
 import secrets
 import sqlite3
-from typing import Callable
+import threading
+from typing import Callable, Iterator
 import unicodedata
 
 from database import Database
@@ -52,6 +54,20 @@ class InvalidState(UserError):
 
 class UserNotFound(UserError):
     pass
+
+
+class UserOperationBusy(UserError):
+    pass
+
+
+@dataclass
+class _OperationLock:
+    lock: threading.Lock
+    references: int = 0
+
+
+_OPERATION_LOCKS_GUARD = threading.Lock()
+_OPERATION_LOCKS: dict[tuple[str, int], _OperationLock] = {}
 
 
 @dataclass(frozen=True)
@@ -225,6 +241,10 @@ class UserService:
     def set_enabled(self, admin_id: int, user_id: int, enabled: bool) -> User:
         if not isinstance(enabled, bool):
             raise ValidationError("enabled must be a boolean")
+        with self._security_operation_lock(user_id):
+            return self._set_enabled(admin_id, user_id, enabled)
+
+    def _set_enabled(self, admin_id: int, user_id: int, enabled: bool) -> User:
         desired_status = "active" if enabled else "disabled"
         changed_at = _utc_now()
         with self._database.transaction(immediate=True) as connection:
@@ -248,6 +268,10 @@ class UserService:
         return updated
 
     def reset_password(self, admin_id: int, user_id: int) -> str:
+        with self._security_operation_lock(user_id):
+            return self._reset_password(admin_id, user_id)
+
+    def _reset_password(self, admin_id: int, user_id: int) -> str:
         temporary_password = secrets.token_urlsafe(12)
         material = self._password_hasher.hash(temporary_password)
         changed_at = _utc_now()
@@ -272,6 +296,12 @@ class UserService:
         return temporary_password
 
     def change_password(
+        self, user_id: int, current_password: str, new_password: str
+    ) -> None:
+        with self._security_operation_lock(user_id):
+            self._change_password(user_id, current_password, new_password)
+
+    def _change_password(
         self, user_id: int, current_password: str, new_password: str
     ) -> None:
         material = self._password_hasher.hash(new_password)
@@ -309,6 +339,33 @@ class UserService:
         except Exception:
             _LOGGER.exception("session revocation failed for user_id=%s", user_id)
             raise
+
+    @contextmanager
+    def _security_operation_lock(self, user_id: int) -> Iterator[None]:
+        if not isinstance(user_id, int) or isinstance(user_id, bool):
+            yield
+            return
+        key = (str(self._database.path.resolve()), user_id)
+        with _OPERATION_LOCKS_GUARD:
+            entry = _OPERATION_LOCKS.get(key)
+            if entry is None:
+                entry = _OperationLock(lock=threading.Lock())
+                _OPERATION_LOCKS[key] = entry
+            entry.references += 1
+            acquired = entry.lock.acquire(blocking=False)
+            if not acquired:
+                entry.references -= 1
+                if entry.references == 0:
+                    del _OPERATION_LOCKS[key]
+                raise UserOperationBusy("another security operation is already running for this user")
+        try:
+            yield
+        finally:
+            entry.lock.release()
+            with _OPERATION_LOCKS_GUARD:
+                entry.references -= 1
+                if entry.references == 0:
+                    del _OPERATION_LOCKS[key]
 
     def _restore_status(
         self, user_id: int, prior_status: str, replacement_status_version: int
@@ -419,3 +476,8 @@ _INSERT_USER = """
 
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _operation_lock_count() -> int:
+    with _OPERATION_LOCKS_GUARD:
+        return len(_OPERATION_LOCKS)
