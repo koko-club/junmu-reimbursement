@@ -1,10 +1,12 @@
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import FrozenInstanceError
+import os
 from pathlib import Path
 import stat
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 
 APP_DIR = Path(__file__).resolve().parents[1]
@@ -80,6 +82,18 @@ class SecretFileTest(unittest.TestCase):
             self.assertEqual(len(set(secrets)), 1)
             self.assertEqual(len(secrets[0]), 32)
 
+    def test_entropy_failure_removes_created_file_and_closes_descriptor(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "state" / "secret.bin"
+
+            with mock.patch("security.secrets.token_bytes", side_effect=OSError("no entropy")), \
+                 mock.patch("security.os.close", wraps=os.close) as close:
+                with self.assertRaisesRegex(OSError, "no entropy"):
+                    load_or_create_secret(path)
+
+            self.assertFalse(path.exists())
+            close.assert_called_once()
+
 
 class AnonymousCsrfSignerTest(unittest.TestCase):
     def setUp(self):
@@ -117,6 +131,15 @@ class AnonymousCsrfSignerTest(unittest.TestCase):
                 self.assertFalse(self.signer.verify(
                     token, "POST", "/setup?next=/dashboard", self.issued_at + 20
                 ))
+
+    def test_token_rejects_tampered_hex_signature(self):
+        prefix, signature = self.token.rsplit(".", 1)
+        replacement = "0" if signature[-1] != "0" else "1"
+        tampered_token = f"{prefix}.{signature[:-1]}{replacement}"
+
+        self.assertFalse(self.signer.verify(
+            tampered_token, "POST", "/setup?next=/dashboard", self.issued_at + 20
+        ))
 
 
 if __name__ == "__main__":

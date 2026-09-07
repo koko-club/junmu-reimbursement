@@ -112,23 +112,23 @@ def load_or_create_secret(path: str | os.PathLike[str]) -> bytes:
                 # The winning creator failed and removed its partial file.
                 continue
 
-        secret = secrets.token_bytes(_SECRET_LENGTH)
+        completed = False
         try:
+            secret = secrets.token_bytes(_SECRET_LENGTH)
             os.fchmod(descriptor, 0o600)
             _write_all(descriptor, secret)
             os.fsync(descriptor)
-        except BaseException:
+            completed = True
+        finally:
             try:
                 os.close(descriptor)
-            finally:
-                try:
-                    secret_path.unlink()
-                except FileNotFoundError:
-                    pass
-            raise
-        else:
-            os.close(descriptor)
-            return secret
+            except BaseException:
+                if completed:
+                    _remove_created_secret(secret_path)
+                    raise
+            if not completed:
+                _remove_created_secret(secret_path)
+        return secret
 
 
 def _write_all(descriptor: int, data: bytes) -> None:
@@ -138,6 +138,13 @@ def _write_all(descriptor: int, data: bytes) -> None:
         if written <= 0:
             raise OSError("could not write secret file")
         view = view[written:]
+
+
+def _remove_created_secret(path: Path) -> None:
+    try:
+        path.unlink()
+    except (FileNotFoundError, OSError):
+        pass
 
 
 def _read_complete_secret(path: Path) -> bytes:
