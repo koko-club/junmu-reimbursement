@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from contextlib import closing
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import logging
 import os
 from pathlib import Path
@@ -24,6 +24,7 @@ from validation import safe_output_stem, validate_image_filename, validate_paylo
 _LOGGER = logging.getLogger(__name__)
 _PUBLIC_GENERATION_ERROR = "生成报销文件失败，请稍后重试"
 _MAX_DISPLAY_NAME_UTF8_BYTES = 180
+_TRASH_RETENTION = timedelta(days=30)
 _CLEANUP_ENTRY_NAME = "entry"
 _DIRECTORY_OPEN_FLAGS = (
     os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
@@ -313,6 +314,94 @@ class ReimbursementService:
     def list_trash(self, user_id: int) -> list[ReimbursementRecord]:
         return self._list(user_id, deleted=True)
 
+    def trash(
+        self,
+        user_id: int,
+        record_id: str,
+        now: datetime | None = None,
+    ) -> ReimbursementRecord:
+        self._require_owner_id(user_id)
+        self._require_record_id(record_id)
+        deleted_at = self._utc_time(now).isoformat()
+        with self._database.transaction(immediate=True) as connection:
+            updated = connection.execute(
+                """UPDATE reimbursements SET deleted_at = ?
+                WHERE id = ? AND user_id = ? AND deleted_at IS NULL""",
+                (deleted_at, record_id, user_id),
+            )
+            if updated.rowcount != 1:
+                raise ReimbursementNotFound("报销记录不存在")
+            row = connection.execute(
+                "SELECT * FROM reimbursements WHERE id = ? AND user_id = ?",
+                (record_id, user_id),
+            ).fetchone()
+        assert row is not None
+        return self._record_from_row(row)
+
+    def restore(self, user_id: int, record_id: str) -> ReimbursementRecord:
+        self._require_owner_id(user_id)
+        self._require_record_id(record_id)
+        with self._database.transaction(immediate=True) as connection:
+            updated = connection.execute(
+                """UPDATE reimbursements SET deleted_at = NULL
+                WHERE id = ? AND user_id = ? AND deleted_at IS NOT NULL""",
+                (record_id, user_id),
+            )
+            if updated.rowcount != 1:
+                raise ReimbursementNotFound("报销记录不存在")
+            row = connection.execute(
+                "SELECT * FROM reimbursements WHERE id = ? AND user_id = ?",
+                (record_id, user_id),
+            ).fetchone()
+        assert row is not None
+        return self._record_from_row(row)
+
+    def purge_one(self, user_id: int, record_id: str) -> None:
+        self._require_owner_id(user_id)
+        self._require_record_id(record_id)
+        with self._database.transaction(immediate=True) as connection:
+            row = connection.execute(
+                """SELECT * FROM reimbursements
+                WHERE id = ? AND user_id = ? AND deleted_at IS NOT NULL""",
+                (record_id, user_id),
+            ).fetchone()
+            if row is None:
+                raise ReimbursementNotFound("报销记录不存在")
+            record = self._record_from_row(row)
+            if not self._purge_record_files(record):
+                raise ReimbursementNotFound("报销记录不存在")
+            deleted = connection.execute(
+                """DELETE FROM reimbursements
+                WHERE id = ? AND user_id = ? AND deleted_at IS NOT NULL""",
+                (record_id, user_id),
+            )
+            if deleted.rowcount != 1:
+                raise ReimbursementNotFound("报销记录不存在")
+
+    def purge_expired(self, now: datetime | None = None) -> int:
+        cutoff = (self._utc_time(now) - _TRASH_RETENTION).isoformat()
+        with closing(self._database.connect()) as connection:
+            candidates = connection.execute(
+                """SELECT id, user_id FROM reimbursements
+                WHERE deleted_at IS NOT NULL AND deleted_at <= ?
+                ORDER BY deleted_at, id""",
+                (cutoff,),
+            ).fetchall()
+        purged = 0
+        for candidate in candidates:
+            record_id = candidate["id"]
+            try:
+                self.purge_one(candidate["user_id"], record_id)
+            except Exception as error:
+                _LOGGER.error(
+                    "expired reimbursement purge failed record_id=%s exception=%s",
+                    record_id,
+                    type(error).__name__,
+                )
+                continue
+            purged += 1
+        return purged
+
     def owned_file(
         self,
         user_id: int,
@@ -419,6 +508,64 @@ class ReimbursementService:
     def _require_owner_id(user_id: object) -> None:
         if type(user_id) is not int or user_id <= 0:
             raise ValueError("valid user_id required")
+
+    @staticmethod
+    def _require_record_id(record_id: object) -> str:
+        if not isinstance(record_id, str):
+            raise ReimbursementNotFound("报销记录不存在")
+        try:
+            parsed = UUID(record_id)
+        except (ValueError, AttributeError):
+            raise ReimbursementNotFound("报销记录不存在") from None
+        if parsed.version != 4 or str(parsed) != record_id:
+            raise ReimbursementNotFound("报销记录不存在")
+        return record_id
+
+    def _purge_record_files(self, record: ReimbursementRecord) -> bool:
+        descriptors: list[int] = []
+        try:
+            expected_prefix = ("users", str(record.user_id), record.id)
+            for kind, stored_value in (
+                ("xlsx", record.xlsx_path),
+                ("pdf", record.pdf_path),
+            ):
+                if not isinstance(stored_value, str) or not stored_value:
+                    raise ValueError("invalid stored path")
+                stored_path = Path(stored_value)
+                if (
+                    stored_path.is_absolute()
+                    or ".." in stored_path.parts
+                    or stored_path.parts[:3] != expected_prefix
+                    or len(stored_path.parts) < 4
+                ):
+                    raise ValueError("stored path is outside record directory")
+                self._validated_artifact_name(stored_path.parts[-1], f".{kind}")
+
+            data_fd = os.open(Path(self._config.data_dir).resolve(), _DIRECTORY_OPEN_FLAGS)
+            descriptors.append(data_fd)
+            users_fd = self._open_directory(data_fd, "users")
+            descriptors.append(users_fd)
+            owner_fd = self._open_directory(users_fd, str(record.user_id))
+            descriptors.append(owner_fd)
+            record_fd = self._open_directory(owner_fd, record.id)
+            descriptors.append(record_fd)
+            identity = self._directory_identity(os.fstat(record_fd))
+            return self._cleanup_at(owner_fd, record.id, {identity}, record.id)
+        except FileNotFoundError:
+            return True
+        except Exception as error:
+            _LOGGER.error(
+                "reimbursement purge filesystem check failed record_id=%s exception=%s",
+                record.id,
+                type(error).__name__,
+            )
+            return False
+        finally:
+            for descriptor in reversed(descriptors):
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
 
     @staticmethod
     def _record_from_row(row) -> ReimbursementRecord:
@@ -652,7 +799,10 @@ class ReimbursementService:
         )
 
     def _utc_now(self) -> datetime:
-        value = self._clock()
+        return self._utc_time(None)
+
+    def _utc_time(self, supplied: datetime | None) -> datetime:
+        value = self._clock() if supplied is None else supplied
         if not isinstance(value, datetime) or value.tzinfo is None:
             raise ValueError("clock must return an aware datetime")
         return value.astimezone(timezone.utc)
@@ -728,36 +878,38 @@ class ReimbursementService:
         name: str,
         expected_identities: set[tuple[int, int]],
         record_id: str,
-    ) -> None:
+    ) -> bool:
         root_fd: int | None = None
         quarantine_fd: int | None = None
         try:
             root_fd = self._open_directory(parent_fd, name)
             root_metadata = os.fstat(root_fd)
             if self._directory_identity(root_metadata) not in expected_identities:
-                return
+                return False
             if self._remove_tree is not None:
                 self._remove_tree(name, dir_fd=parent_fd, root_fd=root_fd)
+            self._remove_directory_contents(root_fd)
             quarantine_name, quarantine_fd, matches = self._isolate_entry(
                 parent_fd,
                 name,
                 root_metadata,
             )
             if not matches:
-                return
-            self._remove_directory_contents(root_fd)
+                return False
             os.rmdir(_CLEANUP_ENTRY_NAME, dir_fd=quarantine_fd)
             os.close(quarantine_fd)
             quarantine_fd = None
             os.rmdir(quarantine_name, dir_fd=parent_fd)
+            return True
         except FileNotFoundError:
-            return
+            return True
         except Exception as cleanup_error:
             _LOGGER.error(
                 "reimbursement cleanup failed record_id=%s exception=%s",
                 record_id,
                 type(cleanup_error).__name__,
             )
+            return False
         finally:
             if quarantine_fd is not None:
                 os.close(quarantine_fd)

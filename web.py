@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from email import policy
+from email.parser import BytesParser
 import hashlib
 from http import cookies
 from http.server import BaseHTTPRequestHandler
@@ -12,12 +15,20 @@ import logging
 import math
 import mimetypes
 from pathlib import Path, PurePosixPath
+import tempfile
 import threading
 import time
 from typing import Callable, Hashable, Iterable
-from urllib.parse import unquote, urlsplit
+from urllib.parse import parse_qs, quote, unquote, urlsplit
+from uuid import UUID
 
 from config import AppConfig
+from reimbursements import (
+    ReimbursementGenerationError,
+    ReimbursementNotFound,
+    ReimbursementRecord,
+    ReimbursementService,
+)
 from security import AnonymousCsrfSigner
 from sessions import AuthenticatedUser, SessionService
 from users import (
@@ -28,6 +39,11 @@ from users import (
     UsernameTaken,
     ValidationError,
     canonicalize_username,
+)
+from validation import (
+    ValidationError as ReimbursementValidationError,
+    validate_image_filename,
+    validate_payload,
 )
 
 
@@ -40,6 +56,10 @@ RATE_LIMIT_MAX_KEYS = 4096
 LOGIN_IP_RATE_LIMIT_ATTEMPTS = 10
 LOGIN_GLOBAL_RATE_LIMIT_ATTEMPTS = 100
 _INVALID_LOGIN_USERNAME_KEY = ("invalid", "<invalid>")
+_REIMBURSEMENT_PREFIX = "/api/reimbursements/"
+_XLSX_CONTENT_TYPE = (
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+)
 _STATIC_EXTENSIONS = {
     ".css", ".js", ".html", ".ico", ".png", ".jpg", ".jpeg", ".svg", ".webp",
     ".woff", ".woff2", ".ttf",
@@ -145,12 +165,14 @@ class WebApplication:
         user_service: UserService,
         session_service: SessionService,
         anonymous_csrf: AnonymousCsrfSigner,
+        reimbursement_service: ReimbursementService,
         rate_limiter: AttemptRateLimiter | None = None,
     ):
         self.config = config
         self.user_service = user_service
         self.session_service = session_service
         self.anonymous_csrf = anonymous_csrf
+        self.reimbursement_service = reimbursement_service
         self.rate_limiter = rate_limiter or AttemptRateLimiter()
         self.get_routes = {
             "/healthz": Route("_health", setup="any"),
@@ -159,6 +181,9 @@ class WebApplication:
             "/register": Route("_register_page"),
             "/api/session": Route(
                 "_session", authentication=True, allow_forced_password_change=True
+            ),
+            "/api/reimbursements": Route(
+                "_reimbursement_list", authentication=True, roles=("user",)
             ),
             "/change-password": Route(
                 "_change_password_page", authentication=True, roles=("user",),
@@ -180,6 +205,10 @@ class WebApplication:
             ),
             "/api/logout": Route(
                 "_logout", authentication=True, allow_forced_password_change=True,
+                csrf="session",
+            ),
+            "/api/reimbursements/generate": Route(
+                "_reimbursement_generate", authentication=True, roles=("user",),
                 csrf="session",
             ),
         }
@@ -222,9 +251,9 @@ class WebApplication:
             self._json(handler, 404, {"error": "请求路径不存在"})
             return
         allowed = []
-        if path in self.get_routes or path.startswith("/static/"):
+        if self._route_for("GET", path) is not None or path.startswith("/static/"):
             allowed.append("GET")
-        if path in self.post_routes:
+        if self._route_for("POST", path) is not None:
             allowed.append("POST")
         if not allowed:
             self._json(handler, 404, {"error": "请求路径不存在"})
@@ -252,11 +281,10 @@ class WebApplication:
             self._method_not_allowed(handler, "GET")
             return
 
-        routes = self.get_routes if method == "GET" else self.post_routes
-        route = routes.get(path)
-        other_routes = self.post_routes if method == "GET" else self.get_routes
+        route = self._route_for(method, path)
         if route is None:
-            if path in other_routes:
+            other_method = "POST" if method == "GET" else "GET"
+            if self._route_for(other_method, path) is not None:
                 self._method_not_allowed(handler, "POST" if method == "GET" else "GET")
             else:
                 self._json(handler, 404, {"error": "请求路径不存在"})
@@ -294,7 +322,6 @@ class WebApplication:
                 self._json(handler, 403, {"error": "安全校验失败，请刷新页面后重试"})
                 return
 
-        # Resource-ownership checks belong here when record routes arrive in Task 8.
         callback: Callable[[BaseHTTPRequestHandler, AuthenticatedUser | None, str | None], None]
         callback = getattr(self, route.callback)
         try:
@@ -305,6 +332,23 @@ class WebApplication:
         except Exception:
             _LOGGER.exception("unhandled web request failure for %s %s", method, path)
             self._json(handler, 500, {"error": "服务暂时不可用，请稍后重试"})
+
+    def _route_for(self, method: str, path: str) -> Route | None:
+        routes = self.get_routes if method == "GET" else self.post_routes
+        route = routes.get(path)
+        if route is not None or not path.startswith(_REIMBURSEMENT_PREFIX):
+            return route
+        parts = path[len(_REIMBURSEMENT_PREFIX):].split("/")
+        if len(parts) != 2 or not all(parts):
+            return None
+        if method == "GET":
+            return Route("_reimbursement_download", authentication=True)
+        if parts[1] in {"trash", "restore", "purge"}:
+            return Route(
+                "_reimbursement_lifecycle", authentication=True, roles=("user",),
+                csrf="session",
+            )
+        return None
 
     def _guard_setup(
         self,
@@ -481,6 +525,252 @@ class WebApplication:
             handler, 200, {"message": "已退出登录", "next": "/login"},
             cookie=self._expired_cookie(),
         )
+
+    def _reimbursement_list(self, handler, user, _token) -> None:
+        assert user is not None
+        parameters = parse_qs(
+            urlsplit(handler.path).query,
+            keep_blank_values=True,
+            strict_parsing=False,
+        )
+        if set(parameters) != {"scope"} or len(parameters["scope"]) != 1:
+            self._json(handler, 400, {"error": "报销记录范围无效"})
+            return
+        scope = parameters["scope"][0]
+        if scope == "active":
+            records = self.reimbursement_service.list_active(user.user_id)
+        elif scope == "trash":
+            records = self.reimbursement_service.list_trash(user.user_id)
+        else:
+            self._json(handler, 400, {"error": "报销记录范围无效"})
+            return
+        self._json(
+            handler,
+            200,
+            {"reimbursements": [self._record_payload(record) for record in records]},
+        )
+
+    def _reimbursement_download(self, handler, user, _token) -> None:
+        assert user is not None
+        parts = self._reimbursement_parts(handler)
+        if parts is None or parts[1] not in {"xlsx", "pdf"} or user.role != "user":
+            self._record_not_found(handler)
+            return
+        record_id, kind = parts
+        try:
+            owned_file = self.reimbursement_service.owned_file(
+                user.user_id, record_id, kind
+            )
+        except ReimbursementNotFound:
+            self._record_not_found(handler)
+            return
+        with owned_file as owned:
+            content_types = {
+                "xlsx": _XLSX_CONTENT_TYPE,
+                "pdf": "application/pdf",
+            }
+            dispositions = {"xlsx": "attachment", "pdf": "inline"}
+            handler.send_response(200)
+            handler.send_header("Content-Type", content_types[owned.kind])
+            handler.send_header("Content-Length", str(owned.size))
+            handler.send_header("X-Content-Type-Options", "nosniff")
+            handler.send_header("Cache-Control", "no-store")
+            handler.send_header(
+                "Content-Disposition",
+                f"{dispositions[owned.kind]}; filename*=UTF-8''"
+                + quote(owned.display_name, safe=""),
+            )
+            handler.end_headers()
+            while True:
+                chunk = owned.stream.read(65536)
+                if not chunk:
+                    break
+                handler.wfile.write(chunk)
+
+    def _reimbursement_lifecycle(self, handler, user, _token) -> None:
+        assert user is not None
+        parts = self._reimbursement_parts(handler)
+        if parts is None or parts[1] not in {"trash", "restore", "purge"}:
+            self._json(handler, 404, {"error": "请求路径不存在"})
+            return
+        if user.role != "user":
+            self._record_not_found(handler)
+            return
+        record_id, action = parts
+        payload = self._json_body(handler)
+        if payload is None:
+            return
+        confirmed = (
+            set(payload) == {"confirm"}
+            and type(payload.get("confirm")) is bool
+            and payload["confirm"] is True
+        )
+        if action == "purge" and not confirmed:
+            self._json(handler, 400, {"error": "请确认永久删除报销记录"})
+            return
+        try:
+            if action == "trash":
+                record = self.reimbursement_service.trash(user.user_id, record_id)
+                self._json(handler, 200, {"record": self._record_payload(record)})
+            elif action == "restore":
+                record = self.reimbursement_service.restore(user.user_id, record_id)
+                self._json(handler, 200, {"record": self._record_payload(record)})
+            else:
+                self.reimbursement_service.purge_one(user.user_id, record_id)
+                self._json(handler, 200, {"message": "报销记录已永久删除"})
+        except ReimbursementNotFound:
+            self._record_not_found(handler)
+
+    def _reimbursement_generate(self, handler, user, _token) -> None:
+        assert user is not None
+        body = self._multipart_body(handler)
+        if body is None:
+            return
+        content_type = handler.headers.get("Content-Type", "")
+        try:
+            message = BytesParser(policy=policy.default).parsebytes(
+                (f"Content-Type: {content_type}\r\nMIME-Version: 1.0\r\n\r\n").encode(
+                    "utf-8"
+                )
+                + body
+            )
+            if not message.is_multipart():
+                raise ValueError("invalid multipart body")
+            payload_raw: bytes | None = None
+            screenshots: list[tuple[str, bytes]] = []
+            for part in message.iter_parts():
+                name = part.get_param("name", header="content-disposition")
+                if name == "payload" and payload_raw is None:
+                    payload_raw = part.get_payload(decode=True) or b""
+                elif name == "screenshots":
+                    filename = part.get_filename()
+                    if filename:
+                        screenshots.append(
+                            (
+                                validate_image_filename(filename),
+                                part.get_payload(decode=True) or b"",
+                            )
+                        )
+            if payload_raw is None:
+                raise ReimbursementValidationError("payload part is required")
+            try:
+                raw_payload = json.loads(payload_raw.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                raise ReimbursementValidationError("invalid JSON payload") from None
+            validate_payload(
+                raw_payload,
+                traveler=user.real_name,
+                department=user.department,
+            )
+        except (ReimbursementValidationError, ValueError, UnicodeError) as error:
+            self._json(handler, 400, {"error": str(error) or "报销请求格式错误"})
+            return
+
+        try:
+            with tempfile.TemporaryDirectory(prefix="reimbursement-upload-") as temp_name:
+                image_paths = []
+                for index, (filename, data) in enumerate(screenshots):
+                    image_path = Path(temp_name) / f"{index:04d}-{filename}"
+                    image_path.write_bytes(data)
+                    image_paths.append(image_path)
+                record = self.reimbursement_service.generate(
+                    user, raw_payload, image_paths
+                )
+        except ReimbursementGenerationError as error:
+            self._json(handler, 500, {"error": str(error)})
+            return
+
+        record_payload = self._record_payload(record)
+        self._json(
+            handler,
+            200,
+            {
+                "record": record_payload,
+                "xlsx_url": record_payload["xlsx_url"],
+                "pdf_url": record_payload["pdf_url"],
+                "xlsx_filename": record.display_name,
+                "pdf_filename": record.display_name[:-5] + ".pdf",
+            },
+        )
+
+    def _multipart_body(self, handler: BaseHTTPRequestHandler) -> bytes | None:
+        length_headers = handler.headers.get_all("Content-Length", failobj=[])
+        length_header = length_headers[0] if len(length_headers) == 1 else None
+        if (
+            length_header is None
+            or not length_header.isascii()
+            or not length_header.isdecimal()
+            or len(length_header) > 20
+            or handler.headers.get("Transfer-Encoding") is not None
+        ):
+            self._json(handler, 400, {"error": "请求体长度无效"})
+            return None
+        length = int(length_header, 10)
+        if length > self.config.max_body_bytes:
+            handler.close_connection = True
+            self._json(handler, 413, {"error": "请求体过大"})
+            return None
+        content_type = handler.headers.get("Content-Type", "")
+        if content_type.split(";", 1)[0].strip().lower() != "multipart/form-data":
+            self._json(handler, 415, {"error": "仅支持 multipart/form-data"})
+            return None
+        try:
+            body = handler.read_request_body(length)
+        except TimeoutError:
+            handler.close_connection = True
+            self._json(
+                handler,
+                408,
+                {"error": "请求体读取超时"},
+                headers={"Connection": "close"},
+            )
+            return None
+        if len(body) != length:
+            handler.close_connection = True
+            self._json(
+                handler,
+                400,
+                {"error": "请求体不完整"},
+                headers={"Connection": "close"},
+            )
+            return None
+        return body
+
+    @staticmethod
+    def _reimbursement_parts(handler: BaseHTTPRequestHandler) -> tuple[str, str] | None:
+        path = WebApplication._decoded_path(handler.path)
+        if path is None or not path.startswith(_REIMBURSEMENT_PREFIX):
+            return None
+        parts = path[len(_REIMBURSEMENT_PREFIX):].split("/")
+        if len(parts) != 2 or not all(parts):
+            return None
+        try:
+            record_uuid = UUID(parts[0])
+        except ValueError:
+            return None
+        if record_uuid.version != 4 or str(record_uuid) != parts[0]:
+            return None
+        return parts[0], parts[1]
+
+    @staticmethod
+    def _record_payload(record: ReimbursementRecord) -> dict:
+        root = f"/api/reimbursements/{record.id}"
+        payload = {
+            "id": record.id,
+            "reimbursement_date": record.reimbursement_date,
+            "display_name": record.display_name,
+            "created_at": record.created_at,
+            "deleted_at": record.deleted_at,
+            "xlsx_url": root + "/xlsx",
+            "pdf_url": root + "/pdf",
+        }
+        if record.deleted_at is not None:
+            deleted_at = datetime.fromisoformat(record.deleted_at).astimezone(timezone.utc)
+            payload["purge_at"] = (deleted_at + timedelta(days=30)).isoformat()
+        return payload
+
+    def _record_not_found(self, handler: BaseHTTPRequestHandler) -> None:
+        self._json(handler, 404, {"error": "报销记录不存在"})
 
     def _not_found(self, handler, _user, _token) -> None:
         self._json(handler, 404, {"error": "请求路径不存在"})

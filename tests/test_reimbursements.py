@@ -1353,6 +1353,13 @@ class ReimbursementServiceTest(unittest.TestCase):
                 self.server_address = address
                 self.handler = handler
 
+            def start_cleanup(self, cleanup, runner):
+                self.cleanup = cleanup
+                self.cleanup_runner = runner
+
+            def server_close(self):
+                self.closed = True
+
         with mock.patch.object(app, "BoundedThreadingHTTPServer", FakeServer), mock.patch(
             "reimbursements.find_soffice",
             side_effect=AssertionError("soffice discovery must stay lazy"),

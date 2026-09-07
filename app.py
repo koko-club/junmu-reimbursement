@@ -5,10 +5,12 @@ from __future__ import annotations
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import io
+import logging
 from pathlib import Path
 import socket
 import threading
 import time
+from typing import Callable
 
 from config import load_config
 from database import Database
@@ -21,6 +23,34 @@ from web import WebApplication
 
 DEFAULT_REQUEST_IDLE_TIMEOUT_SECONDS = 15.0
 DEFAULT_MAX_CONCURRENT_REQUESTS = 32
+_CLEANUP_INTERVAL_SECONDS = 86400
+_LOGGER = logging.getLogger(__name__)
+
+
+def _cleanup_loop(
+    stop_event: threading.Event,
+    cleanup: Callable[[], None],
+) -> None:
+    while not stop_event.wait(_CLEANUP_INTERVAL_SECONDS):
+        cleanup()
+
+
+def _purge_expired(
+    session_service: SessionService,
+    reimbursement_service: ReimbursementService,
+) -> None:
+    for label, purge in (
+        ("sessions", session_service.purge_expired),
+        ("reimbursements", reimbursement_service.purge_expired),
+    ):
+        try:
+            purge()
+        except Exception as error:
+            _LOGGER.error(
+                "scheduled cleanup failed target=%s exception=%s",
+                label,
+                type(error).__name__,
+            )
 
 
 class _DeadlineSocketReader(io.RawIOBase):
@@ -81,7 +111,42 @@ class BoundedThreadingHTTPServer(ThreadingHTTPServer):
         self._request_slots = threading.BoundedSemaphore(self.max_concurrent_requests)
         self._request_count_lock = threading.Lock()
         self._active_request_count = 0
+        self.cleanup_stop_event: threading.Event | None = None
+        self.cleanup_thread: threading.Thread | None = None
         super().__init__(server_address, request_handler_class)
+
+    def start_cleanup(
+        self,
+        cleanup: Callable[[], None],
+        runner: Callable[[threading.Event, Callable[[], None]], None],
+    ) -> None:
+        if self.cleanup_thread is not None:
+            raise RuntimeError("cleanup loop already started")
+        stop_event = threading.Event()
+        cleanup_thread = threading.Thread(
+            target=runner,
+            args=(stop_event, cleanup),
+            name="reimbursement-cleanup",
+            daemon=True,
+        )
+        self.cleanup_stop_event = stop_event
+        self.cleanup_thread = cleanup_thread
+        cleanup_thread.start()
+
+    def server_close(self) -> None:
+        stop_event = self.cleanup_stop_event
+        cleanup_thread = self.cleanup_thread
+        if stop_event is not None:
+            stop_event.set()
+        try:
+            super().server_close()
+        finally:
+            if (
+                cleanup_thread is not None
+                and cleanup_thread.ident is not None
+                and cleanup_thread is not threading.current_thread()
+            ):
+                cleanup_thread.join()
 
     @property
     def active_request_count(self) -> int:
@@ -157,7 +222,13 @@ class BoundedThreadingHTTPServer(ThreadingHTTPServer):
             self.shutdown_request(request)
 
 
-def create_server(config_path: Path) -> ThreadingHTTPServer:
+def create_server(
+    config_path: Path,
+    *,
+    cleanup_runner: Callable[
+        [threading.Event, Callable[[], None]], None
+    ] = _cleanup_loop,
+) -> ThreadingHTTPServer:
     """Create the configured server without starting its serving loop."""
     config = load_config(Path(config_path), allow_ephemeral_port=True)
     config.data_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -178,8 +249,8 @@ def create_server(config_path: Path) -> ThreadingHTTPServer:
         user_service,
         session_service,
         AnonymousCsrfSigner(secret),
+        reimbursement_service,
     )
-    application.reimbursement_service = reimbursement_service
 
     class Handler(BaseHTTPRequestHandler):
         server_version = "ReimbursementTool/2.0"
@@ -321,6 +392,13 @@ def create_server(config_path: Path) -> ThreadingHTTPServer:
     server.application = application
     server.database = database
     server.reimbursement_service = reimbursement_service
+    cleanup = lambda: _purge_expired(session_service, reimbursement_service)
+    cleanup()
+    try:
+        server.start_cleanup(cleanup, cleanup_runner)
+    except BaseException:
+        server.server_close()
+        raise
     return server
 
 

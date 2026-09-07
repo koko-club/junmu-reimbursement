@@ -96,6 +96,7 @@ class ServerTest(unittest.TestCase):
 
     def test_running_app_closes_server_and_temporary_directory_when_thread_start_fails(self):
         original_create_server = app.create_server
+        original_thread_start = threading.Thread.start
         created = []
 
         def tracked_create_server(config_path):
@@ -105,18 +106,25 @@ class ServerTest(unittest.TestCase):
             created.append(server)
             return server
 
+        def fail_serving_thread_start(thread):
+            if thread.name == "reimbursement-cleanup":
+                return original_thread_start(thread)
+            raise RuntimeError("thread failed")
+
         running = RunningApp()
         try:
             with mock.patch(
                 "tests.http_helpers.app.create_server", side_effect=tracked_create_server
             ), mock.patch(
                 "tests.http_helpers.threading.Thread.start",
-                side_effect=RuntimeError("thread failed"),
+                autospec=True,
+                side_effect=fail_serving_thread_start,
             ):
                 with self.assertRaisesRegex(RuntimeError, "thread failed"):
                     running.__enter__()
             created[0].shutdown.assert_not_called()
             created[0].server_close.assert_called_once_with()
+            self.assertFalse(created[0].cleanup_thread.is_alive())
             self.assertFalse(running.root.exists())
         finally:
             if created and created[0].fileno() != -1:
