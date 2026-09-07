@@ -97,6 +97,7 @@ class UserService:
     ):
         self._database = database
         self._password_hasher = password_hasher
+        self._dummy_password_material = password_hasher.dummy_material()
         self._revoke_sessions = revoke_sessions or (lambda _user_id: None)
 
     def setup_complete(self) -> bool:
@@ -162,22 +163,33 @@ class UserService:
             return self._get_in(connection, cursor.lastrowid)
 
     def authenticate(self, username: str, password: str) -> User:
+        username_key = None
         try:
             _, username_key = self._username(username)
-        except ValidationError as error:
-            raise AuthenticationFailed("invalid username or password") from error
-        with self._database.transaction() as connection:
-            row = connection.execute(
-                "SELECT * FROM users WHERE username_key = ?", (username_key,)
-            ).fetchone()
-        if row is None or row["status"] != "active":
-            raise AuthenticationFailed("invalid username or password")
-        material = PasswordMaterial(
-            digest=bytes(row["password_hash"]),
-            salt=bytes(row["password_salt"]),
-            params=row["password_params"],
-        )
-        if not self._password_hasher.verify(password, material):
+        except ValidationError:
+            pass
+        row = None
+        if username_key is not None:
+            with self._database.transaction() as connection:
+                row = connection.execute(
+                    "SELECT * FROM users WHERE username_key = ?", (username_key,)
+                ).fetchone()
+        material = self._dummy_password_material
+        if row is not None:
+            material = PasswordMaterial(
+                digest=bytes(row["password_hash"]),
+                salt=bytes(row["password_salt"]),
+                params=row["password_params"],
+            )
+        password_is_valid = isinstance(password, str) and 8 <= len(password) <= 128
+        candidate = password if password_is_valid else "invalid-password-placeholder"
+        password_matches = self._password_hasher.verify(candidate, material)
+        if (
+            row is None
+            or row["status"] != "active"
+            or not password_is_valid
+            or not password_matches
+        ):
             raise AuthenticationFailed("invalid username or password")
         return self._public_user(row)
 

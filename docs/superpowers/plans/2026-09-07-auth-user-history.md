@@ -409,7 +409,7 @@ Expected: session and user tests pass.
 - Modify: `app.py`
 - Modify: `tests/test_server.py`
 
-- [ ] **Step 1: Create a cookie-preserving fixture and failing route tests**
+- [x] **Step 1: Create a cookie-preserving fixture and failing route tests**
 
 `tests/http_helpers.py` exposes a `RunningApp` context manager that creates temporary config/templates/data, starts `create_server()` on port 0, and provides clients backed by `urllib.request.HTTPCookieProcessor`.
 
@@ -438,7 +438,7 @@ def test_forced_change_session_cannot_open_application(self):
 
 Also test anonymous CSRF on setup/login/register, session CSRF on logout/change-password, pending/disabled login messages, cookie deletion, role redirects, body-size checks before parsing, static traversal, and `Secure` only when configured.
 
-- [ ] **Step 2: Verify failure**
+- [x] **Step 2: Verify failure**
 
 ```bash
 python3 -m unittest tests.test_web_auth -v
@@ -446,7 +446,7 @@ python3 -m unittest tests.test_web_auth -v
 
 Expected: guarded routes are absent.
 
-- [ ] **Step 3: Implement `WebApplication`**
+- [x] **Step 3: Implement `WebApplication`**
 
 Define explicit GET/POST route tables. Before setup completion, allow only `/healthz`, setup GET/POST, and required static assets. After setup, HTML guards use 303 redirects and API guards use JSON 401/403. Apply guards in this order: setup, session, account status, forced password change, role, CSRF for writes, resource ownership.
 
@@ -468,7 +468,7 @@ POST /api/password/change
 POST /api/logout
 ```
 
-- [ ] **Step 4: Compose services in `app.create_server()`**
+- [x] **Step 4: Compose services in `app.create_server()`**
 
 Load `AppConfig`, create the data directory, migrate the database, load `/data/app-secret`, and compose `PasswordHasher`, `SessionService`, `UserService`, and `WebApplication`. Keep the public signature `create_server(config_path: Path) -> ThreadingHTTPServer`.
 
@@ -487,7 +487,7 @@ class Handler(BaseHTTPRequestHandler):
 
 Adapt inherited tests to initialize/login; do not preserve unauthenticated `/generate` or filename-only `/download` compatibility.
 
-- [ ] **Step 5: Run tests and commit**
+- [x] **Step 5: Run tests and commit**
 
 ```bash
 python3 -m unittest tests.test_web_auth tests.test_server -v

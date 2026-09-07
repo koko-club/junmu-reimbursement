@@ -175,6 +175,37 @@ class UserServiceTest(unittest.TestCase):
         with self.assertRaises(AuthenticationFailed):
             self.service.authenticate("pending", "correct horse battery staple")
 
+    def test_authentication_runs_one_verify_for_unknown_inactive_and_invalid_inputs(self):
+        admin = self.setup_admin()
+        self.service.register(
+            "pending", "correct horse battery staple", "Pending", "Engineering"
+        )
+        disabled = self.service.register(
+            "disabled", "correct horse battery staple", "Disabled", "Engineering"
+        )
+        self.service.approve(admin.id, disabled.id)
+        self.service.set_enabled(admin.id, disabled.id, False)
+
+        cases = (
+            ("missing", "correct horse battery staple"),
+            ("pending", "correct horse battery staple"),
+            ("disabled", "correct horse battery staple"),
+            ("x", "correct horse battery staple"),
+            ("admin", None),
+            ("admin", "short"),
+        )
+        with mock.patch.object(self.service._password_hasher, "verify", return_value=True) as verify:
+            for username, password in cases:
+                with self.subTest(username=username, password=password):
+                    verify.reset_mock()
+                    with self.assertRaises(AuthenticationFailed):
+                        self.service.authenticate(username, password)
+                    verify.assert_called_once()
+                    submitted, material = verify.call_args.args
+                    self.assertIsInstance(submitted, str)
+                    self.assertGreaterEqual(len(submitted), 8)
+                    self.assertIsInstance(material, users.PasswordMaterial)
+
     def test_reset_and_change_password_revoke_sessions_and_never_persist_plaintext(self):
         admin, user = self.register_and_approve()
         with mock.patch("users.secrets.token_urlsafe", return_value="temporary-secret"):

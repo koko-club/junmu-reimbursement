@@ -141,39 +141,55 @@ class RunningApp:
 
     def __enter__(self):
         self._temporary = tempfile.TemporaryDirectory()
-        self.root = Path(self._temporary.name)
-        self.templates_dir = self.root / "templates"
-        self.static_dir = self.root / "static"
-        self.data_dir = self.root / "data"
-        self.templates_dir.mkdir()
-        self.static_dir.mkdir()
-        (self.templates_dir / "index.html").write_text(
-            "<!doctype html><html><body>reimbursement form</body></html>", encoding="utf-8"
-        )
-        (self.static_dir / "app.js").write_text("window.appLoaded = true;", encoding="utf-8")
-        (self.root / "template.xlsx").write_bytes(b"template")
-        self.config_path = self.root / "config.json"
-        self.config_path.write_text(
-            json.dumps(
-                {
-                    "template_path": "template.xlsx",
-                    "data_dir": "data",
-                    "templates_dir": "templates",
-                    "static_dir": "static",
-                    "host": "127.0.0.1",
-                    "port": 0,
-                    "max_body_bytes": self.max_body_bytes,
-                    "cookie_secure": self.cookie_secure,
-                }
-            ),
-            encoding="utf-8",
-        )
-        self.server = app.create_server(self.config_path)
-        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
-        self.thread.start()
-        self.base_url = f"http://127.0.0.1:{self.server.server_address[1]}"
-        self.client = self.new_client()
-        return self
+        server = None
+        thread_started = False
+        try:
+            self.root = Path(self._temporary.name)
+            self.templates_dir = self.root / "templates"
+            self.static_dir = self.root / "static"
+            self.data_dir = self.root / "data"
+            self.templates_dir.mkdir()
+            self.static_dir.mkdir()
+            (self.templates_dir / "index.html").write_text(
+                "<!doctype html><html><body>reimbursement form</body></html>", encoding="utf-8"
+            )
+            (self.static_dir / "app.js").write_text(
+                "window.appLoaded = true;", encoding="utf-8"
+            )
+            (self.root / "template.xlsx").write_bytes(b"template")
+            self.config_path = self.root / "config.json"
+            self.config_path.write_text(
+                json.dumps(
+                    {
+                        "template_path": "template.xlsx",
+                        "data_dir": "data",
+                        "templates_dir": "templates",
+                        "static_dir": "static",
+                        "host": "127.0.0.1",
+                        "port": 0,
+                        "max_body_bytes": self.max_body_bytes,
+                        "cookie_secure": self.cookie_secure,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            server = app.create_server(self.config_path)
+            self.server = server
+            self.thread = threading.Thread(target=server.serve_forever, daemon=True)
+            self.thread.start()
+            thread_started = True
+            self.base_url = f"http://127.0.0.1:{server.server_address[1]}"
+            self.client = self.new_client()
+            return self
+        except BaseException:
+            if server is not None:
+                if thread_started:
+                    server.shutdown()
+                server.server_close()
+                if thread_started:
+                    self.thread.join(timeout=2)
+            self._temporary.cleanup()
+            raise
 
     @property
     def users(self):

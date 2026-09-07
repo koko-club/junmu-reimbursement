@@ -10,6 +10,7 @@ from pathlib import Path
 import secrets
 import stat
 import tempfile
+import threading
 import time
 
 
@@ -31,13 +32,27 @@ class PasswordMaterial:
 class PasswordHasher:
     """Hash passwords with scrypt and retain the work factors per digest."""
 
-    def __init__(self, n: int = 16384, r: int = 8, p: int = 1):
+    def __init__(
+        self, n: int = 16384, r: int = 8, p: int = 1, max_concurrent_scrypt: int = 2
+    ):
         self._params = self._validate_params({"n": n, "r": r, "p": p})
+        if type(max_concurrent_scrypt) is not int or max_concurrent_scrypt <= 0:
+            raise ValueError("max concurrent scrypt operations must be positive")
+        self._scrypt_slots = threading.BoundedSemaphore(max_concurrent_scrypt)
+
+    def dummy_material(self) -> PasswordMaterial:
+        """Return non-secret material that exercises this instance's scrypt cost."""
+        return PasswordMaterial(
+            digest=b"\x00" * _DIGEST_LENGTH,
+            salt=b"\x00" * _SALT_LENGTH,
+            params=json.dumps(self._params, separators=(",", ":"), sort_keys=True),
+        )
 
     def hash(self, password: str) -> PasswordMaterial:
         password_bytes = self._password_bytes(password)
         salt = secrets.token_bytes(_SALT_LENGTH)
-        digest = self._scrypt(password_bytes, salt, self._params)
+        with self._scrypt_slots:
+            digest = self._scrypt(password_bytes, salt, self._params)
         return PasswordMaterial(
             digest=digest,
             salt=salt,
@@ -56,7 +71,8 @@ class PasswordHasher:
             if not isinstance(material.params, str):
                 return False
             params = self._validate_params(json.loads(material.params))
-            candidate = self._scrypt(password_bytes, material.salt, params)
+            with self._scrypt_slots:
+                candidate = self._scrypt(password_bytes, material.salt, params)
         except (TypeError, ValueError, json.JSONDecodeError, OverflowError):
             return False
         return hmac.compare_digest(candidate, material.digest)

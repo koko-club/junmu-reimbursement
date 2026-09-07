@@ -113,6 +113,48 @@ class PasswordHasherTest(unittest.TestCase):
 
         self.assertTrue(hasher.verify("correct horse battery staple", material))
 
+    def test_one_hasher_limits_combined_hash_and_verify_scrypt_concurrency(self):
+        hasher = PasswordHasher(n=1024, r=8, p=1)
+        material = hasher.dummy_material()
+        lock = threading.Lock()
+        two_entered = threading.Event()
+        third_entered = threading.Event()
+        release = threading.Event()
+        active = 0
+        peak = 0
+
+        def blocked_scrypt(*args, **kwargs):
+            nonlocal active, peak
+            with lock:
+                active += 1
+                peak = max(peak, active)
+                if active == 2:
+                    two_entered.set()
+                if active >= 3:
+                    third_entered.set()
+            try:
+                self.assertTrue(release.wait(timeout=2))
+                return b"d" * 32
+            finally:
+                with lock:
+                    active -= 1
+
+        with mock.patch("security.hashlib.scrypt", side_effect=blocked_scrypt):
+            with ThreadPoolExecutor(max_workers=6) as executor:
+                futures = [
+                    executor.submit(hasher.hash, "correct horse battery staple")
+                    for _ in range(3)
+                ] + [
+                    executor.submit(hasher.verify, "correct horse battery staple", material)
+                    for _ in range(3)
+                ]
+                self.assertTrue(two_entered.wait(timeout=1))
+                self.assertFalse(third_entered.wait(timeout=0.1))
+                release.set()
+                for future in futures:
+                    future.result(timeout=2)
+        self.assertEqual(peak, 2)
+
 
 class SecretFileTest(unittest.TestCase):
     def test_secret_is_reused_and_is_private_to_owner(self):

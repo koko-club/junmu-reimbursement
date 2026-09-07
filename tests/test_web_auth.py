@@ -1,13 +1,60 @@
 from __future__ import annotations
 
+import threading
 import unittest
 from unittest import mock
 
 from tests.http_helpers import RunningApp
+from web import AttemptRateLimiter
 
 
 ADMIN_PASSWORD = "administrator1"
 USER_PASSWORD = "correct horse battery staple"
+
+
+class AttemptRateLimiterTest(unittest.TestCase):
+    def test_window_is_injected_and_expired_entries_are_lazily_removed(self):
+        now = [100.0]
+        limiter = AttemptRateLimiter(limit=2, window_seconds=10, clock=lambda: now[0])
+        self.assertIsNone(limiter.reserve(("register", "127.0.0.1")))
+        self.assertIsNone(limiter.reserve(("register", "127.0.0.1")))
+        self.assertEqual(limiter.reserve(("register", "127.0.0.1")), 10)
+        now[0] = 111.0
+        self.assertIsNone(limiter.reserve(("register", "127.0.0.1")))
+
+    def test_concurrent_reservations_keep_timestamps_in_clock_order(self):
+        first_clock_called = threading.Event()
+        second_reserved = threading.Event()
+
+        def clock():
+            if threading.current_thread().name == "first-reservation":
+                first_clock_called.set()
+                second_reserved.wait(timeout=0.1)
+                return 100.0
+            if threading.current_thread().name == "second-reservation":
+                return 101.0
+            return 102.0
+
+        limiter = AttemptRateLimiter(limit=2, window_seconds=10, clock=clock)
+
+        first = threading.Thread(
+            name="first-reservation", target=lambda: limiter.reserve("login")
+        )
+
+        def reserve_second():
+            limiter.reserve("login")
+            second_reserved.set()
+
+        second = threading.Thread(name="second-reservation", target=reserve_second)
+        first.start()
+        self.assertTrue(first_clock_called.wait(timeout=1))
+        second.start()
+        first.join(timeout=1)
+        second.join(timeout=1)
+
+        self.assertFalse(first.is_alive())
+        self.assertFalse(second.is_alive())
+        self.assertEqual(limiter.reserve("login"), 8)
 
 
 class WebAuthenticationTest(unittest.TestCase):
@@ -155,6 +202,146 @@ class WebAuthenticationTest(unittest.TestCase):
         self.assertEqual(disabled.body, unknown.body)
         self.assertNotIn(b"pending", pending.body.lower())
         self.assertNotIn(b"disabled", disabled.body.lower())
+
+    def test_malformed_login_credentials_still_run_one_password_verification(self):
+        self.setup_admin()
+        token = self.client.csrf_for("/api/login")
+        hasher = self.running.users._password_hasher
+        payloads = (
+            {"password": USER_PASSWORD},
+            {"username": None, "password": USER_PASSWORD},
+            {"username": "admin", "password": None},
+            {"username": ["admin"], "password": USER_PASSWORD},
+        )
+        with mock.patch.object(hasher, "verify", wraps=hasher.verify) as verify:
+            for payload in payloads:
+                with self.subTest(payload=payload):
+                    before = verify.call_count
+                    response = self.client.post_json("/api/login", payload, csrf=token)
+                    self.assertEqual(response.status, 401)
+                    self.assertEqual(verify.call_count, before + 1)
+
+    def test_malformed_login_bucket_does_not_collide_with_a_valid_username(self):
+        self.client.post_json(
+            "/api/setup",
+            {
+                "username": "<invalid>", "password": ADMIN_PASSWORD,
+                "real_name": "A", "department": "D",
+            },
+        )
+        token = self.client.csrf_for("/api/login")
+        for _ in range(5):
+            self.assertEqual(
+                self.client.post_json(
+                    "/api/login", {"username": None, "password": USER_PASSWORD}, csrf=token
+                ).status,
+                401,
+            )
+        self.assertEqual(
+            self.client.post_json(
+                "/api/login",
+                {"username": "<invalid>", "password": ADMIN_PASSWORD},
+                csrf=token,
+            ).status,
+            200,
+        )
+
+    def test_setup_rate_limit_stops_before_domain_work(self):
+        token = self.client.csrf_for("/api/setup")
+        payload = {
+            "username": "admin", "password": ADMIN_PASSWORD,
+            "real_name": "A", "department": "D",
+        }
+        with mock.patch.object(
+            self.running.users, "setup_admin", side_effect=ValueError("simulated rejection")
+        ) as setup:
+            for _ in range(5):
+                self.assertEqual(self.client.post_json("/api/setup", payload, csrf=token).status, 400)
+            limited = self.client.post_json("/api/setup", payload, csrf=token)
+        self.assertEqual(limited.status, 429)
+        self.assertEqual(setup.call_count, 5)
+        self.assertGreaterEqual(int(limited.headers["Retry-After"]), 1)
+
+    def test_register_rate_limit_is_separate_and_stops_before_hashing(self):
+        self.setup_admin()
+        token = self.client.csrf_for("/api/register")
+        with mock.patch.object(self.running.users, "register", wraps=self.running.users.register) as register:
+            for index in range(5):
+                response = self.client.post_json(
+                    "/api/register",
+                    {
+                        "username": f"user{index}", "password": USER_PASSWORD,
+                        "real_name": "A", "department": "D",
+                    },
+                    csrf=token,
+                )
+                self.assertEqual(response.status, 201)
+            limited = self.client.post_json(
+                "/api/register",
+                {"username": "user5", "password": USER_PASSWORD, "real_name": "A", "department": "D"},
+                csrf=token,
+            )
+        self.assertEqual(limited.status, 429)
+        self.assertEqual(register.call_count, 5)
+        self.assertEqual(
+            self.client.post_json(
+                "/api/login", {"username": "admin", "password": ADMIN_PASSWORD}
+            ).status,
+            200,
+        )
+
+    def test_login_rate_limit_normalizes_username_and_does_not_pollute_other_keys(self):
+        self.setup_admin()
+        hasher = self.running.users._password_hasher
+        with mock.patch.object(hasher, "verify", wraps=hasher.verify) as verify:
+            for username in (" ADMIN ", "admin", "ＡＤＭＩＮ", "Admin", "admin"):
+                response = self.client.post_json(
+                    "/api/login", {"username": username, "password": "wrong-password"}
+                )
+                self.assertEqual(response.status, 401)
+            limited = self.client.post_json(
+                "/api/login", {"username": "admin", "password": "wrong-password"}
+            )
+            other_key = self.client.post_json(
+                "/api/login", {"username": "someone-else", "password": "wrong-password"}
+            )
+        self.assertEqual(limited.status, 429)
+        self.assertGreaterEqual(int(limited.headers["Retry-After"]), 1)
+        self.assertEqual(other_key.status, 401)
+        self.assertEqual(verify.call_count, 6)
+
+    def test_successful_login_clears_prior_failures_for_its_normalized_key(self):
+        self.setup_admin()
+        token = self.client.csrf_for("/api/login")
+        for _ in range(4):
+            self.assertEqual(
+                self.client.post_json(
+                    "/api/login", {"username": " ADMIN ", "password": "wrong-password"},
+                    csrf=token,
+                ).status,
+                401,
+            )
+        self.assertEqual(
+            self.client.post_json(
+                "/api/login", {"username": "admin", "password": ADMIN_PASSWORD}, csrf=token
+            ).status,
+            200,
+        )
+        for _ in range(5):
+            self.assertEqual(
+                self.client.post_json(
+                    "/api/login", {"username": "Admin", "password": "wrong-password"},
+                    csrf=token,
+                ).status,
+                401,
+            )
+        self.assertEqual(
+            self.client.post_json(
+                "/api/login", {"username": "admin", "password": "wrong-password"},
+                csrf=token,
+            ).status,
+            429,
+        )
 
     def test_session_json_has_profile_and_csrf_without_security_versions(self):
         self.setup_admin()
@@ -352,6 +539,13 @@ class WebAuthenticationTest(unittest.TestCase):
         self.assertEqual(response.status, 500)
         self.assertEqual(response.headers["Content-Type"], "application/json; charset=utf-8")
         self.assertNotIn(b"private database detail", response.body)
+
+    def test_response_timeout_does_not_attempt_a_second_error_response(self):
+        application = self.running.server.application
+        handler = mock.Mock(command="GET")
+        with mock.patch.object(application, "_json") as render_json:
+            application._safely(handler, mock.Mock(side_effect=TimeoutError))
+        render_json.assert_not_called()
 
     def test_legacy_anonymous_generate_and_filename_download_routes_are_absent(self):
         self.setup_admin()

@@ -8,9 +8,13 @@ from http.server import BaseHTTPRequestHandler
 import html
 import json
 import logging
+import math
 import mimetypes
 from pathlib import Path, PurePosixPath
-from typing import Callable
+import threading
+import time
+from typing import Callable, Hashable
+import unicodedata
 from urllib.parse import unquote, urlsplit
 
 from config import AppConfig
@@ -28,6 +32,8 @@ from users import (
 _LOGGER = logging.getLogger(__name__)
 _COOKIE_NAME = "reimbursement_session"
 _COOKIE_MAX_AGE = 7 * 24 * 60 * 60
+RATE_LIMIT_ATTEMPTS = 5
+RATE_LIMIT_WINDOW_SECONDS = 15 * 60
 _STATIC_EXTENSIONS = {
     ".css", ".js", ".html", ".ico", ".png", ".jpg", ".jpeg", ".svg", ".webp",
     ".woff", ".woff2", ".ttf",
@@ -44,6 +50,44 @@ class Route:
     csrf: str | None = None
 
 
+class AttemptRateLimiter:
+    """Reserve bounded attempts in fixed windows without background threads."""
+
+    def __init__(
+        self,
+        limit: int = RATE_LIMIT_ATTEMPTS,
+        window_seconds: float = RATE_LIMIT_WINDOW_SECONDS,
+        clock: Callable[[], float] = time.monotonic,
+    ):
+        if type(limit) is not int or limit <= 0 or window_seconds <= 0:
+            raise ValueError("rate limit values must be positive")
+        self.limit = limit
+        self.window_seconds = float(window_seconds)
+        self._clock = clock
+        self._lock = threading.Lock()
+        self._attempts: dict[Hashable, list[float]] = {}
+
+    def reserve(self, key: Hashable) -> int | None:
+        with self._lock:
+            now = self._clock()
+            cutoff = now - self.window_seconds
+            for existing_key, timestamps in list(self._attempts.items()):
+                retained = [timestamp for timestamp in timestamps if timestamp > cutoff]
+                if retained:
+                    self._attempts[existing_key] = retained
+                else:
+                    del self._attempts[existing_key]
+            timestamps = self._attempts.setdefault(key, [])
+            if len(timestamps) >= self.limit:
+                return max(1, math.ceil(timestamps[0] + self.window_seconds - now))
+            timestamps.append(now)
+            return None
+
+    def clear(self, key: Hashable) -> None:
+        with self._lock:
+            self._attempts.pop(key, None)
+
+
 class WebApplication:
     """Apply ordered access guards and dispatch the fixed authentication routes."""
 
@@ -53,11 +97,13 @@ class WebApplication:
         user_service: UserService,
         session_service: SessionService,
         anonymous_csrf: AnonymousCsrfSigner,
+        rate_limiter: AttemptRateLimiter | None = None,
     ):
         self.config = config
         self.user_service = user_service
         self.session_service = session_service
         self.anonymous_csrf = anonymous_csrf
+        self.rate_limiter = rate_limiter or AttemptRateLimiter()
         self.get_routes = {
             "/healthz": Route("_health", setup="any"),
             "/setup": Route("_setup_page", setup="incomplete"),
@@ -99,6 +145,29 @@ class WebApplication:
     def handle_unsupported(self, handler: BaseHTTPRequestHandler) -> None:
         self._safely(handler, lambda: self._unsupported(handler))
 
+    def handle_parser_error(self, handler: BaseHTTPRequestHandler, status: int) -> None:
+        messages = {
+            400: "请求格式错误",
+            408: "请求读取超时",
+            414: "请求路径过长",
+            431: "请求头过大",
+        }
+        handler.close_connection = True
+        if getattr(handler, "request_version", "HTTP/0.9") in {"", "HTTP/0.9"}:
+            handler.request_version = "HTTP/1.0"
+        raw_method = getattr(handler, "raw_requestline", b"").split(maxsplit=1)[:1]
+        if raw_method == [b"HEAD"]:
+            handler.command = "HEAD"
+        try:
+            self._json(
+                handler,
+                status,
+                {"error": messages.get(status, "请求格式错误")},
+                headers={"Connection": "close"},
+            )
+        except OSError:
+            return
+
     def _unsupported(self, handler: BaseHTTPRequestHandler) -> None:
         path = self._decoded_path(handler.path)
         if path is None:
@@ -117,7 +186,7 @@ class WebApplication:
     def _safely(self, handler: BaseHTTPRequestHandler, action: Callable[[], None]) -> None:
         try:
             action()
-        except (ConnectionError, BrokenPipeError):
+        except (ConnectionError, TimeoutError):
             return
         except Exception:
             _LOGGER.exception("unhandled web request failure for %s", handler.command)
@@ -250,6 +319,8 @@ class WebApplication:
         if values is None:
             self._json(handler, 400, {"error": "请完整填写初始化信息"})
             return
+        if self._rate_limited(handler, ("setup", self._client_ip(handler))):
+            return
         try:
             self.user_service.setup_admin(*values)
         except SetupClosed:
@@ -264,16 +335,26 @@ class WebApplication:
         payload = self._json_body(handler)
         if payload is None:
             return
-        values = self._required_strings(payload, "username", "password")
-        if values is None:
-            self._login_failed(handler)
+        username = payload.get("username")
+        password = payload.get("password")
+        normalized_username = (
+            unicodedata.normalize("NFKC", username).strip().casefold()
+            if isinstance(username, str)
+            else None
+        )
+        limit_key = (
+            "login", normalized_username,
+            self._client_ip(handler),
+        )
+        if self._rate_limited(handler, limit_key):
             return
         try:
-            authenticated_user = self.user_service.authenticate(*values)
+            authenticated_user = self.user_service.authenticate(username, password)
             issued = self.session_service.issue(authenticated_user)
         except (AuthenticationFailed, ValueError):
             self._login_failed(handler)
             return
+        self.rate_limiter.clear(limit_key)
         self._json(
             handler,
             200,
@@ -288,6 +369,8 @@ class WebApplication:
         values = self._required_strings(payload, "username", "password", "real_name", "department")
         if values is None:
             self._json(handler, 400, {"error": "请完整填写注册信息"})
+            return
+        if self._rate_limited(handler, ("register", self._client_ip(handler))):
             return
         try:
             self.user_service.register(*values)
@@ -385,7 +468,23 @@ class WebApplication:
             self._json(handler, 415, {"error": "仅支持 application/json"})
             return None
         try:
-            value = json.loads(handler.rfile.read(length).decode("utf-8"))
+            body = handler.rfile.read(length)
+        except TimeoutError:
+            handler.close_connection = True
+            self._json(
+                handler, 408, {"error": "请求体读取超时"},
+                headers={"Connection": "close"},
+            )
+            return None
+        if len(body) != length:
+            handler.close_connection = True
+            self._json(
+                handler, 400, {"error": "请求体不完整"},
+                headers={"Connection": "close"},
+            )
+            return None
+        try:
+            value = json.loads(body.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError):
             self._json(handler, 400, {"error": "JSON 请求数据格式错误"})
             return None
@@ -451,6 +550,22 @@ class WebApplication:
 
     def _login_failed(self, handler: BaseHTTPRequestHandler) -> None:
         self._json(handler, 401, {"error": "用户名或密码错误"})
+
+    def _rate_limited(self, handler: BaseHTTPRequestHandler, key: Hashable) -> bool:
+        retry_after = self.rate_limiter.reserve(key)
+        if retry_after is None:
+            return False
+        self._json(
+            handler,
+            429,
+            {"error": "请求过于频繁，请稍后重试"},
+            headers={"Retry-After": str(retry_after)},
+        )
+        return True
+
+    @staticmethod
+    def _client_ip(handler: BaseHTTPRequestHandler) -> str:
+        return str(handler.client_address[0])
 
     @staticmethod
     def _decoded_path(request_target: str) -> str | None:
