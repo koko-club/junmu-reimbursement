@@ -35,4 +35,5 @@
 - Wrote and self-reviewed `docs/superpowers/plans/2026-09-07-auth-user-history.md`; all design requirements map to implementation and verification tasks.
 - Task 1 complete: copied the verified baseline into a new Git repository, restored the receipt fixture, made tests use the repository template, and verified all 57 baseline tests pass with the bundled runtime.
 - Task 2 complete: added typed Mac/Docker configuration, exact versioned SQLite schema, transaction/backup helpers, strict type validation, and connection cleanup; 16 focused tests pass.
+- Task 3 complete: added bounded scrypt password hashing, atomic persistent secret creation, and signed anonymous CSRF tokens; 22 focused security tests pass, including fault-injected concurrency and resource-boundary cases.
 - Self-review clarified pre-setup route restrictions, protected administrator targets, and the stopped-service one-shot backup flow.

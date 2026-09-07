@@ -208,7 +208,7 @@ Expected: focused tests pass.
 - Create: `security.py`
 - Create: `tests/test_security.py`
 
-- [ ] **Step 1: Write failing security tests**
+- [x] **Step 1: Write failing security tests**
 
 ```python
 def test_password_hash_uses_random_salts_and_verifies(self):
@@ -232,7 +232,7 @@ def test_anonymous_csrf_binds_method_path_and_expiry(self):
     self.assertFalse(signer.verify(token, "POST", "/api/register", now=5000))
 ```
 
-- [ ] **Step 2: Verify failure**
+- [x] **Step 2: Verify failure**
 
 ```bash
 python3 -m unittest tests.test_security -v
@@ -240,7 +240,7 @@ python3 -m unittest tests.test_security -v
 
 Expected: the `security` import fails.
 
-- [ ] **Step 3: Implement the security primitives**
+- [x] **Step 3: Implement the security primitives**
 
 Create immutable `PasswordMaterial(digest: bytes, salt: bytes, params: str)`. `PasswordHasher` defaults to `n=16384, r=8, p=1`, uses a random 16-byte salt, a 32-byte result, JSON parameters, and `hmac.compare_digest`. Passwords must be strings containing 8–128 Unicode characters.
 
@@ -255,7 +255,7 @@ digest = hashlib.scrypt(
 
 `load_or_create_secret(path)` uses exclusive creation, 32 random bytes, `fsync`, and mode `0600`; concurrent creation reads the winning file. `AnonymousCsrfSigner` signs issue time, method, path, and random nonce with HMAC-SHA256, uses constant-time comparison, and expires tokens after 30 minutes.
 
-- [ ] **Step 4: Run tests and commit**
+- [x] **Step 4: Run tests and commit**
 
 ```bash
 python3 -m unittest tests.test_security -v
