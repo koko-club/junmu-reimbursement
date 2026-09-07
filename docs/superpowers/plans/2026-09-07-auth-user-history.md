@@ -336,7 +336,7 @@ Expected: all user tests pass.
 - Modify: `users.py`
 - Modify: `tests/test_users.py`
 
-- [ ] **Step 1: Write failing session tests**
+- [x] **Step 1: Write failing session tests**
 
 ```python
 def issue_after_authentication(self, username, password, now):
@@ -368,7 +368,7 @@ def test_stale_authentication_snapshot_cannot_issue_after_reset(self):
 
 Also test that SQLite stores only SHA-256 token hashes, both roles get one session, logout/revoke work, expired rows purge, and logged-in CSRF uses constant-time comparison. Use event/barrier synchronization to verify that an old authentication snapshot cannot issue after a password change/reset or a disable/reenable transition completes.
 
-- [ ] **Step 2: Verify failure**
+- [x] **Step 2: Verify failure**
 
 ```bash
 python3 -m unittest tests.test_sessions -v
@@ -376,7 +376,7 @@ python3 -m unittest tests.test_sessions -v
 
 Expected: `SessionService` is missing.
 
-- [ ] **Step 3: Implement the session service**
+- [x] **Step 3: Implement the session service**
 
 Create immutable `IssuedSession(token,csrf_token,expires_at)` and `AuthenticatedUser(user_id,username,real_name,department,role,must_change_password,csrf_token)` dataclasses. Implement `issue(authenticated_user,now=None)`, `resolve(token,now=None)`, `verify_csrf(user,submitted)`, `revoke_token(token)`, `revoke_user(user_id)`, and `purge_expired(now=None)`. `authenticated_user` is the `User` snapshot returned by `UserService.authenticate()`; `issue_authenticated(authenticated_user,now=None)` is the explicit login-route alias. Do not expose a bare `user_id` signing path.
 
@@ -388,7 +388,7 @@ token_hash = hashlib.sha256(token.encode("ascii")).digest()
 
 `issue()` deletes the previous row and inserts the replacement in one immediate transaction with `expires_at = now + timedelta(days=7)`. In that same transaction it requires `status = 'active'` and exact equality with the authentication snapshot's `password_version` and `status_version`; an old snapshot must not issue after password change/reset or disable/reenable. `resolve()` joins the active user, deletes expired sessions, and never extends expiry. Wire `SessionService.revoke_user` into `UserService` and test revocation after disable, reset, and self-change.
 
-- [ ] **Step 4: Run tests and commit**
+- [x] **Step 4: Run tests and commit**
 
 ```bash
 python3 -m unittest tests.test_sessions tests.test_users -v
