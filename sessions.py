@@ -9,6 +9,7 @@ import secrets
 from typing import Callable
 
 from database import Database
+from users import User
 
 
 _SESSION_LIFETIME = timedelta(days=7)
@@ -41,17 +42,50 @@ class SessionService:
         self._database = database
         self._clock = clock or (lambda: datetime.now(timezone.utc))
 
-    def issue(self, user_id: int, now: datetime | None = None) -> IssuedSession:
+    def issue(
+        self, authenticated_user: object, now: datetime | None = None
+    ) -> IssuedSession:
+        """Issue a session from a current authentication snapshot."""
+        return self.issue_authenticated(authenticated_user, now)
+
+    def issue_authenticated(
+        self, authenticated_user: object, now: datetime | None = None
+    ) -> IssuedSession:
+        """Issue only when the authentication snapshot remains current."""
+        if (
+            not isinstance(authenticated_user, User)
+            or not _valid_user_id(authenticated_user.id)
+            or not _valid_version(authenticated_user.password_version)
+            or not _valid_version(authenticated_user.status_version)
+        ):
+            raise ValueError("valid authentication snapshot required")
+        return self._issue(
+            authenticated_user.id,
+            authenticated_user.password_version,
+            authenticated_user.status_version,
+            now,
+        )
+
+    def _issue(
+        self,
+        user_id: int,
+        password_version: int,
+        status_version: int,
+        now: datetime | None,
+    ) -> IssuedSession:
         if not _valid_user_id(user_id):
             raise ValueError("active user required")
         issued_at = self._now(now)
         expires_at = issued_at + _SESSION_LIFETIME
         with self._database.transaction(immediate=True) as connection:
             user = connection.execute(
-                "SELECT id FROM users WHERE id = ? AND status = 'active'", (user_id,)
+                """SELECT id FROM users
+                WHERE id = ? AND status = 'active'
+                AND password_version = ? AND status_version = ?""",
+                (user_id, password_version, status_version),
             ).fetchone()
             if user is None:
-                raise ValueError("active user required")
+                raise ValueError("authentication is no longer valid")
             token = secrets.token_urlsafe(32)
             csrf_token = secrets.token_urlsafe(32)
             token_hash = _token_hash(token)
@@ -149,6 +183,10 @@ class SessionService:
 
 def _valid_user_id(value: object) -> bool:
     return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _valid_version(value: object) -> bool:
+    return _valid_user_id(value) and value >= 0
 
 
 def _token_hash(token: str) -> bytes:
