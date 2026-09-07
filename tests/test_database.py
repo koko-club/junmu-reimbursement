@@ -62,7 +62,7 @@ class DatabaseTest(unittest.TestCase):
         self.assertTrue(versions[0]["applied_at"])
         self.assertEqual(setting["value"], "false")
 
-    def test_migrate_upgrades_an_existing_v1_database_with_security_version(self):
+    def test_migrate_upgrades_an_existing_v1_database_with_operation_versions(self):
         connection = self.db.connect()
         try:
             connection.execute("BEGIN IMMEDIATE")
@@ -89,7 +89,8 @@ class DatabaseTest(unittest.TestCase):
             versions = [row["version"] for row in connection.execute(
                 "SELECT version FROM schema_migrations ORDER BY version"
             )]
-        self.assertEqual(columns["security_version"]["dflt_value"], "0")
+        self.assertEqual(columns["status_version"]["dflt_value"], "0")
+        self.assertEqual(columns["password_version"]["dflt_value"], "0")
         self.assertEqual(versions, [1, 2])
 
     def test_v1_schema_matches_storage_contract(self):
@@ -121,7 +122,8 @@ class DatabaseTest(unittest.TestCase):
         self.assertEqual(users["password_hash"]["type"], "BLOB")
         self.assertEqual(users["password_salt"]["type"], "BLOB")
         self.assertEqual(users["must_change_password"]["dflt_value"], "0")
-        self.assertEqual(users["security_version"]["dflt_value"], "0")
+        self.assertEqual(users["status_version"]["dflt_value"], "0")
+        self.assertEqual(users["password_version"]["dflt_value"], "0")
         self.assertEqual(sessions["token_hash"]["type"], "BLOB")
         self.assertEqual(reimbursements["id"]["type"], "TEXT")
         self.assertEqual(reimbursements["id"]["pk"], 1)

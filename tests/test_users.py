@@ -320,8 +320,8 @@ class UserServiceTest(unittest.TestCase):
             worker = threading.Thread(target=disable_then_capture_failure)
             worker.start()
             self.assertTrue(revocation_started.wait(timeout=2))
-            self.assertEqual(second.set_enabled(admin.id, user.id, True).security_version, 2)
-            self.assertEqual(second.set_enabled(admin.id, user.id, False).security_version, 3)
+            self.assertEqual(second.set_enabled(admin.id, user.id, True).status_version, 2)
+            self.assertEqual(second.set_enabled(admin.id, user.id, False).status_version, 3)
             second.update_profile(admin.id, user.id, "Concurrent Name", "Concurrent Department")
             release_failure.set()
             worker.join(timeout=2)
@@ -330,8 +330,96 @@ class UserServiceTest(unittest.TestCase):
         self.assertIsInstance(captured[0], RuntimeError)
         final_user = self.service.get(user.id)
         self.assertEqual(final_user.status, "disabled")
-        self.assertEqual(final_user.security_version, 3)
+        self.assertEqual(final_user.status_version, 3)
+        self.assertEqual(final_user.password_version, 0)
         self.assertEqual((final_user.real_name, final_user.department), ("Concurrent Name", "Concurrent Department"))
+
+    def test_failed_reset_does_not_undo_concurrent_status_operations(self):
+        admin, user = self.register_and_approve()
+        revocation_started = threading.Event()
+        release_failure = threading.Event()
+        captured = []
+
+        def delayed_failure(_user_id):
+            revocation_started.set()
+            self.assertTrue(release_failure.wait(timeout=2))
+            raise RuntimeError("revoke failed")
+
+        first = UserService(
+            self.database,
+            PasswordHasher(n=1024, r=8, p=1),
+            revoke_sessions=delayed_failure,
+        )
+        second = UserService(self.database, PasswordHasher(n=1024, r=8, p=1))
+
+        def reset_then_capture_failure():
+            try:
+                first.reset_password(admin.id, user.id)
+            except BaseException as error:
+                captured.append(error)
+
+        with self.assertLogs("users", level="ERROR"):
+            worker = threading.Thread(target=reset_then_capture_failure)
+            worker.start()
+            self.assertTrue(revocation_started.wait(timeout=2))
+            self.assertEqual(second.set_enabled(admin.id, user.id, False).status_version, 1)
+            self.assertEqual(second.set_enabled(admin.id, user.id, True).status_version, 2)
+            release_failure.set()
+            worker.join(timeout=2)
+
+        self.assertFalse(worker.is_alive())
+        self.assertIsInstance(captured[0], RuntimeError)
+        final_user = self.service.get(user.id)
+        self.assertEqual(final_user.status, "active")
+        self.assertEqual((final_user.status_version, final_user.password_version), (2, 2))
+        self.assertFalse(final_user.must_change_password)
+        self.assertEqual(self.service.authenticate("alex", "correct horse battery staple").id, user.id)
+
+    def test_failed_disable_does_not_undo_concurrent_password_change(self):
+        admin, user = self.register_and_approve()
+        revocation_started = threading.Event()
+        release_failure = threading.Event()
+        captured = []
+
+        def delayed_failure(_user_id):
+            revocation_started.set()
+            self.assertTrue(release_failure.wait(timeout=2))
+            raise RuntimeError("revoke failed")
+
+        first = UserService(
+            self.database,
+            PasswordHasher(n=1024, r=8, p=1),
+            revoke_sessions=delayed_failure,
+        )
+        second = UserService(self.database, PasswordHasher(n=1024, r=8, p=1))
+
+        def disable_then_capture_failure():
+            try:
+                first.set_enabled(admin.id, user.id, False)
+            except BaseException as error:
+                captured.append(error)
+
+        with self.assertLogs("users", level="ERROR"):
+            worker = threading.Thread(target=disable_then_capture_failure)
+            worker.start()
+            self.assertTrue(revocation_started.wait(timeout=2))
+            second.change_password(
+                user.id,
+                current_password="correct horse battery staple",
+                new_password="concurrent correct horse battery staple",
+            )
+            release_failure.set()
+            worker.join(timeout=2)
+
+        self.assertFalse(worker.is_alive())
+        self.assertIsInstance(captured[0], RuntimeError)
+        final_user = self.service.get(user.id)
+        self.assertEqual(final_user.status, "active")
+        self.assertEqual((final_user.status_version, final_user.password_version), (2, 1))
+        self.assertEqual(
+            self.service.authenticate("alex", "concurrent correct horse battery staple").id,
+            user.id,
+        )
 
     def test_get_raises_for_unknown_user_and_lists_have_stable_order(self):
         admin = self.setup_admin()

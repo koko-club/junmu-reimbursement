@@ -116,9 +116,13 @@ class Database:
                 columns = {
                     row["name"] for row in connection.execute("PRAGMA table_info(users)")
                 }
-                if "security_version" not in columns:
+                if "status_version" not in columns:
                     connection.execute(
-                        "ALTER TABLE users ADD COLUMN security_version INTEGER NOT NULL DEFAULT 0"
+                        "ALTER TABLE users ADD COLUMN status_version INTEGER NOT NULL DEFAULT 0"
+                    )
+                if "password_version" not in columns:
+                    connection.execute(
+                        "ALTER TABLE users ADD COLUMN password_version INTEGER NOT NULL DEFAULT 0"
                     )
                 connection.execute(
                     "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
