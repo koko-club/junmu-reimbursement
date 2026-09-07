@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>差旅报销单</title>
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <main class="page-shell">
+    <header class="page-header">
+      <h1>差旅报销单</h1>
+      <p>填写报销信息与行程明细，生成可下载的 Excel 和 PDF。</p>
+    </header>
+    <form id="reimbursement-form" novalidate>
+      <section class="form-section" aria-labelledby="basic-heading">
+        <h2 id="basic-heading">基本信息</h2>
+        <div class="basic-grid">
+          <label>报销日期<input id="date" name="date" type="date"></label>
+          <label>部门<input id="department" name="department" value="技术部" required></label>
+          <label>出差人<input id="traveler" name="traveler" required></label>
+          <label class="wide">出差事由<input id="reason" name="reason" required></label>
+          <label>出差总天数<input id="days" name="days" type="number" min="0" step="any" required></label>
+          <label>补贴标准（元/天）<input id="allowance" name="allowance" type="number" min="0" step="any" value="50" required></label>
+        </div>
+      </section>
+
+      <section class="form-section" aria-labelledby="detail-heading">
+        <div class="section-heading"><h2 id="detail-heading">行程明细</h2><span>最多 11 行，空行可留空</span></div>
+        <div class="table-wrap">
+          <table class="detail-table">
+            <thead><tr><th>序号</th><th>日期</th><th>起点</th><th>终点</th><th>交通工具</th><th>公共交通金额</th><th>自驾里程（KM）</th><th>通行费</th><th>住宿费</th><th>单据数</th></tr></thead>
+            <tbody id="detail-rows">
+              <tr class="detail-row"><th scope="row">1</th><td><input data-field="date" name="row-1-date" type="date"></td><td><input data-field="origin" name="row-1-origin"></td><td><input data-field="destination" name="row-1-destination"></td><td><input data-field="transport" name="row-1-transport"></td><td><input data-field="public_amount" name="row-1-public_amount" type="number" min="0" step="any"></td><td><input data-field="mileage" name="row-1-mileage" type="number" min="0" step="any"></td><td><input data-field="toll" name="row-1-toll" type="number" min="0" step="any"></td><td><input data-field="lodging" name="row-1-lodging" type="number" min="0" step="any"></td><td><input data-field="receipts" name="row-1-receipts" type="number" min="0" step="1"></td></tr>
+              <tr class="detail-row"><th scope="row">2</th><td><input data-field="date" name="row-2-date" type="date"></td><td><input data-field="origin" name="row-2-origin"></td><td><input data-field="destination" name="row-2-destination"></td><td><input data-field="transport" name="row-2-transport"></td><td><input data-field="public_amount" name="row-2-public_amount" type="number" min="0" step="any"></td><td><input data-field="mileage" name="row-2-mileage" type="number" min="0" step="any"></td><td><input data-field="toll" name="row-2-toll" type="number" min="0" step="any"></td><td><input data-field="lodging" name="row-2-lodging" type="number" min="0" step="any"></td><td><input data-field="receipts" name="row-2-receipts" type="number" min="0" step="1"></td></tr>
+              <tr class="detail-row"><th scope="row">3</th><td><input data-field="date" name="row-3-date" type="date"></td><td><input data-field="origin" name="row-3-origin"></td><td><input data-field="destination" name="row-3-destination"></td><td><input data-field="transport" name="row-3-transport"></td><td><input data-field="public_amount" name="row-3-public_amount" type="number" min="0" step="any"></td><td><input data-field="mileage" name="row-3-mileage" type="number" min="0" step="any"></td><td><input data-field="toll" name="row-3-toll" type="number" min="0" step="any"></td><td><input data-field="lodging" name="row-3-lodging" type="number" min="0" step="any"></td><td><input data-field="receipts" name="row-3-receipts" type="number" min="0" step="1"></td></tr>
+              <tr class="detail-row"><th scope="row">4</th><td><input data-field="date" name="row-4-date" type="date"></td><td><input data-field="origin" name="row-4-origin"></td><td><input data-field="destination" name="row-4-destination"></td><td><input data-field="transport" name="row-4-transport"></td><td><input data-field="public_amount" name="row-4-public_amount" type="number" min="0" step="any"></td><td><input data-field="mileage" name="row-4-mileage" type="number" min="0" step="any"></td><td><input data-field="toll" name="row-4-toll" type="number" min="0" step="any"></td><td><input data-field="lodging" name="row-4-lodging" type="number" min="0" step="any"></td><td><input data-field="receipts" name="row-4-receipts" type="number" min="0" step="1"></td></tr>
+              <tr class="detail-row"><th scope="row">5</th><td><input data-field="date" name="row-5-date" type="date"></td><td><input data-field="origin" name="row-5-origin"></td><td><input data-field="destination" name="row-5-destination"></td><td><input data-field="transport" name="row-5-transport"></td><td><input data-field="public_amount" name="row-5-public_amount" type="number" min="0" step="any"></td><td><input data-field="mileage" name="row-5-mileage" type="number" min="0" step="any"></td><td><input data-field="toll" name="row-5-toll" type="number" min="0" step="any"></td><td><input data-field="lodging" name="row-5-lodging" type="number" min="0" step="any"></td><td><input data-field="receipts" name="row-5-receipts" type="number" min="0" step="1"></td></tr>
+              <tr class="detail-row"><th scope="row">6</th><td><input data-field="date" name="row-6-date" type="date"></td><td><input data-field="origin" name="row-6-origin"></td><td><input data-field="destination" name="row-6-destination"></td><td><input data-field="transport" name="row-6-transport"></td><td><input data-field="public_amount" name="row-6-public_amount" type="number" min="0" step="any"></td><td><input data-field="mileage" name="row-6-mileage" type="number" min="0" step="any"></td><td><input data-field="toll" name="row-6-toll" type="number" min="0" step="any"></td><td><input data-field="lodging" name="row-6-lodging" type="number" min="0" step="any"></td><td><input data-field="receipts" name="row-6-receipts" type="number" min="0" step="1"></td></tr>
+              <tr class="detail-row"><th scope="row">7</th><td><input data-field="date" name="row-7-date" type="date"></td><td><input data-field="origin" name="row-7-origin"></td><td><input data-field="destination" name="row-7-destination"></td><td><input data-field="transport" name="row-7-transport"></td><td><input data-field="public_amount" name="row-7-public_amount" type="number" min="0" step="any"></td><td><input data-field="mileage" name="row-7-mileage" type="number" min="0" step="any"></td><td><input data-field="toll" name="row-7-toll" type="number" min="0" step="any"></td><td><input data-field="lodging" name="row-7-lodging" type="number" min="0" step="any"></td><td><input data-field="receipts" name="row-7-receipts" type="number" min="0" step="1"></td></tr>
+              <tr class="detail-row"><th scope="row">8</th><td><input data-field="date" name="row-8-date" type="date"></td><td><input data-field="origin" name="row-8-origin"></td><td><input data-field="destination" name="row-8-destination"></td><td><input data-field="transport" name="row-8-transport"></td><td><input data-field="public_amount" name="row-8-public_amount" type="number" min="0" step="any"></td><td><input data-field="mileage" name="row-8-mileage" type="number" min="0" step="any"></td><td><input data-field="toll" name="row-8-toll" type="number" min="0" step="any"></td><td><input data-field="lodging" name="row-8-lodging" type="number" min="0" step="any"></td><td><input data-field="receipts" name="row-8-receipts" type="number" min="0" step="1"></td></tr>
+              <tr class="detail-row"><th scope="row">9</th><td><input data-field="date" name="row-9-date" type="date"></td><td><input data-field="origin" name="row-9-origin"></td><td><input data-field="destination" name="row-9-destination"></td><td><input data-field="transport" name="row-9-transport"></td><td><input data-field="public_amount" name="row-9-public_amount" type="number" min="0" step="any"></td><td><input data-field="mileage" name="row-9-mileage" type="number" min="0" step="any"></td><td><input data-field="toll" name="row-9-toll" type="number" min="0" step="any"></td><td><input data-field="lodging" name="row-9-lodging" type="number" min="0" step="any"></td><td><input data-field="receipts" name="row-9-receipts" type="number" min="0" step="1"></td></tr>
+              <tr class="detail-row"><th scope="row">10</th><td><input data-field="date" name="row-10-date" type="date"></td><td><input data-field="origin" name="row-10-origin"></td><td><input data-field="destination" name="row-10-destination"></td><td><input data-field="transport" name="row-10-transport"></td><td><input data-field="public_amount" name="row-10-public_amount" type="number" min="0" step="any"></td><td><input data-field="mileage" name="row-10-mileage" type="number" min="0" step="any"></td><td><input data-field="toll" name="row-10-toll" type="number" min="0" step="any"></td><td><input data-field="lodging" name="row-10-lodging" type="number" min="0" step="any"></td><td><input data-field="receipts" name="row-10-receipts" type="number" min="0" step="1"></td></tr>
+              <tr class="detail-row"><th scope="row">11</th><td><input data-field="date" name="row-11-date" type="date"></td><td><input data-field="origin" name="row-11-origin"></td><td><input data-field="destination" name="row-11-destination"></td><td><input data-field="transport" name="row-11-transport"></td><td><input data-field="public_amount" name="row-11-public_amount" type="number" min="0" step="any"></td><td><input data-field="mileage" name="row-11-mileage" type="number" min="0" step="any"></td><td><input data-field="toll" name="row-11-toll" type="number" min="0" step="any"></td><td><input data-field="lodging" name="row-11-lodging" type="number" min="0" step="any"></td><td><input data-field="receipts" name="row-11-receipts" type="number" min="0" step="1"></td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="form-section upload-section" aria-labelledby="upload-heading">
+        <h2 id="upload-heading">里程截图</h2>
+        <label for="screenshots" class="file-label">选择里程截图</label>
+        <input id="screenshots" name="screenshots" type="file" accept=".jpg,.jpeg,.png,image/jpeg,image/png" multiple>
+        <div id="preview-list" class="preview-list" aria-live="polite"></div>
+      </section>
+      <div id="error" class="result error" role="alert" aria-live="assertive"></div>
+      <div id="result" class="result" role="status" aria-live="polite"></div>
+      <div class="actions"><button id="submit" type="submit">生成 Excel + PDF</button><button id="clear" type="reset" class="secondary">清空</button></div>
+    </form>
+  </main>
+  <script src="/static/app.js" defer></script>
+</body>
+</html>

@@ -1,0 +1,36 @@
+# Progress
+
+## 2026-09-07
+- Read the applicable brainstorming, planning, TDD, and verification workflows.
+- Confirmed the current workspace is empty and located the existing reimbursement app in the prior project directory.
+- Recorded the requested authentication, user administration, single-session, and per-user history scope.
+- User selected option A: build the upgraded copy in the current workspace and preserve the old app.
+- Inspected current HTTP, frontend, configuration, packaging, and test structure; identified that all protected resources currently bypass authentication.
+- User chose one-time first-run administrator setup in the browser.
+- User chose single-session policy B: a new ordinary-user login invalidates the old session.
+- User chose administrator history scope B: administrators cannot view or download ordinary-user history.
+- User chose not to migrate existing unowned generated files.
+- Requirement changed: ordinary users self-register from the login page and require administrator approval.
+- User chose registration fields A: username, password, real name, and department are required.
+- User chose locked profile fields: ordinary users cannot edit traveler or department on a reimbursement form.
+- User chose password policy A: self-service password change plus administrator temporary-password reset with forced change.
+- User chose rejection policy B: delete the application and require a fresh registration.
+- User chose session duration C: remember login for 7 days unless explicitly revoked.
+- User chose administrator concurrency B: administrators are also limited to one active session.
+- User chose approved-user management A: disable/enable and password reset, with no account/history deletion.
+- User chose history action B: ordinary users may delete their own records and files.
+- User chose recoverable deletion A: 30-day recycle bin with restore and permanent-delete actions.
+- User chose profile-edit policy C: only administrators can edit approved real name and department.
+- Deployment target clarified: local Mac development, then Docker on Synology NAS.
+- Deployment hardware confirmed as Synology DS925+ / AMD Ryzen V1500B (`linux/amd64`), LAN-only.
+- User selected implementation approach A: keep the standard-library Python server and add focused SQLite/auth/storage modules.
+- User approved the architecture and module boundaries.
+- User approved the SQLite data model and 30-day soft-delete model.
+- User approved the registration, approval, single-session, password, CSRF, and login-security flows.
+- User approved server-side history ownership checks, concurrent generation isolation, downloads, and recycle-bin behavior.
+- User selected visual layout B: left sidebar for ordinary-user and administrator navigation.
+- User approved Docker persistence, backup, error handling, and verification design; default port changed to 8800.
+- Wrote and self-reviewed `docs/superpowers/specs/2026-09-07-auth-user-history-design.md`; awaiting user approval before implementation planning.
+- User approved the written design specification.
+- Wrote and self-reviewed `docs/superpowers/plans/2026-09-07-auth-user-history.md`; all design requirements map to implementation and verification tasks.
+- Self-review clarified pre-setup route restrictions, protected administrator targets, and the stopped-service one-shot backup flow.

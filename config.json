@@ -1,0 +1,7 @@
+{
+  "template_path": "resources/差旅报销单模板.xlsx",
+  "output_dir": "generated",
+  "host": "127.0.0.1",
+  "port": 0,
+  "soffice_path": ""
+}
