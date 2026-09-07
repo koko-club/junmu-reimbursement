@@ -273,7 +273,7 @@ Expected: all security tests pass.
 - Create: `users.py`
 - Create: `tests/test_users.py`
 
-- [ ] **Step 1: Write failing lifecycle tests**
+- [x] **Step 1: Write failing lifecycle tests**
 
 ```python
 def test_setup_closes_permanently(self):
@@ -296,7 +296,7 @@ def test_admin_management_cannot_target_admin(self):
 
 Also test NFKC plus `casefold()` uniqueness, 3–50 character usernames, required real name/department, pending/disabled authentication denial, profile editing, enable/disable, and reset setting `must_change_password=1`.
 
-- [ ] **Step 2: Verify failure**
+- [x] **Step 2: Verify failure**
 
 ```bash
 python3 -m unittest tests.test_users -v
@@ -304,7 +304,7 @@ python3 -m unittest tests.test_users -v
 
 Expected: `UserService` is missing.
 
-- [ ] **Step 3: Implement `UserService`**
+- [x] **Step 3: Implement `UserService`**
 
 Provide these exact methods: `setup_complete()`, `setup_admin(username,password,real_name,department)`, `register(username,password,real_name,department)`, `authenticate(username,password)`, `get(user_id)`, `list_pending(admin_id)`, `list_approved_users(admin_id)`, `approve(admin_id,user_id)`, `reject(admin_id,user_id)`, `update_profile(admin_id,user_id,real_name,department)`, `set_enabled(admin_id,user_id,enabled)`, `reset_password(admin_id,user_id)`, and `change_password(user_id,current_password,new_password)`.
 
@@ -316,7 +316,7 @@ username_key = unicodedata.normalize("NFKC", username).strip().casefold()
 
 Use immediate transactions for setup, approval/rejection, status, and password changes. Each admin operation loads an active admin actor and a `role='user'` target in the same transaction. Translate duplicate keys to `UsernameTaken`. Inject `revoke_sessions(user_id)` and invoke it after disable, reset, and password change. `reset_password()` generates `secrets.token_urlsafe(12)`, stores only its hash, returns plaintext once, and never logs it.
 
-- [ ] **Step 4: Run tests and commit**
+- [x] **Step 4: Run tests and commit**
 
 ```bash
 python3 -m unittest tests.test_users -v
