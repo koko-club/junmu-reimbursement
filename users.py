@@ -60,6 +60,18 @@ class UserOperationBusy(UserError):
     pass
 
 
+def canonicalize_username(value: object) -> tuple[str, str]:
+    if not isinstance(value, str):
+        raise ValidationError("username must be a string")
+    username = value.strip()
+    if not 3 <= len(username) <= 50:
+        raise ValidationError("username must contain 3 to 50 characters")
+    key = unicodedata.normalize("NFKC", username).strip().casefold()
+    if not key:
+        raise ValidationError("username must contain 3 to 50 characters")
+    return username, key
+
+
 @dataclass
 class _OperationLock:
     lock: threading.Lock
@@ -110,7 +122,7 @@ class UserService:
     def setup_admin(
         self, username: str, password: str, real_name: str, department: str
     ) -> User:
-        username, username_key = self._username(username)
+        username, username_key = canonicalize_username(username)
         real_name = self._profile_value(real_name, "real name")
         department = self._profile_value(department, "department")
         material = self._password_hasher.hash(password)
@@ -139,7 +151,7 @@ class UserService:
     def register(
         self, username: str, password: str, real_name: str, department: str
     ) -> User:
-        username, username_key = self._username(username)
+        username, username_key = canonicalize_username(username)
         real_name = self._profile_value(real_name, "real name")
         department = self._profile_value(department, "department")
         material = self._password_hasher.hash(password)
@@ -165,7 +177,7 @@ class UserService:
     def authenticate(self, username: str, password: str) -> User:
         username_key = None
         try:
-            _, username_key = self._username(username)
+            _, username_key = canonicalize_username(username)
         except ValidationError:
             pass
         row = None
@@ -414,16 +426,6 @@ class UserService:
             )
         if restored.rowcount != 1:
             _LOGGER.error("could not restore password after failed revocation for user_id=%s", user_id)
-
-    @staticmethod
-    def _username(value: object) -> tuple[str, str]:
-        if not isinstance(value, str):
-            raise ValidationError("username must be a string")
-        username = value.strip()
-        key = unicodedata.normalize("NFKC", username).strip().casefold()
-        if not 3 <= len(username) <= 50 or not key:
-            raise ValidationError("username must contain 3 to 50 characters")
-        return username, key
 
     @staticmethod
     def _profile_value(value: object, label: str) -> str:

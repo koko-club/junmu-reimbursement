@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
 from http import cookies
 from http.server import BaseHTTPRequestHandler
 import html
@@ -14,7 +15,6 @@ from pathlib import Path, PurePosixPath
 import threading
 import time
 from typing import Callable, Hashable, Iterable
-import unicodedata
 from urllib.parse import unquote, urlsplit
 
 from config import AppConfig
@@ -26,6 +26,8 @@ from users import (
     UserError,
     UserService,
     UsernameTaken,
+    ValidationError,
+    canonicalize_username,
 )
 
 
@@ -37,7 +39,6 @@ RATE_LIMIT_WINDOW_SECONDS = 15 * 60
 RATE_LIMIT_MAX_KEYS = 4096
 LOGIN_IP_RATE_LIMIT_ATTEMPTS = 10
 LOGIN_GLOBAL_RATE_LIMIT_ATTEMPTS = 100
-_LOGIN_USERNAME_MAX_CHARS = 50
 _INVALID_LOGIN_USERNAME_KEY = ("invalid", "<invalid>")
 _STATIC_EXTENSIONS = {
     ".css", ".js", ".html", ".ico", ".png", ".jpg", ".jpeg", ".svg", ".webp",
@@ -631,15 +632,12 @@ class WebApplication:
 
     @staticmethod
     def _login_username_key(username: object) -> tuple[str, str]:
-        if not isinstance(username, str):
+        try:
+            _, canonical_key = canonicalize_username(username)
+        except ValidationError:
             return _INVALID_LOGIN_USERNAME_KEY
-        stripped = username.strip()
-        if not 3 <= len(stripped) <= _LOGIN_USERNAME_MAX_CHARS:
-            return _INVALID_LOGIN_USERNAME_KEY
-        normalized = unicodedata.normalize("NFKC", stripped).strip().casefold()
-        if not normalized or len(normalized) > _LOGIN_USERNAME_MAX_CHARS:
-            return _INVALID_LOGIN_USERNAME_KEY
-        return ("valid", normalized)
+        digest = hashlib.sha256(canonical_key.encode("utf-8")).hexdigest()
+        return ("valid-sha256", digest)
 
     @staticmethod
     def _client_ip(handler: BaseHTTPRequestHandler) -> str:

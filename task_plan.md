@@ -4,7 +4,7 @@
 在现有差旅报销网页工具基础上增加管理员、普通用户登录、普通用户单会话限制，以及按用户隔离的 Excel/PDF 生成历史。
 
 ## Current Phase
-Task 6 absolute-deadline and bounded-login-limiter follow-up complete and verified; Task 7 has not started.
+Task 6 canonical login-limiter identity follow-up complete and verified; Task 7 has not started.
 
 ## Design Checklist
 - [x] Explore current project location and existing architecture
@@ -32,3 +32,8 @@ Task 6 absolute-deadline and bounded-login-limiter follow-up complete and verifi
 | Visual companion could not bind inside the sandbox | 1 | Started the approved localhost-only design server outside the sandbox |
 | Confirmed-HEAD test replacement had an indentation error | 1 | Corrected the assertion block and reran focused, HTTP, and full verification before commit |
 | Repeated deadline stress produced one delayed header response and one unframed body response | 1 | Replaced timer plus `SHUT_RD` with a synchronous deadline-aware raw reader; the same 9-test stress sequence passes |
+| Canonical limiter follow-up planning patch used mistyped context | 1 | Re-read the planning files and applied the update against the exact current text |
+| Focused RED command selected system Python 3.9 and failed on supported union syntax before collecting tests | 1 | Re-ran with the Codex bundled Python runtime used by the project verification suite |
+| HTTP/auth verification referenced absent planned module `tests.test_request_security` | 1 | Derived the actual verification groups from the current test tree and prior 55-test total: `test_web_auth` plus `test_server` |
+| Sandboxed HTTP test could not bind its temporary localhost port | 1 | Re-ran the same focused test with approved localhost binding and captured the behavioral RED result |
+| Verbose full-suite output did not retain its final summary in the tool capture | 1 | Re-ran the complete suite quietly and captured the definitive 180-test count and zero exit status |

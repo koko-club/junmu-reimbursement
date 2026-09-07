@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import inspect
 import threading
 import unittest
@@ -409,10 +410,9 @@ class WebAuthenticationTest(unittest.TestCase):
         token = self.client.csrf_for("/api/login")
         hasher = self.running.users._password_hasher
         huge_username = "x" * 900_000
-        expanding_username = "ß" * 50
 
         with mock.patch.object(hasher, "verify", wraps=hasher.verify) as verify:
-            for username in (None, huge_username, "x" * 51, expanding_username):
+            for username in (None, huge_username, "x" * 51):
                 with self.subTest(username_type=type(username).__name__):
                     response = self.client.post_json(
                         "/api/login",
@@ -439,7 +439,37 @@ class WebAuthenticationTest(unittest.TestCase):
         account_keys = [key for key in login_keys if key[0] == "login-account-ip"]
         self.assertEqual(len(account_keys), 1)
         self.assertEqual(account_keys[0][1], ("invalid", "<invalid>"))
-        self.assertEqual(verify.call_count, 4)
+        self.assertEqual(verify.call_count, 3)
+
+    def test_valid_expanding_username_does_not_share_invalid_limiter_identity(self):
+        username = "ß" * 50
+        self.setup_admin()
+        self.assertEqual(self.register(username=username).status, 201)
+        self.approve_user(username=username)
+        token = self.client.csrf_for("/api/login")
+        limiter_identity = self.running.server.application._login_username_key(username)
+        self.assertEqual(
+            limiter_identity,
+            ("valid-sha256", hashlib.sha256(("ss" * 50).encode("utf-8")).hexdigest()),
+        )
+        self.assertEqual(len(limiter_identity[1]), 64)
+
+        for _ in range(5):
+            self.assertEqual(
+                self.client.post_json(
+                    "/api/login",
+                    {"username": None, "password": "wrong-password"},
+                    csrf=token,
+                ).status,
+                401,
+            )
+
+        response = self.client.post_json(
+            "/api/login",
+            {"username": username, "password": USER_PASSWORD},
+            csrf=token,
+        )
+        self.assertEqual(response.status, 200)
 
     def test_successful_login_clears_only_account_key_not_ip_or_global_budget(self):
         self.assertEqual(
