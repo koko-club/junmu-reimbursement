@@ -339,24 +339,34 @@ Expected: all user tests pass.
 - [ ] **Step 1: Write failing session tests**
 
 ```python
+def issue_after_authentication(self, username, password, now):
+    authenticated_user = self.users.authenticate(username, password)
+    return self.sessions.issue(authenticated_user, now=now)
+
 def test_new_login_replaces_old_session(self):
-    first = self.sessions.issue(self.user_id, now=self.at(0))
-    second = self.sessions.issue(self.user_id, now=self.at(10))
+    first = self.issue_after_authentication("alex", "correct horse battery staple", self.at(0))
+    second = self.issue_after_authentication("alex", "correct horse battery staple", self.at(10))
     self.assertIsNone(self.sessions.resolve(first.token, now=self.at(11)))
     self.assertEqual(self.sessions.resolve(second.token, now=self.at(11)).user_id, self.user_id)
 
 def test_session_has_absolute_seven_day_expiry(self):
-    issued = self.sessions.issue(self.user_id, now=self.at(0))
+    issued = self.issue_after_authentication("alex", "correct horse battery staple", self.at(0))
     self.assertIsNotNone(self.sessions.resolve(issued.token, now=self.at(days=6, seconds=86399)))
     self.assertIsNone(self.sessions.resolve(issued.token, now=self.at(days=7)))
 
 def test_disabled_user_is_rejected_even_with_session_row(self):
-    issued = self.sessions.issue(self.user_id, now=self.at(0))
+    issued = self.issue_after_authentication("alex", "correct horse battery staple", self.at(0))
     self.disable_user_directly(self.user_id)
     self.assertIsNone(self.sessions.resolve(issued.token, now=self.at(1)))
+
+def test_stale_authentication_snapshot_cannot_issue_after_reset(self):
+    authenticated_user = self.users.authenticate("alex", "correct horse battery staple")
+    self.users.reset_password(self.admin_id, self.user_id)
+    with self.assertRaises(ValueError):
+        self.sessions.issue(authenticated_user, now=self.at(1))
 ```
 
-Also test that SQLite stores only SHA-256 token hashes, both roles get one session, logout/revoke work, expired rows purge, and logged-in CSRF uses constant-time comparison.
+Also test that SQLite stores only SHA-256 token hashes, both roles get one session, logout/revoke work, expired rows purge, and logged-in CSRF uses constant-time comparison. Use event/barrier synchronization to verify that an old authentication snapshot cannot issue after a password change/reset or a disable/reenable transition completes.
 
 - [ ] **Step 2: Verify failure**
 
@@ -368,7 +378,7 @@ Expected: `SessionService` is missing.
 
 - [ ] **Step 3: Implement the session service**
 
-Create immutable `IssuedSession(token,csrf_token,expires_at)` and `AuthenticatedUser(user_id,username,real_name,department,role,must_change_password,csrf_token)` dataclasses. Implement `issue(user_id,now=None)`, `resolve(token,now=None)`, `verify_csrf(user,submitted)`, `revoke_token(token)`, `revoke_user(user_id)`, and `purge_expired(now=None)`.
+Create immutable `IssuedSession(token,csrf_token,expires_at)` and `AuthenticatedUser(user_id,username,real_name,department,role,must_change_password,csrf_token)` dataclasses. Implement `issue(authenticated_user,now=None)`, `resolve(token,now=None)`, `verify_csrf(user,submitted)`, `revoke_token(token)`, `revoke_user(user_id)`, and `purge_expired(now=None)`. `authenticated_user` is the `User` snapshot returned by `UserService.authenticate()`; `issue_authenticated(authenticated_user,now=None)` is the explicit login-route alias. Do not expose a bare `user_id` signing path.
 
 Generate token and CSRF values with `secrets.token_urlsafe(32)` and store only:
 
@@ -376,7 +386,7 @@ Generate token and CSRF values with `secrets.token_urlsafe(32)` and store only:
 token_hash = hashlib.sha256(token.encode("ascii")).digest()
 ```
 
-`issue()` deletes the previous row and inserts the replacement in one immediate transaction with `expires_at = now + timedelta(days=7)`. `resolve()` joins the active user, deletes expired sessions, and never extends expiry. Wire `SessionService.revoke_user` into `UserService` and test revocation after disable, reset, and self-change.
+`issue()` deletes the previous row and inserts the replacement in one immediate transaction with `expires_at = now + timedelta(days=7)`. In that same transaction it requires `status = 'active'` and exact equality with the authentication snapshot's `password_version` and `status_version`; an old snapshot must not issue after password change/reset or disable/reenable. `resolve()` joins the active user, deletes expired sessions, and never extends expiry. Wire `SessionService.revoke_user` into `UserService` and test revocation after disable, reset, and self-change.
 
 - [ ] **Step 4: Run tests and commit**
 

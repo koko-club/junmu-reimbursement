@@ -69,7 +69,7 @@
 - `csrf_token`：修改类请求的随机 CSRF 校验材料。
 - `created_at` / `expires_at`：创建时间和最长 7 天的绝对过期时间。
 
-数据库不保存原始 Cookie 令牌。创建新会话时，先删除该用户的旧会话，再插入新会话。
+数据库不保存原始 Cookie 令牌。登录路由先调用 `UserService.authenticate()`，再将返回的 `User` 认证快照传给 `SessionService.issue(authenticated_user)`；不提供裸 `user_id` 签发路径。签发在同一个 `BEGIN IMMEDIATE` 事务内要求账号仍为 `active`，且 `password_version` 与 `status_version` 同时匹配认证快照，然后删除该用户的旧会话并插入新会话。密码修改、管理员重置、停用或停用后重新启用都会改变版本，旧认证快照不得重新签发会话。
 
 ### 5.3 reimbursements
 
@@ -117,7 +117,7 @@
 ### 6.3 登录和单会话
 
 - 密码长度为 8–128 个字符，使用 Python 标准库 `hashlib.scrypt` 和每用户随机盐。
-- 成功登录后生成至少 256 位随机令牌，原始值只放入 Cookie。
+- 成功登录后将 `UserService.authenticate()` 返回的 `User` 快照传给 `SessionService.issue(authenticated_user)`，生成至少 256 位随机令牌，原始值只放入 Cookie。
 - Cookie 设置 `HttpOnly`、`SameSite=Lax` 和 `Path=/`；HTTPS 环境通过配置增加 `Secure`。
 - 会话有效期为绝对 7 天，不因活动而无限延长。
 - 新登录在事务中替换该账号的旧会话。旧设备的下一个受保护请求返回会话失效并跳转登录。
@@ -264,6 +264,7 @@
 
 - `scrypt` 哈希与校验、密码长度和临时密码。
 - 会话创建、单会话替换、过期、退出和撤销。
+- 认证快照签发：`active`、`password_version` 和 `status_version` 在同一立即事务内校验；密码修改/重置及禁用后重新启用均不能让旧快照签发。
 - CSRF 缺失、错误和正确请求。
 - 初始设置仅一次、注册、批准、拒绝、停用和强制改密。
 - 管理员重置密码后撤销会话。
