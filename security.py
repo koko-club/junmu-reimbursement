@@ -18,6 +18,7 @@ _SALT_LENGTH = 16
 _DIGEST_LENGTH = 32
 _SECRET_READ_ATTEMPTS = 100
 _MAX_SCRYPT_MEMORY = 64 * 1024 * 1024
+MAX_SCRYPT_P = 4
 
 
 @dataclass(frozen=True)
@@ -80,15 +81,15 @@ class PasswordHasher:
             or n < 2
             or n & (n - 1)
             or r <= 0
-            or p <= 0
-            or 128 * n * r > _MAX_SCRYPT_MEMORY
-            or r * p >= 2**30
+            or not 1 <= p <= MAX_SCRYPT_P
+            or _estimated_scrypt_memory(n, r, p) > _MAX_SCRYPT_MEMORY
         ):
             raise ValueError("invalid scrypt parameters")
         return {"n": n, "r": r, "p": p}
 
     @staticmethod
     def _scrypt(password: bytes, salt: bytes, params: dict[str, int]) -> bytes:
+        maxmem = max(_MAX_SCRYPT_MEMORY, _estimated_scrypt_memory(**params)) + 1
         return hashlib.scrypt(
             password,
             salt=salt,
@@ -96,8 +97,12 @@ class PasswordHasher:
             r=params["r"],
             p=params["p"],
             dklen=_DIGEST_LENGTH,
-            maxmem=_MAX_SCRYPT_MEMORY,
+            maxmem=maxmem,
         )
+
+
+def _estimated_scrypt_memory(n: int, r: int, p: int) -> int:
+    return 128 * r * (n + p + 2)
 
 
 def load_or_create_secret(path: str | os.PathLike[str]) -> bytes:

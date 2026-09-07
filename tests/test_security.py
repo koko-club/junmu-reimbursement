@@ -78,6 +78,41 @@ class PasswordHasherTest(unittest.TestCase):
         )
         self.assertFalse(PasswordHasher().verify("correct horse battery staple", material))
 
+    def test_scrypt_rejects_out_of_range_p_before_hash_or_verify(self):
+        with mock.patch("security.hashlib.scrypt", return_value=b"d" * 32) as scrypt:
+            for invalid_p in (0, 32768):
+                with self.subTest(p=invalid_p):
+                    material = PasswordMaterial(
+                        digest=b"d" * 32,
+                        salt=b"s" * 16,
+                        params=f'{{"n":16384,"r":8,"p":{invalid_p}}}',
+                    )
+                    with self.assertRaises(ValueError):
+                        PasswordHasher(n=16384, r=8, p=invalid_p).hash("correct horse battery staple")
+                    self.assertFalse(PasswordHasher().verify("correct horse battery staple", material))
+
+        scrypt.assert_not_called()
+
+    def test_scrypt_rejects_openssl_formula_over_budget_before_calling_library(self):
+        with mock.patch("security.hashlib.scrypt", return_value=b"d" * 32) as scrypt:
+            with self.assertRaises(ValueError):
+                PasswordHasher(n=65536, r=8, p=4).hash("correct horse battery staple")
+
+        scrypt.assert_not_called()
+
+    def test_scrypt_maxmem_is_strictly_above_memory_budget(self):
+        with mock.patch("security.hashlib.scrypt", return_value=b"d" * 32) as scrypt:
+            PasswordHasher(n=1024, r=8, p=4).hash("correct horse battery staple")
+
+        self.assertGreater(scrypt.call_args.kwargs["maxmem"], 64 * 1024 * 1024)
+
+    def test_scrypt_near_budget_parameters_execute(self):
+        hasher = PasswordHasher(n=32768, r=15, p=1)
+
+        material = hasher.hash("correct horse battery staple")
+
+        self.assertTrue(hasher.verify("correct horse battery staple", material))
+
 
 class SecretFileTest(unittest.TestCase):
     def test_secret_is_reused_and_is_private_to_owner(self):
