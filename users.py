@@ -66,9 +66,17 @@ def canonicalize_username(value: object) -> tuple[str, str]:
     username = value.strip()
     if not 3 <= len(username) <= 50:
         raise ValidationError("username must contain 3 to 50 characters")
+    try:
+        username.encode("utf-8")
+    except UnicodeEncodeError as error:
+        raise ValidationError("username must be valid UTF-8 text") from error
     key = unicodedata.normalize("NFKC", username).strip().casefold()
     if not key:
         raise ValidationError("username must contain 3 to 50 characters")
+    try:
+        key.encode("utf-8")
+    except UnicodeEncodeError as error:
+        raise ValidationError("username must be valid UTF-8 text") from error
     return username, key
 
 

@@ -89,6 +89,16 @@ class UserServiceTest(unittest.TestCase):
                 with self.assertRaises(ValidationError):
                     self.service.register(username, "correct horse battery staple", "Alex", "Engineering")
 
+    def test_canonicalize_username_rejects_unencodable_surrogates(self):
+        self.assertEqual(
+            users.canonicalize_username("\U0001f600xx"),
+            ("\U0001f600xx", "\U0001f600xx"),
+        )
+        for username in ("\ud800xx", "\udfffxx", "x\ud800x"):
+            with self.subTest(username=repr(username)):
+                with self.assertRaises(ValidationError):
+                    users.canonicalize_username(username)
+
     def test_profile_fields_are_required_bounded_and_formula_safe(self):
         self.setup_admin()
         for name, department in (("", "Engineering"), ("Alex", "\t"), ("=formula", "Engineering"), ("Alex", "+formula"), ("x" * 101, "Engineering")):

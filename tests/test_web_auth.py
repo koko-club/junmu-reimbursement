@@ -441,6 +441,90 @@ class WebAuthenticationTest(unittest.TestCase):
         self.assertEqual(account_keys[0][1], ("invalid", "<invalid>"))
         self.assertEqual(verify.call_count, 3)
 
+    def test_raw_unencodable_usernames_are_throttled_without_exception_logging(self):
+        self.setup_admin()
+        token = self.client.csrf_for("/api/login")
+        application = self.running.server.application
+        hasher = self.running.users._password_hasher
+        username_escapes = (br"\ud800xx", br"\udfffxx") * 3
+
+        with mock.patch.object(hasher, "verify", wraps=hasher.verify) as verify, mock.patch(
+            "web._LOGGER.exception"
+        ) as log_exception:
+            statuses = []
+            for username_escape in username_escapes:
+                body = (
+                    b'{"username":"'
+                    + username_escape
+                    + b'","password":"wrong-password"}'
+                )
+                response = self.client.raw_request(
+                    "POST",
+                    "/api/login",
+                    body=body,
+                    headers=[
+                        ("Content-Type", "application/json"),
+                        ("Content-Length", str(len(body))),
+                        ("X-CSRF-Token", token),
+                    ],
+                )
+                statuses.append(response.status)
+
+        self.assertEqual(statuses, [401] * 5 + [429])
+        self.assertEqual(verify.call_count, 5)
+        log_exception.assert_not_called()
+        invalid_identity = ("invalid", "<invalid>")
+        client_ip = "127.0.0.1"
+        for key in (
+            ("login-account-ip", invalid_identity, client_ip),
+            ("login-ip", client_ip),
+            ("login-global",),
+        ):
+            with self.subTest(key=key):
+                self.assertEqual(len(application.rate_limiter._attempts[key]), 5)
+
+    def test_raw_unencodable_setup_and_registration_stop_before_hashing(self):
+        hasher = self.running.users._password_hasher
+
+        def raw_account_request(path, username_escape, token):
+            body = (
+                b'{"username":"'
+                + username_escape
+                + b'","password":"administrator1","real_name":"A",'
+                b'"department":"D"}'
+            )
+            return self.client.raw_request(
+                "POST",
+                path,
+                body=body,
+                headers=[
+                    ("Content-Type", "application/json"),
+                    ("Content-Length", str(len(body))),
+                    ("X-CSRF-Token", token),
+                ],
+            )
+
+        setup_token = self.client.csrf_for("/api/setup")
+        with mock.patch.object(hasher, "hash", wraps=hasher.hash) as hash_password, mock.patch(
+            "web._LOGGER.exception"
+        ) as log_exception:
+            setup = raw_account_request("/api/setup", br"\ud800xx", setup_token)
+        self.assertEqual(setup.status, 400)
+        hash_password.assert_not_called()
+        log_exception.assert_not_called()
+
+        self.assertEqual(self.setup_admin().status, 201)
+        register_token = self.client.csrf_for("/api/register")
+        with mock.patch.object(hasher, "hash", wraps=hasher.hash) as hash_password, mock.patch(
+            "web._LOGGER.exception"
+        ) as log_exception:
+            registration = raw_account_request(
+                "/api/register", br"\udfffxx", register_token
+            )
+        self.assertEqual(registration.status, 400)
+        hash_password.assert_not_called()
+        log_exception.assert_not_called()
+
     def test_valid_expanding_username_does_not_share_invalid_limiter_identity(self):
         username = "ß" * 50
         self.setup_admin()

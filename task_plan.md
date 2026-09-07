@@ -4,7 +4,7 @@
 在现有差旅报销网页工具基础上增加管理员、普通用户登录、普通用户单会话限制，以及按用户隔离的 Excel/PDF 生成历史。
 
 ## Current Phase
-Task 6 canonical login-limiter identity follow-up complete and verified; Task 7 has not started.
+Task 6 unencodable-username canonicalization follow-up complete and verified; Task 7 has not started.
 
 ## Design Checklist
 - [x] Explore current project location and existing architecture
@@ -37,3 +37,4 @@ Task 6 canonical login-limiter identity follow-up complete and verified; Task 7 
 | HTTP/auth verification referenced absent planned module `tests.test_request_security` | 1 | Derived the actual verification groups from the current test tree and prior 55-test total: `test_web_auth` plus `test_server` |
 | Sandboxed HTTP test could not bind its temporary localhost port | 1 | Re-ran the same focused test with approved localhost binding and captured the behavioral RED result |
 | Verbose full-suite output did not retain its final summary in the tool capture | 1 | Re-ran the complete suite quietly and captured the definitive 180-test count and zero exit status |
+| Combined surrogate-test patch mismatched escaped Unicode context in `test_users.py` | 1 | Confirmed the patch was atomic with no test changes, then split it into smaller insertions anchored on ASCII-only lines |
