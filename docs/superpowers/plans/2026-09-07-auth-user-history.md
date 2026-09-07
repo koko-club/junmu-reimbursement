@@ -104,7 +104,7 @@ Expected: a root commit in the new project; the old project remains untouched.
 - Modify: `config.json`
 - Modify: `tests/test_config.py`
 
-- [ ] **Step 1: Write failing configuration and schema tests**
+- [x] **Step 1: Write failing configuration and schema tests**
 
 ```python
 def test_environment_overrides_docker_values(self):
@@ -128,7 +128,7 @@ def test_migrate_is_idempotent_and_enables_safety(self):
         self.assertEqual(connection.execute("PRAGMA journal_mode").fetchone()[0].lower(), "wal")
 ```
 
-- [ ] **Step 2: Verify failure**
+- [x] **Step 2: Verify failure**
 
 ```bash
 python3 -m unittest tests.test_config tests.test_database -v
@@ -136,7 +136,7 @@ python3 -m unittest tests.test_config tests.test_database -v
 
 Expected: import failures for `config` and `database`.
 
-- [ ] **Step 3: Implement configuration**
+- [x] **Step 3: Implement configuration**
 
 Create immutable `AppConfig` with `template_path`, `data_dir`, `templates_dir`, `static_dir`, `host`, `port`, `soffice_path`, `max_body_bytes`, `max_concurrent_generations`, and `cookie_secure`. `load_config(path,environ=None)` resolves JSON-relative paths against the config directory and honors `APP_HOST`, `APP_PORT`, `APP_DATA_DIR`, `APP_SOFFICE_PATH`, `APP_MAX_BODY_BYTES`, `APP_MAX_CONCURRENT_GENERATIONS`, and `APP_COOKIE_SECURE`.
 
@@ -157,7 +157,7 @@ Use this local default:
 
 Reject ports outside 1–65535 except test port 0, reject non-positive limits, and parse booleans only from `true/false`, `1/0`, or `yes/no` case-insensitively.
 
-- [ ] **Step 4: Implement `Database` and migration version 1**
+- [x] **Step 4: Implement `Database` and migration version 1**
 
 Each connection uses `sqlite3.Row`, foreign keys, 5000 ms busy timeout, and WAL. Transactions commit on success and roll back on every exception. `Database.backup(destination)` uses SQLite's backup API.
 
@@ -190,7 +190,7 @@ CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT
 INSERT INTO app_settings(key,value) VALUES ('setup_complete','false');
 ```
 
-- [ ] **Step 5: Run tests and commit**
+- [x] **Step 5: Run tests and commit**
 
 ```bash
 python3 -m unittest tests.test_config tests.test_database -v
