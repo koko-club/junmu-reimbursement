@@ -1460,7 +1460,7 @@ class ReimbursementServiceTest(unittest.TestCase):
         self.assertEqual(len(observed), 2)
         self.assertTrue(all(connection.closed for connection in observed))
 
-    def test_work_directory_open_failure_rolls_back_created_uuid_directory(self):
+    def test_work_directory_open_failure_rolls_back_stat_verified_uuid_directory(self):
         record_uuid = UUID("33333333-3333-4333-8333-333333333331")
         record_id = str(record_uuid)
         real_open = os.open
@@ -1481,6 +1481,178 @@ class ReimbursementServiceTest(unittest.TestCase):
         self.assertTrue(failed)
         self.assertFalse((self.data_dir / "tmp" / record_id).exists())
         self._assert_no_history_or_artifacts()
+
+    def test_work_directory_open_failure_does_not_delete_swapped_replacement(self):
+        record_uuid = UUID("33333333-3333-4333-8333-333333333337")
+        record_id = str(record_uuid)
+        detached_created = self.root / "detached-created-work"
+        replacement = self.data_dir / "tmp" / record_id
+        sentinel = replacement / "DO-NOT-DELETE"
+        real_open = os.open
+        failed = False
+
+        def swap_then_fail(path, *args, **kwargs):
+            nonlocal failed
+            if path == record_id and not failed:
+                failed = True
+                replacement.rename(detached_created)
+                replacement.mkdir()
+                sentinel.write_bytes(b"external")
+                raise OSError("forced work directory open failure after replacement")
+            return real_open(path, *args, **kwargs)
+
+        service = self._service_with(uuid_factory=lambda: record_uuid)
+        with mock.patch("reimbursements.os.open", side_effect=swap_then_fail):
+            with self.assertRaises(ReimbursementGenerationError):
+                service.generate(self.alice, valid_payload(), [])
+
+        self.assertTrue(failed)
+        self.assertTrue(detached_created.is_dir())
+        self.assertEqual(sentinel.read_bytes(), b"external")
+        with self.database.connect() as connection:
+            count = connection.execute("SELECT COUNT(*) FROM reimbursements").fetchone()[0]
+        self.assertEqual(count, 0)
+        self.assertEqual(list(self.data_dir.rglob("*.xlsx")), [])
+        self.assertEqual(list(self.data_dir.rglob("*.pdf")), [])
+
+    def test_work_directory_first_open_does_not_adopt_swapped_replacement(self):
+        record_uuid = UUID("33333333-3333-4333-8333-333333333339")
+        record_id = str(record_uuid)
+        detached_created = self.root / "detached-created-before-open"
+        replacement = self.data_dir / "tmp" / record_id
+        sentinel = replacement / "DO-NOT-DELETE"
+        real_open = os.open
+        swapped = False
+
+        def swap_then_open(path, *args, **kwargs):
+            nonlocal swapped
+            if path == record_id and not swapped:
+                swapped = True
+                replacement.rename(detached_created)
+                replacement.mkdir()
+                sentinel.write_bytes(b"external")
+            return real_open(path, *args, **kwargs)
+
+        service = self._service_with(
+            uuid_factory=lambda: record_uuid,
+            workbook_generator=mock.Mock(side_effect=RuntimeError("forced failure")),
+        )
+        with mock.patch("reimbursements.os.open", side_effect=swap_then_open):
+            with self.assertRaises(ReimbursementGenerationError):
+                service.generate(self.alice, valid_payload(), [])
+
+        self.assertTrue(swapped)
+        self.assertTrue(detached_created.is_dir())
+        self.assertEqual(sentinel.read_bytes(), b"external")
+        with self.database.connect() as connection:
+            count = connection.execute("SELECT COUNT(*) FROM reimbursements").fetchone()[0]
+        self.assertEqual(count, 0)
+
+    def test_work_directory_initial_stat_failure_retains_unverified_uuid_directory(self):
+        record_uuid = UUID("33333333-3333-4333-8333-333333333335")
+        record_id = str(record_uuid)
+        real_stat = os.stat
+        failed = False
+
+        def fail_once(path, *args, **kwargs):
+            nonlocal failed
+            if path == record_id and not failed:
+                failed = True
+                raise OSError("forced work directory stat failure")
+            return real_stat(path, *args, **kwargs)
+
+        service = self._service_with(uuid_factory=lambda: record_uuid)
+        with mock.patch(
+            "reimbursements.os.stat", side_effect=fail_once
+        ), self.assertLogs("reimbursements", level="ERROR") as captured:
+            with self.assertRaises(ReimbursementGenerationError):
+                service.generate(self.alice, valid_payload(), [])
+
+        self.assertTrue(failed)
+        self.assertTrue((self.data_dir / "tmp" / record_id).is_dir())
+        self.assertEqual(
+            captured.output,
+            [
+                "ERROR:reimbursements:reimbursement generation failed "
+                f"record_id={record_id} exception=OSError"
+            ],
+        )
+        with self.database.connect() as connection:
+            count = connection.execute("SELECT COUNT(*) FROM reimbursements").fetchone()[0]
+        self.assertEqual(count, 0)
+        self.assertEqual(list(self.data_dir.rglob("*.xlsx")), [])
+        self.assertEqual(list(self.data_dir.rglob("*.pdf")), [])
+
+        later_record = self.service.generate(self.alice, valid_payload(), [])
+        self.assertEqual(later_record.user_id, self.alice.user_id)
+        with self.database.connect() as connection:
+            count = connection.execute("SELECT COUNT(*) FROM reimbursements").fetchone()[0]
+        self.assertEqual(count, 1)
+
+    def test_work_directory_initial_stat_failure_does_not_delete_swapped_replacement(self):
+        record_uuid = UUID("33333333-3333-4333-8333-333333333338")
+        record_id = str(record_uuid)
+        detached_created = self.root / "detached-created-before-stat"
+        replacement = self.data_dir / "tmp" / record_id
+        sentinel = replacement / "DO-NOT-DELETE"
+        real_stat = os.stat
+        failed = False
+
+        def swap_then_fail(path, *args, **kwargs):
+            nonlocal failed
+            if path == record_id and not failed:
+                failed = True
+                replacement.rename(detached_created)
+                replacement.mkdir()
+                sentinel.write_bytes(b"external")
+                raise OSError("forced work directory stat failure after replacement")
+            return real_stat(path, *args, **kwargs)
+
+        service = self._service_with(uuid_factory=lambda: record_uuid)
+        with mock.patch("reimbursements.os.stat", side_effect=swap_then_fail):
+            with self.assertRaises(ReimbursementGenerationError):
+                service.generate(self.alice, valid_payload(), [])
+
+        self.assertTrue(failed)
+        self.assertTrue(detached_created.is_dir())
+        self.assertEqual(sentinel.read_bytes(), b"external")
+        with self.database.connect() as connection:
+            count = connection.execute("SELECT COUNT(*) FROM reimbursements").fetchone()[0]
+        self.assertEqual(count, 0)
+        self.assertEqual(list(self.data_dir.rglob("*.xlsx")), [])
+        self.assertEqual(list(self.data_dir.rglob("*.pdf")), [])
+
+    def test_persistent_initial_stat_failure_does_not_delete_swapped_replacement(self):
+        record_uuid = UUID("33333333-3333-4333-8333-33333333333a")
+        record_id = str(record_uuid)
+        detached_created = self.root / "detached-created-before-persistent-stat"
+        replacement = self.data_dir / "tmp" / record_id
+        sentinel = replacement / "DO-NOT-DELETE"
+        real_stat = os.stat
+        target_calls = 0
+
+        def swap_then_always_fail(path, *args, **kwargs):
+            nonlocal target_calls
+            if path == record_id:
+                target_calls += 1
+                if target_calls == 1:
+                    replacement.rename(detached_created)
+                    replacement.mkdir()
+                    sentinel.write_bytes(b"external")
+                raise OSError("persistent work directory stat failure")
+            return real_stat(path, *args, **kwargs)
+
+        service = self._service_with(uuid_factory=lambda: record_uuid)
+        with mock.patch("reimbursements.os.stat", side_effect=swap_then_always_fail):
+            with self.assertRaises(ReimbursementGenerationError):
+                service.generate(self.alice, valid_payload(), [])
+
+        self.assertGreaterEqual(target_calls, 1)
+        self.assertTrue(detached_created.is_dir())
+        self.assertEqual(sentinel.read_bytes(), b"external")
+        with self.database.connect() as connection:
+            count = connection.execute("SELECT COUNT(*) FROM reimbursements").fetchone()[0]
+        self.assertEqual(count, 0)
 
     def test_work_directory_identity_failure_rolls_back_and_closes_fd(self):
         record_uuid = UUID("33333333-3333-4333-8333-333333333332")
@@ -1522,7 +1694,7 @@ class ReimbursementServiceTest(unittest.TestCase):
                 os.fstat(descriptor)
         self._assert_no_history_or_artifacts()
 
-    def test_final_claim_open_failure_rolls_back_created_uuid_directory(self):
+    def test_final_claim_open_failure_rolls_back_stat_verified_uuid_directory(self):
         record_uuid = UUID("33333333-3333-4333-8333-333333333333")
         record_id = str(record_uuid)
         real_open = os.open
@@ -1548,6 +1720,34 @@ class ReimbursementServiceTest(unittest.TestCase):
         final_dir = self.data_dir / "users" / str(self.alice.user_id) / record_id
         self.assertTrue(failed)
         self.assertFalse(final_dir.exists())
+        self._assert_no_history_or_artifacts()
+
+    def test_final_claim_initial_stat_failure_retains_unverified_uuid_directory(self):
+        record_uuid = UUID("33333333-3333-4333-8333-333333333336")
+        record_id = str(record_uuid)
+        real_stat = os.stat
+        record_stat_count = 0
+        failed = False
+
+        def fail_second_record_stat(path, *args, **kwargs):
+            nonlocal failed, record_stat_count
+            if path == record_id:
+                record_stat_count += 1
+                if record_stat_count == 2 and not failed:
+                    failed = True
+                    raise OSError("forced final claim stat failure")
+            return real_stat(path, *args, **kwargs)
+
+        service = self._service_with(uuid_factory=lambda: record_uuid)
+        with mock.patch(
+            "reimbursements.os.stat", side_effect=fail_second_record_stat
+        ):
+            with self.assertRaises(ReimbursementGenerationError):
+                service.generate(self.alice, valid_payload(), [])
+
+        final_dir = self.data_dir / "users" / str(self.alice.user_id) / record_id
+        self.assertTrue(failed)
+        self.assertTrue(final_dir.is_dir())
         self._assert_no_history_or_artifacts()
 
     def test_final_claim_identity_failure_rolls_back_and_closes_fd(self):

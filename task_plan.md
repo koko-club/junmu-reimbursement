@@ -30,6 +30,12 @@ Task 7 atomic per-user generation follow-up is in progress under strict TDD; Tas
 - [x] GREEN: create, open, and capture identity for request-owned directories in one rollback-safe helper
 - [x] Run focused/full ResourceWarning, real LibreOffice E2E, compile, diff, review, and commit; keep Task 7 in progress
 
+## Task 7 Initial-statat Follow-up
+- [x] RED: inject one-shot initial statat failures for work and final claim UUID directories
+- [x] GREEN: bind ownership to the first no-follow stat, require the opened fd to match, and retain UUID entries when that first identity check fails
+- [x] Preserve collision, persistent-inspection-failure, shared-directory, and fd-close behavior
+- [x] Run new/focused/full ResourceWarning, real LibreOffice E2E, compile, diff, review, and commit follow-up; keep Task 7 in progress
+
 ## Design Checklist
 - [x] Explore current project location and existing architecture
 - [x] Confirm whether to preserve the old version and build in this directory
@@ -74,3 +80,6 @@ Task 7 atomic per-user generation follow-up is in progress under strict TDD; Tas
 | Sandboxed full suite could not bind loopback sockets (`PermissionError`) | 1 | Re-run the same 244-test command with the required local-network sandbox permission |
 | Shared-directory characterization reused the no-files helper despite precreated sentinels | 1 | Replaced only its final assertion with zero database rows and zero XLSX/PDF artifacts |
 | Identity-failure tests counted only creation fds, but rollback safely reopened the same UUID | 1 | Assert every captured creation and rollback fd is closed instead of assuming the pre-fix fd count |
+| First complete-suite capture omitted its final unittest summary and exit status after expected fault-injection logs | 1 | Re-ran through a persistent buffered unittest session and captured 255 tests, `OK`, and exit status 0 |
+| First Initial-statat review fix moved unsafe identity inference from failed open recovery to failed stat recovery | 1 | Added the symmetric replacement regression and retained any UUID entry whose first open cannot establish a bound identity |
+| Three mkdir/open/stat orderings each allowed a replacement inode to become the rollback identity | 3 | Stop rearranging non-atomic operations; require an explicit contract decision between conservative retention and guaranteed transient-failure cleanup |
