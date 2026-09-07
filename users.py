@@ -66,6 +66,7 @@ class User:
     created_at: str
     approved_at: str | None
     updated_at: str
+    security_version: int
 
 
 class UserService:
@@ -231,7 +232,8 @@ class UserService:
             if user["status"] == desired_status:
                 raise InvalidState("user already has requested enabled state")
             connection.execute(
-                "UPDATE users SET status = ?, updated_at = ? WHERE id = ?",
+                "UPDATE users SET status = ?, updated_at = ?, security_version = security_version + 1 "
+                "WHERE id = ?",
                 (desired_status, changed_at, user_id),
             )
             updated = self._get_in(connection, user_id)
@@ -240,7 +242,7 @@ class UserService:
             try:
                 self._revoke(user_id)
             except Exception:
-                self._restore_status(user_id, prior_status)
+                self._restore_status(user_id, prior_status, updated.security_version)
                 raise
         return updated
 
@@ -253,13 +255,18 @@ class UserService:
             previous = self._require_user_approved(connection, user_id)
             connection.execute(
                 "UPDATE users SET password_hash = ?, password_salt = ?, password_params = ?, "
-                "must_change_password = 1, updated_at = ? WHERE id = ?",
+                "must_change_password = 1, updated_at = ?, security_version = security_version + 1 "
+                "WHERE id = ?",
                 (material.digest, material.salt, material.params, changed_at, user_id),
             )
+            updated = self._get_in(connection, user_id)
         try:
             self._revoke(user_id)
         except Exception:
-            self._restore_password(user_id, previous, material, replacement_must_change_password=1)
+            self._restore_password(
+                user_id, previous, material, replacement_must_change_password=1,
+                replacement_security_version=updated.security_version,
+            )
             raise
         return temporary_password
 
@@ -281,13 +288,18 @@ class UserService:
                 raise AuthenticationFailed("invalid username or password")
             connection.execute(
                 "UPDATE users SET password_hash = ?, password_salt = ?, password_params = ?, "
-                "must_change_password = 0, updated_at = ? WHERE id = ?",
+                "must_change_password = 0, updated_at = ?, security_version = security_version + 1 "
+                "WHERE id = ?",
                 (material.digest, material.salt, material.params, changed_at, user_id),
             )
+            updated = self._get_in(connection, user_id)
         try:
             self._revoke(user_id)
         except Exception:
-            self._restore_password(user_id, user, material, replacement_must_change_password=0)
+            self._restore_password(
+                user_id, user, material, replacement_must_change_password=0,
+                replacement_security_version=updated.security_version,
+            )
             raise
 
     def _revoke(self, user_id: int) -> None:
@@ -297,11 +309,14 @@ class UserService:
             _LOGGER.exception("session revocation failed for user_id=%s", user_id)
             raise
 
-    def _restore_status(self, user_id: int, prior_status: str) -> None:
+    def _restore_status(
+        self, user_id: int, prior_status: str, replacement_security_version: int
+    ) -> None:
         with self._database.transaction(immediate=True) as connection:
             restored = connection.execute(
-                "UPDATE users SET status = ? WHERE id = ? AND status = 'disabled'",
-                (prior_status, user_id),
+                "UPDATE users SET status = ?, security_version = security_version + 1 "
+                "WHERE id = ? AND security_version = ? AND status = 'disabled'",
+                (prior_status, user_id, replacement_security_version),
             )
         if restored.rowcount != 1:
             _LOGGER.error("could not restore status after failed revocation for user_id=%s", user_id)
@@ -312,17 +327,19 @@ class UserService:
         previous: sqlite3.Row,
         replacement: PasswordMaterial,
         replacement_must_change_password: int,
+        replacement_security_version: int,
     ) -> None:
         with self._database.transaction(immediate=True) as connection:
             restored = connection.execute(
                 "UPDATE users SET password_hash = ?, password_salt = ?, password_params = ?, "
-                "must_change_password = ? "
+                "must_change_password = ?, security_version = security_version + 1 "
                 "WHERE id = ? AND password_hash = ? AND password_salt = ? AND password_params = ? "
-                "AND must_change_password = ?",
+                "AND must_change_password = ? AND security_version = ?",
                 (
                     previous["password_hash"], previous["password_salt"], previous["password_params"],
                     previous["must_change_password"], user_id, replacement.digest,
                     replacement.salt, replacement.params, replacement_must_change_password,
+                    replacement_security_version,
                 ),
             )
         if restored.rowcount != 1:
@@ -354,6 +371,7 @@ class UserService:
             department=row["department"], role=row["role"], status=row["status"],
             must_change_password=bool(row["must_change_password"]), created_at=row["created_at"],
             approved_at=row["approved_at"], updated_at=row["updated_at"],
+            security_version=row["security_version"],
         )
 
     def _get_in(self, connection: sqlite3.Connection, user_id: int) -> User:

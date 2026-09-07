@@ -10,6 +10,7 @@ APP_DIR = Path(__file__).resolve().parents[1]
 if str(APP_DIR) not in sys.path:
     sys.path.insert(0, str(APP_DIR))
 
+import database
 from database import Database
 
 
@@ -57,9 +58,39 @@ class DatabaseTest(unittest.TestCase):
                 "SELECT value FROM app_settings WHERE key = 'setup_complete'"
             ).fetchone()
 
-        self.assertEqual([row["version"] for row in versions], [1])
+        self.assertEqual([row["version"] for row in versions], [1, 2])
         self.assertTrue(versions[0]["applied_at"])
         self.assertEqual(setting["value"], "false")
+
+    def test_migrate_upgrades_an_existing_v1_database_with_security_version(self):
+        connection = self.db.connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                "CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)"
+            )
+            for statement in database._SCHEMA_V1:
+                connection.execute(statement)
+            connection.execute(
+                "INSERT INTO app_settings(key, value) VALUES ('setup_complete', 'false')"
+            )
+            connection.execute(
+                "INSERT INTO schema_migrations(version, applied_at) VALUES (1, '2026-09-07T00:00:00+00:00')"
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        self.db.migrate()
+        self.db.migrate()
+
+        with self.db.transaction() as connection:
+            columns = {row["name"]: row for row in connection.execute("PRAGMA table_info(users)")}
+            versions = [row["version"] for row in connection.execute(
+                "SELECT version FROM schema_migrations ORDER BY version"
+            )]
+        self.assertEqual(columns["security_version"]["dflt_value"], "0")
+        self.assertEqual(versions, [1, 2])
 
     def test_v1_schema_matches_storage_contract(self):
         self.db.migrate()
@@ -90,6 +121,7 @@ class DatabaseTest(unittest.TestCase):
         self.assertEqual(users["password_hash"]["type"], "BLOB")
         self.assertEqual(users["password_salt"]["type"], "BLOB")
         self.assertEqual(users["must_change_password"]["dflt_value"], "0")
+        self.assertEqual(users["security_version"]["dflt_value"], "0")
         self.assertEqual(sessions["token_hash"]["type"], "BLOB")
         self.assertEqual(reimbursements["id"]["type"], "TEXT")
         self.assertEqual(reimbursements["id"]["pk"], 1)

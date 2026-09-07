@@ -109,6 +109,21 @@ class Database:
                     "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
                     (1, datetime.now(timezone.utc).isoformat()),
                 )
+            version = connection.execute(
+                "SELECT 1 FROM schema_migrations WHERE version = 2"
+            ).fetchone()
+            if version is None:
+                columns = {
+                    row["name"] for row in connection.execute("PRAGMA table_info(users)")
+                }
+                if "security_version" not in columns:
+                    connection.execute(
+                        "ALTER TABLE users ADD COLUMN security_version INTEGER NOT NULL DEFAULT 0"
+                    )
+                connection.execute(
+                    "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
+                    (2, datetime.now(timezone.utc).isoformat()),
+                )
             connection.commit()
         except Exception:
             connection.rollback()
