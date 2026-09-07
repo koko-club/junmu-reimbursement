@@ -506,8 +506,11 @@ Completion follow-up: Task 6 also implements one shared two-operation scrypt con
 **Files:**
 - Create: `reimbursements.py`
 - Create: `tests/test_reimbursements.py`
+- Modify: `generator.py`
+- Modify: `tests/test_generator.py`
 - Modify: `validation.py`
 - Modify: `tests/test_validation.py`
+- Modify: `tests/test_end_to_end.py`
 - Modify: `app.py`
 
 - [ ] **Step 1: Write failing generation tests**
@@ -554,9 +557,9 @@ payload = validate_payload(
 
 - [ ] **Step 4: Implement `ReimbursementService`**
 
-Create immutable `ReimbursementRecord` with `id`, `user_id`, `reimbursement_date`, `display_name`, `xlsx_path`, `pdf_path`, `created_at`, and `deleted_at`. Implement `generate(user,raw_payload,screenshots)`, `list_active(user_id)`, `list_trash(user_id)`, and `owned_file(user_id,record_id,kind,include_deleted=False)`.
+Create immutable `ReimbursementRecord` with `id`, `user_id`, `reimbursement_date`, `display_name`, `xlsx_path`, `pdf_path`, `created_at`, and `deleted_at`. Implement `generate(user,raw_payload,screenshots)`, `list_active(user_id)`, `list_trash(user_id)`, and `owned_file(user_id,record_id,kind,include_deleted=False)`. `owned_file()` returns a context-managed `OwnedReimbursementFile` containing the record, artifact kind, display name, size, and an already-open binary stream; callers must close it with `with` and must never reopen a returned path.
 
-`generate()` requires ordinary-user role, creates UUID4 ID and `/data/tmp/<id>`, applies trusted profile fields, and runs generator/LibreOffice under a `BoundedSemaphore(max_concurrent_generations)`. Verify both outputs stay in the work directory, move it atomically to `/data/users/<user_id>/<id>`, then insert server-controlled relative paths. On failure, remove artifacts created by that call and raise a stable Chinese web error while internal logs retain request ID and exception class.
+`generate()` requires ordinary-user role, creates UUID4 ID and `/data/tmp/<id>`, applies trusted profile fields, and computes a filesystem-safe output stem capped at 150 UTF-8 bytes before entering `BoundedSemaphore(max_concurrent_generations)`. The workbook retains the complete trusted profile value. Anchor data/tmp/users/owner/record directories with `O_DIRECTORY|O_NOFOLLOW` descriptors; create and move record directories only with `dir_fd`-relative operations. Open each output through every directory component with `O_NOFOLLOW`, require a regular single-link file, preserve its `(st_dev,st_ino)` and open descriptor through database commit, and recheck the same identity after PDF export, immediately before move, and after move. Cleanup validates the request-owned directory identity and uses symlink-resistant fd-relative recursion; it never reparses an absolute cleanup path. Then insert only server-controlled relative paths. On failure, remove only artifacts whose identities belong to that call and raise a stable Chinese web error while internal logs retain request ID and exception class.
 
 - [ ] **Step 5: Run regressions and commit**
 
@@ -578,6 +581,8 @@ Expected: all focused tests pass, including formulas, blank dates, PDF uppercase
 - Modify: `reimbursements.py`
 - Modify: `web.py`
 - Modify: `app.py`
+
+Download handlers consume `OwnedReimbursementFile` only inside its context manager, set metadata from that object, and stream `owned.stream` in 64 KiB chunks. They never resolve or reopen a filesystem path after authorization.
 
 - [ ] **Step 1: Write the failing permission matrix**
 

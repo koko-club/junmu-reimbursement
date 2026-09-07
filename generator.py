@@ -187,7 +187,11 @@ def generate_workbook(
         receipt_count = normalized.get("receipt_count")
         if receipt_count is None:
             receipt_count = sum((row.get("receipts", 0) or 0) for row in normalized.get("rows", []) if isinstance(row, dict))
-        stem = safe_output_stem(normalized.get("date", ""), normalized.get("traveler", ""))
+        computed_stem = safe_output_stem(
+            normalized.get("date", ""), normalized.get("traveler", "")
+        )
+        requested_stem = normalized.get("output_stem")
+        stem = requested_stem if requested_stem == computed_stem else computed_stem
         candidate = output_dir / f"{stem}.xlsx"
         suffix = 2
         # Reserve the destination atomically so concurrent requests cannot select

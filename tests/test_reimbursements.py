@@ -6,6 +6,7 @@ from datetime import datetime, timedelta
 import json
 import os
 from pathlib import Path
+import shutil
 import sqlite3
 import stat
 import tempfile
@@ -14,10 +15,12 @@ import unittest
 from unittest import mock
 from uuid import UUID
 
+from openpyxl import load_workbook
+
 import app
 from config import AppConfig
 from database import Database
-from generator import GenerationResult
+from generator import GenerationResult, generate_workbook
 from reimbursements import (
     ReimbursementGenerationError,
     ReimbursementNotFound,
@@ -288,6 +291,70 @@ class ReimbursementServiceTest(unittest.TestCase):
         self.assertNotIn(dangerous_name, "\n".join(captured.output))
         self._assert_no_history_or_artifacts()
 
+    def test_dangerous_pdf_name_is_not_persisted_or_logged(self):
+        dangerous_name = "private-pdf-token\r\nInjected-Header.pdf"
+
+        def dangerous_exporter(_xlsx, work_dir, _soffice):
+            path = Path(work_dir) / dangerous_name
+            path.write_bytes(b"pdf")
+            return path
+
+        service = self._service_with(pdf_exporter=dangerous_exporter)
+
+        with self.assertLogs("reimbursements", level="ERROR") as captured:
+            with self.assertRaisesRegex(
+                ReimbursementGenerationError, "^生成报销文件失败，请稍后重试$"
+            ):
+                service.generate(self.alice, valid_payload(), [])
+
+        combined = "\n".join(captured.output)
+        self.assertNotIn("private-pdf-token", combined)
+        self.assertNotIn("Injected-Header", combined)
+        self._assert_no_history_or_artifacts()
+
+    def test_long_unicode_profiles_generate_bounded_private_files(self):
+        template = Path(__file__).resolve().parents[1] / "resources" / "差旅报销单模板.xlsx"
+        observed_payloads = []
+
+        def real_generator(template_path, work_dir, payload, image_paths):
+            observed_payloads.append(payload)
+            return generate_workbook(template_path, work_dir, payload, image_paths)
+
+        def successful_export(_xlsx, work_dir, _soffice):
+            pdf = Path(work_dir) / "converted.pdf"
+            pdf.write_bytes(b"pdf")
+            return pdf
+
+        service = ReimbursementService(
+            self.database,
+            replace(self.config, template_path=template),
+            workbook_generator=real_generator,
+            pdf_exporter=successful_export,
+        )
+
+        for length in (50, 100):
+            traveler = "张" * length
+            user = replace(self.alice, real_name=traveler)
+            with self.subTest(length=length):
+                record = service.generate(user, valid_payload(), [])
+                self.assertLessEqual(len(record.display_name.encode("utf-8")), 180)
+                self.assertTrue(record.display_name.endswith("-差旅报销单.xlsx"))
+                self.assertLessEqual(
+                    len(observed_payloads[-1]["output_stem"].encode("utf-8")),
+                    150,
+                )
+                with service.owned_file(user.user_id, record.id, "xlsx") as owned:
+                    workbook = load_workbook(owned.stream, data_only=False)
+                    try:
+                        self.assertEqual(
+                            workbook["差旅报销单"]["B5"].value,
+                            traveler,
+                        )
+                    finally:
+                        workbook.close()
+                with service.owned_file(user.user_id, record.id, "pdf") as owned:
+                    self.assertEqual(owned.stream.read(), b"pdf")
+
     def test_pdf_failure_leaves_no_files_or_history(self):
         self.exporter.side_effect = RuntimeError("conversion failed with private path")
 
@@ -310,6 +377,52 @@ class ReimbursementServiceTest(unittest.TestCase):
         self.exporter.assert_not_called()
         self._assert_no_history_or_artifacts()
 
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "FIFO is not supported")
+    def test_generator_fifo_is_rejected_without_blocking(self):
+        record_uuid = UUID("22222222-2222-4222-8222-222222222224")
+        fifo_ready = threading.Event()
+
+        def fifo_generator(_template, work_dir, _payload, _images):
+            path = Path(work_dir) / "blocked.xlsx"
+            os.mkfifo(path, 0o600)
+            fifo_ready.set()
+            return GenerationResult(path, 0, 0)
+
+        service = self._service_with(
+            uuid_factory=lambda: record_uuid,
+            workbook_generator=fifo_generator,
+        )
+        done = threading.Event()
+        errors = []
+
+        def generate():
+            try:
+                service.generate(self.alice, valid_payload(), [])
+            except Exception as error:
+                errors.append(error)
+            finally:
+                done.set()
+
+        worker = threading.Thread(target=generate, daemon=True)
+        worker.start()
+        self.assertTrue(fifo_ready.wait(1))
+        fifo_path = self.data_dir / "tmp" / str(record_uuid) / "blocked.xlsx"
+        writer_fd = None
+        try:
+            completed_without_writer = done.wait(0.2)
+            if not completed_without_writer:
+                writer_fd = os.open(fifo_path, os.O_WRONLY | os.O_NONBLOCK)
+            self.assertTrue(done.wait(1), "generation blocked while opening a FIFO")
+        finally:
+            if writer_fd is not None:
+                os.close(writer_fd)
+            worker.join(1)
+
+        self.assertTrue(completed_without_writer)
+        self.assertEqual(len(errors), 1)
+        self.assertIsInstance(errors[0], ReimbursementGenerationError)
+        self._assert_no_history_or_artifacts()
+
     def test_generator_symlink_is_rejected_without_deleting_target(self):
         target = self.root / "target.xlsx"
         target.write_bytes(b"external-target")
@@ -325,6 +438,25 @@ class ReimbursementServiceTest(unittest.TestCase):
             self.service.generate(self.alice, valid_payload(), [])
 
         self.assertEqual(target.read_bytes(), b"external-target")
+        self.exporter.assert_not_called()
+        self._assert_no_history_or_artifacts()
+
+    def test_generator_external_hardlink_is_rejected_without_deleting_target(self):
+        external = self.root / "external-hardlink.xlsx"
+        external.write_bytes(b"external-target")
+
+        def hardlink_result(_template, work_dir, _payload, _images):
+            linked = Path(work_dir) / "linked.xlsx"
+            linked.hardlink_to(external)
+            return GenerationResult(linked, 0, 0)
+
+        self.generator.side_effect = hardlink_result
+
+        with self.assertRaises(ReimbursementGenerationError):
+            self.service.generate(self.alice, valid_payload(), [])
+
+        self.assertEqual(external.read_bytes(), b"external-target")
+        self.assertEqual(external.stat().st_nlink, 1)
         self.exporter.assert_not_called()
         self._assert_no_history_or_artifacts()
 
@@ -369,6 +501,24 @@ class ReimbursementServiceTest(unittest.TestCase):
             self.service.generate(self.alice, valid_payload(), [])
 
         self.assertEqual(target.read_bytes(), b"external-target")
+        self._assert_no_history_or_artifacts()
+
+    def test_pdf_external_hardlink_is_rejected_without_deleting_target(self):
+        external = self.root / "external-hardlink.pdf"
+        external.write_bytes(b"external-target")
+
+        def hardlink_pdf(_xlsx, work_dir, _soffice):
+            linked = Path(work_dir) / "linked.pdf"
+            linked.hardlink_to(external)
+            return linked
+
+        self.exporter.side_effect = hardlink_pdf
+
+        with self.assertRaises(ReimbursementGenerationError):
+            self.service.generate(self.alice, valid_payload(), [])
+
+        self.assertEqual(external.read_bytes(), b"external-target")
+        self.assertEqual(external.stat().st_nlink, 1)
         self._assert_no_history_or_artifacts()
 
     def test_pdf_must_not_be_same_file_as_workbook(self):
@@ -595,7 +745,7 @@ class ReimbursementServiceTest(unittest.TestCase):
         screenshot = self.root / "caller.png"
         screenshot.write_bytes(b"caller")
 
-        def fail_move(_source, _destination):
+        def fail_move(_source, _destination, **_kwargs):
             raise OSError("move failed at secret path")
 
         service = self._service_with(move_directory=fail_move)
@@ -606,15 +756,279 @@ class ReimbursementServiceTest(unittest.TestCase):
         self.assertEqual(screenshot.read_bytes(), b"caller")
         self._assert_no_history_or_artifacts()
 
+    def test_cleanup_does_not_follow_replaced_tmp_root_to_external_directory(self):
+        external = self.root / "external-tmp-target"
+        detached_tmp = self.root / "detached-tmp"
+        sentinel = None
+        detached_work = None
+
+        def replace_tmp_then_fail(_xlsx, work_dir, _soffice):
+            nonlocal sentinel, detached_work
+            work_dir = Path(work_dir)
+            tmp_root = work_dir.parent
+            detached_work = detached_tmp / work_dir.name
+            external_work = external / work_dir.name
+            external_work.mkdir(parents=True)
+            sentinel = external_work / "DO-NOT-DELETE"
+            sentinel.write_bytes(b"external")
+            tmp_root.rename(detached_tmp)
+            tmp_root.symlink_to(external, target_is_directory=True)
+            raise RuntimeError("forced export failure")
+
+        service = self._service_with(pdf_exporter=replace_tmp_then_fail)
+
+        with self.assertRaises(ReimbursementGenerationError):
+            service.generate(self.alice, valid_payload(), [])
+
+        self.assertIsNotNone(sentinel)
+        self.assertEqual(sentinel.read_bytes(), b"external")
+        self.assertFalse(detached_work.exists())
+        with self.database.connect() as connection:
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM reimbursements").fetchone()[0], 0)
+
+    def test_cleanup_does_not_follow_replaced_users_root_to_external_directory(self):
+        record_uuid = UUID("11111111-1111-4111-8111-111111111111")
+        existing_id = "11111111-1111-4111-8111-111111111112"
+        existing_xlsx, _ = self._insert_record(
+            self.alice.user_id,
+            existing_id,
+            created_at="2026-09-07T00:00:00+00:00",
+        )
+        users_root = self.data_dir / "users"
+        detached_users = self.root / "detached-users"
+        external_users = self.root / "external-users-target"
+        external_record = external_users / str(self.alice.user_id) / str(record_uuid)
+        external_record.mkdir(parents=True)
+        sentinel = external_record / "DO-NOT-DELETE"
+        sentinel.write_bytes(b"external")
+
+        def replace_users_then_fail(_source, _destination, **_kwargs):
+            users_root.rename(detached_users)
+            users_root.symlink_to(external_users, target_is_directory=True)
+            raise OSError("forced move failure")
+
+        service = self._service_with(
+            uuid_factory=lambda: record_uuid,
+            move_directory=replace_users_then_fail,
+        )
+
+        with self.assertRaises(ReimbursementGenerationError):
+            service.generate(self.alice, valid_payload(), [])
+
+        self.assertEqual(sentinel.read_bytes(), b"external")
+        self.assertFalse((detached_users / str(self.alice.user_id) / str(record_uuid)).exists())
+        detached_existing = (
+            detached_users / str(self.alice.user_id) / existing_id / existing_xlsx.name
+        )
+        self.assertEqual(detached_existing.read_bytes(), b"xlsx-history")
+        with self.database.connect() as connection:
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM reimbursements").fetchone()[0], 1)
+
+    def test_cleanup_does_not_follow_replaced_owner_to_different_directory(self):
+        record_uuid = UUID("22222222-2222-4222-8222-222222222222")
+        owner_dir = self.data_dir / "users" / str(self.alice.user_id)
+        detached_owner = self.root / "detached-owner"
+        replacement_owner = self.root / "replacement-owner"
+        replacement_record = replacement_owner / str(record_uuid)
+        replacement_record.mkdir(parents=True)
+        sentinel = replacement_record / "DO-NOT-DELETE"
+        sentinel.write_bytes(b"external")
+
+        def replace_owner_then_fail(_source, _destination, **_kwargs):
+            owner_dir.rename(detached_owner)
+            replacement_owner.rename(owner_dir)
+            raise OSError("forced move failure")
+
+        service = self._service_with(
+            uuid_factory=lambda: record_uuid,
+            move_directory=replace_owner_then_fail,
+        )
+
+        with self.assertRaises(ReimbursementGenerationError):
+            service.generate(self.alice, valid_payload(), [])
+
+        moved_sentinel = owner_dir / str(record_uuid) / sentinel.name
+        self.assertEqual(moved_sentinel.read_bytes(), b"external")
+        self.assertFalse((detached_owner / str(record_uuid)).exists())
+        with self.database.connect() as connection:
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM reimbursements").fetchone()[0], 0)
+
+    def test_cleanup_keeps_replacement_swapped_after_root_is_opened(self):
+        record_uuid = UUID("22222222-2222-4222-8222-222222222223")
+        tmp_root = self.data_dir / "tmp"
+        replacement = self.root / "unowned-replacement"
+        replacement.mkdir()
+        sentinel_name = "DO-NOT-DELETE"
+        (replacement / sentinel_name).write_bytes(b"external")
+
+        def swap_cleanup(name, *, dir_fd, root_fd=None):
+            os.rename(
+                name,
+                "detached-request",
+                src_dir_fd=dir_fd,
+                dst_dir_fd=dir_fd,
+            )
+            replacement.rename(tmp_root / name)
+            if root_fd is None:
+                shutil.rmtree(name, dir_fd=dir_fd)
+
+        service = self._service_with(
+            uuid_factory=lambda: record_uuid,
+            pdf_exporter=mock.Mock(side_effect=RuntimeError("forced failure")),
+            remove_tree=swap_cleanup,
+        )
+
+        with self.assertRaises(ReimbursementGenerationError):
+            service.generate(self.alice, valid_payload(), [])
+
+        sentinels = list(tmp_root.rglob(sentinel_name))
+        self.assertEqual(len(sentinels), 1)
+        self.assertEqual(sentinels[0].read_bytes(), b"external")
+
+    def test_cleanup_does_not_unlink_leaf_replaced_after_identity_check(self):
+        record_uuid = UUID("22222222-2222-4222-8222-222222222225")
+        work_dir = self.data_dir / "tmp" / str(record_uuid)
+        replacement = self.root / "unowned-replacement.xlsx"
+        replacement.write_bytes(b"external")
+        replacement_metadata = replacement.stat()
+        armed = False
+        real_stat = os.stat
+
+        def arm_cleanup(_name, **_kwargs):
+            nonlocal armed
+            armed = True
+
+        def swap_after_stat(path, *args, **kwargs):
+            nonlocal armed
+            metadata = real_stat(path, *args, **kwargs)
+            if armed and path == "相同显示名.xlsx":
+                dir_fd = kwargs["dir_fd"]
+                os.rename(
+                    path,
+                    "detached-leaf.xlsx",
+                    src_dir_fd=dir_fd,
+                    dst_dir_fd=dir_fd,
+                )
+                replacement.rename(work_dir / path)
+                armed = False
+            return metadata
+
+        service = self._service_with(
+            uuid_factory=lambda: record_uuid,
+            pdf_exporter=mock.Mock(side_effect=RuntimeError("forced failure")),
+            remove_tree=arm_cleanup,
+        )
+
+        with mock.patch("reimbursements.os.stat", side_effect=swap_after_stat):
+            with self.assertRaises(ReimbursementGenerationError):
+                service.generate(self.alice, valid_payload(), [])
+
+        identities = [candidate.lstat() for candidate in self.data_dir.rglob("*")]
+        self.assertTrue(
+            replacement.exists()
+            or any(os.path.samestat(replacement_metadata, item) for item in identities)
+        )
+
+    def test_cleanup_does_not_rmdir_root_replaced_after_identity_check(self):
+        record_uuid = UUID("22222222-2222-4222-8222-222222222226")
+        work_dir = self.data_dir / "tmp" / str(record_uuid)
+        replacement = self.root / "unowned-empty-directory"
+        replacement.mkdir()
+        replacement_metadata = replacement.stat()
+        armed = False
+        real_stat = os.stat
+
+        def arm_cleanup(_name, **_kwargs):
+            nonlocal armed
+            armed = True
+
+        def swap_after_stat(path, *args, **kwargs):
+            nonlocal armed
+            metadata = real_stat(path, *args, **kwargs)
+            if armed and path == str(record_uuid):
+                work_dir.rename(self.root / "detached-request-after-stat")
+                replacement.rename(work_dir)
+                armed = False
+            return metadata
+
+        service = self._service_with(
+            uuid_factory=lambda: record_uuid,
+            pdf_exporter=mock.Mock(side_effect=RuntimeError("forced failure")),
+            remove_tree=arm_cleanup,
+        )
+
+        with mock.patch("reimbursements.os.stat", side_effect=swap_after_stat):
+            with self.assertRaises(ReimbursementGenerationError):
+                service.generate(self.alice, valid_payload(), [])
+
+        identities = [candidate.lstat() for candidate in self.data_dir.rglob("*")]
+        self.assertTrue(
+            replacement.exists()
+            or any(os.path.samestat(replacement_metadata, item) for item in identities)
+        )
+
     def test_partial_move_failure_removes_the_new_final_directory(self):
-        def move_then_fail(source, destination):
-            os.replace(source, destination)
+        def move_then_fail(source, destination, *, src_dir_fd, dst_dir_fd):
+            os.rename(
+                source.name,
+                destination.name,
+                src_dir_fd=src_dir_fd,
+                dst_dir_fd=dst_dir_fd,
+            )
             raise OSError("move result uncertain")
 
         service = self._service_with(move_directory=move_then_fail)
         with self.assertRaises(ReimbursementGenerationError):
             service.generate(self.alice, valid_payload(), [])
 
+        self._assert_no_history_or_artifacts()
+
+    def test_move_hook_cannot_swap_validated_workbook_to_external_hardlink(self):
+        external = self.root / "external-before-move.xlsx"
+        external.write_bytes(b"external-target")
+
+        def swap_then_move(source, destination, *, src_dir_fd, dst_dir_fd):
+            workbook = next(Path(source).rglob("*.xlsx"))
+            workbook.unlink()
+            workbook.hardlink_to(external)
+            os.rename(
+                source.name,
+                destination.name,
+                src_dir_fd=src_dir_fd,
+                dst_dir_fd=dst_dir_fd,
+            )
+
+        service = self._service_with(move_directory=swap_then_move)
+
+        with self.assertRaises(ReimbursementGenerationError):
+            service.generate(self.alice, valid_payload(), [])
+
+        self.assertEqual(external.read_bytes(), b"external-target")
+        self.assertEqual(external.stat().st_nlink, 1)
+        self._assert_no_history_or_artifacts()
+
+    def test_move_hook_cannot_swap_validated_pdf_to_external_hardlink(self):
+        external = self.root / "external-before-move.pdf"
+        external.write_bytes(b"external-target")
+
+        def swap_then_move(source, destination, *, src_dir_fd, dst_dir_fd):
+            pdf = next(Path(source).rglob("*.pdf"))
+            pdf.unlink()
+            pdf.hardlink_to(external)
+            os.rename(
+                source.name,
+                destination.name,
+                src_dir_fd=src_dir_fd,
+                dst_dir_fd=dst_dir_fd,
+            )
+
+        service = self._service_with(move_directory=swap_then_move)
+
+        with self.assertRaises(ReimbursementGenerationError):
+            service.generate(self.alice, valid_payload(), [])
+
+        self.assertEqual(external.read_bytes(), b"external-target")
+        self.assertEqual(external.stat().st_nlink, 1)
         self._assert_no_history_or_artifacts()
 
     def test_database_commit_then_error_compensates_row_before_removing_files(self):
@@ -650,7 +1064,7 @@ class ReimbursementServiceTest(unittest.TestCase):
         screenshot.write_bytes(b"caller")
         self.exporter.side_effect = RuntimeError("payload-name-token-private-path")
 
-        def cleanup_fails(_path):
+        def cleanup_fails(_name, **_kwargs):
             raise OSError("cleanup-private-path")
 
         service = self._service_with(
@@ -765,14 +1179,16 @@ class ReimbursementServiceTest(unittest.TestCase):
             deleted_at="2026-09-08T00:00:00+00:00",
         )
 
-        self.assertEqual(
-            self.service.owned_file(self.alice.user_id, active_id, "xlsx"),
-            active_xlsx,
-        )
-        self.assertEqual(
-            self.service.owned_file(self.alice.user_id, active_id, "pdf"),
-            active_pdf,
-        )
+        with self.service.owned_file(
+            self.alice.user_id, active_id, "xlsx"
+        ) as owned_xlsx:
+            self.assertEqual(owned_xlsx.stream.read(), active_xlsx.read_bytes())
+            self.assertEqual(owned_xlsx.display_name, active_xlsx.name)
+        with self.service.owned_file(
+            self.alice.user_id, active_id, "pdf"
+        ) as owned_pdf:
+            self.assertEqual(owned_pdf.stream.read(), active_pdf.read_bytes())
+            self.assertEqual(owned_pdf.display_name, active_pdf.name)
         for user_id, record_id, kind in (
             (self.bob.user_id, active_id, "xlsx"),
             (self.alice.user_id, active_id, "zip"),
@@ -781,12 +1197,10 @@ class ReimbursementServiceTest(unittest.TestCase):
             with self.subTest(user_id=user_id, record_id=record_id, kind=kind):
                 with self.assertRaisesRegex(ReimbursementNotFound, "^报销记录不存在$"):
                     self.service.owned_file(user_id, record_id, kind)
-        self.assertEqual(
-            self.service.owned_file(
-                self.alice.user_id, deleted_id, "xlsx", include_deleted=True
-            ),
-            deleted_xlsx,
-        )
+        with self.service.owned_file(
+            self.alice.user_id, deleted_id, "xlsx", include_deleted=True
+        ) as deleted_file:
+            self.assertEqual(deleted_file.stream.read(), deleted_xlsx.read_bytes())
 
     def test_owned_file_rejects_unsafe_missing_and_cross_record_paths(self):
         first_id = "40000000-0000-4000-8000-000000000001"
@@ -824,6 +1238,98 @@ class ReimbursementServiceTest(unittest.TestCase):
                 self.assertEqual(str(captured.exception), "报销记录不存在")
 
         self.assertEqual(external.read_bytes(), b"external")
+
+    def test_owned_file_rejects_external_hardlink(self):
+        record_id = "70000000-0000-4000-8000-000000000001"
+        xlsx, _ = self._insert_record(
+            self.alice.user_id, record_id, created_at="2026-09-08T00:00:00+00:00"
+        )
+        external = self.root / "external-owned-hardlink.xlsx"
+        external.write_bytes(b"external")
+        xlsx.unlink()
+        xlsx.hardlink_to(external)
+
+        with self.assertRaises(ReimbursementNotFound):
+            self.service.owned_file(self.alice.user_id, record_id, "xlsx")
+
+        self.assertEqual(external.read_bytes(), b"external")
+
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "FIFO is not supported")
+    def test_owned_file_rejects_fifo_without_blocking(self):
+        record_id = "70000000-0000-4000-8000-000000000004"
+        xlsx, _ = self._insert_record(
+            self.alice.user_id,
+            record_id,
+            created_at="2026-09-08T00:00:00+00:00",
+        )
+        xlsx.unlink()
+        os.mkfifo(xlsx, 0o600)
+        done = threading.Event()
+        errors = []
+
+        def read_owned_file():
+            try:
+                self.service.owned_file(self.alice.user_id, record_id, "xlsx")
+            except Exception as error:
+                errors.append(error)
+            finally:
+                done.set()
+
+        reader = threading.Thread(target=read_owned_file, daemon=True)
+        reader.start()
+        writer_fd = None
+        try:
+            completed_without_writer = done.wait(0.2)
+            if not completed_without_writer:
+                writer_fd = os.open(xlsx, os.O_WRONLY | os.O_NONBLOCK)
+            self.assertTrue(done.wait(1), "owned_file blocked while opening a FIFO")
+        finally:
+            if writer_fd is not None:
+                os.close(writer_fd)
+            reader.join(1)
+
+        self.assertTrue(completed_without_writer)
+        self.assertEqual(len(errors), 1)
+        self.assertIsInstance(errors[0], ReimbursementNotFound)
+
+    def test_owned_file_rejects_unsafe_pdf_display_name_from_database(self):
+        record_id = "70000000-0000-4000-8000-000000000003"
+        _, pdf = self._insert_record(
+            self.alice.user_id, record_id, created_at="2026-09-08T00:00:00+00:00"
+        )
+        unsafe_pdf = pdf.with_name("unsafe\r\nInjected.pdf")
+        pdf.rename(unsafe_pdf)
+        with self.database.transaction(immediate=True) as connection:
+            connection.execute(
+                "UPDATE reimbursements SET pdf_path = ? WHERE id = ?",
+                (unsafe_pdf.relative_to(self.data_dir.resolve()).as_posix(), record_id),
+            )
+
+        with self.assertRaises(ReimbursementNotFound):
+            with self.service.owned_file(self.alice.user_id, record_id, "pdf"):
+                pass
+
+    def test_owned_file_stream_remains_bound_after_path_replacement(self):
+        record_id = "70000000-0000-4000-8000-000000000002"
+        xlsx, _ = self._insert_record(
+            self.alice.user_id, record_id, created_at="2026-09-08T00:00:00+00:00"
+        )
+        original = xlsx.read_bytes()
+        saved = self.root / "saved-original.xlsx"
+
+        owned = self.service.owned_file(self.alice.user_id, record_id, "xlsx")
+        try:
+            xlsx.replace(saved)
+            xlsx.write_bytes(b"attacker-replacement")
+            self.assertEqual(owned.stream.read(), original)
+            self.assertEqual(owned.record.id, record_id)
+            self.assertEqual(owned.kind, "xlsx")
+            self.assertEqual(owned.display_name, "history.xlsx")
+            self.assertEqual(owned.size, len(original))
+        finally:
+            owned.close()
+
+        self.assertTrue(owned.stream.closed)
 
     def test_create_server_exposes_service_without_eager_soffice_discovery(self):
         config_path = self.root / "server-config.json"
@@ -879,14 +1385,14 @@ class ReimbursementServiceTest(unittest.TestCase):
 
         record = service.generate(self.alice, valid_payload(), [])
 
-        self.assertEqual(
-            service.owned_file(self.alice.user_id, record.id, "xlsx").read_bytes(),
-            b"xlsx",
-        )
-        self.assertEqual(
-            service.owned_file(self.alice.user_id, record.id, "pdf").read_bytes(),
-            b"pdf",
-        )
+        with service.owned_file(
+            self.alice.user_id, record.id, "xlsx"
+        ) as owned_xlsx:
+            self.assertEqual(owned_xlsx.stream.read(), b"xlsx")
+        with service.owned_file(
+            self.alice.user_id, record.id, "pdf"
+        ) as owned_pdf:
+            self.assertEqual(owned_pdf.stream.read(), b"pdf")
         self.assertIn("/nested/nested.xlsx", record.xlsx_path)
         self.assertIn("/nested/nested.pdf", record.pdf_path)
 
@@ -948,10 +1454,118 @@ class ReimbursementServiceTest(unittest.TestCase):
         )
 
         service.list_active(self.alice.user_id)
-        service.owned_file(self.alice.user_id, record_id, "xlsx")
+        with service.owned_file(self.alice.user_id, record_id, "xlsx"):
+            pass
 
         self.assertEqual(len(observed), 2)
         self.assertTrue(all(connection.closed for connection in observed))
+
+    def test_generation_closes_all_opened_file_descriptors_on_success_and_failure(self):
+        real_open = os.open
+
+        for exporter_fails in (False, True):
+            opened = []
+
+            def tracking_open(*args, **kwargs):
+                descriptor = real_open(*args, **kwargs)
+                opened.append(descriptor)
+                return descriptor
+
+            exporter = self.exporter
+            if exporter_fails:
+                exporter = mock.Mock(side_effect=RuntimeError("forced failure"))
+            service = self._service_with(pdf_exporter=exporter)
+            with self.subTest(exporter_fails=exporter_fails), mock.patch(
+                "reimbursements.os.open", side_effect=tracking_open
+            ):
+                if exporter_fails:
+                    with self.assertRaises(ReimbursementGenerationError):
+                        service.generate(self.alice, valid_payload(), [])
+                else:
+                    service.generate(self.alice, valid_payload(), [])
+
+            self.assertTrue(opened)
+            for descriptor in opened:
+                with self.assertRaises(OSError):
+                    os.fstat(descriptor)
+
+    def test_isolate_entry_closes_quarantine_fd_when_post_rename_stat_fails(self):
+        parent = self.root / "cleanup-parent"
+        parent.mkdir()
+        owned = parent / "owned.xlsx"
+        owned.write_bytes(b"owned")
+        metadata = owned.stat()
+        parent_fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY)
+        real_create = ReimbursementService._create_quarantine_directory
+        real_stat = os.stat
+        opened = []
+
+        def tracking_create(directory_fd):
+            name, descriptor = real_create(directory_fd)
+            opened.append(descriptor)
+            return name, descriptor
+
+        def fail_isolated_stat(path, *args, **kwargs):
+            if path == "entry":
+                raise OSError("forced isolated stat failure")
+            return real_stat(path, *args, **kwargs)
+
+        try:
+            with mock.patch.object(
+                ReimbursementService,
+                "_create_quarantine_directory",
+                side_effect=tracking_create,
+            ), mock.patch("reimbursements.os.stat", side_effect=fail_isolated_stat):
+                with self.assertRaises(OSError):
+                    ReimbursementService._isolate_entry(
+                        parent_fd,
+                        owned.name,
+                        metadata,
+                    )
+        finally:
+            os.close(parent_fd)
+
+        self.assertEqual(len(opened), 1)
+        with self.assertRaises(OSError):
+            os.fstat(opened[0])
+        retained = list(parent.rglob("entry"))
+        self.assertEqual(len(retained), 1)
+        self.assertEqual(retained[0].read_bytes(), b"owned")
+
+    def test_create_quarantine_closes_fd_when_identity_fstat_fails(self):
+        parent = self.root / "cleanup-parent"
+        parent.mkdir()
+        parent_fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY)
+        real_open = os.open
+        real_fstat = os.fstat
+        opened = []
+        fstat_calls = {}
+
+        def tracking_open(path, *args, **kwargs):
+            descriptor = real_open(path, *args, **kwargs)
+            if isinstance(path, str) and path.startswith(".reimbursement-cleanup-"):
+                opened.append(descriptor)
+            return descriptor
+
+        def fail_second_fstat(descriptor):
+            count = fstat_calls.get(descriptor, 0) + 1
+            fstat_calls[descriptor] = count
+            if descriptor in opened and count == 2:
+                raise OSError("forced quarantine identity failure")
+            return real_fstat(descriptor)
+
+        try:
+            with mock.patch(
+                "reimbursements.os.open", side_effect=tracking_open
+            ), mock.patch("reimbursements.os.fstat", side_effect=fail_second_fstat):
+                with self.assertRaises(OSError):
+                    ReimbursementService._create_quarantine_directory(parent_fd)
+        finally:
+            os.close(parent_fd)
+
+        self.assertEqual(len(opened), 1)
+        with self.assertRaises(OSError):
+            os.fstat(opened[0])
 
     def test_uuid_factory_must_return_version_four_before_path_creation(self):
         invalid_values = (

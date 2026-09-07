@@ -14,6 +14,16 @@ Task 7 atomic per-user generation follow-up is in progress under strict TDD; Tas
 - [x] Run focused, real LibreOffice end-to-end, full-suite, compile, and diff checks
 - [x] Self-review the scoped follow-up without FIFO queueing or marking Task 7 complete
 
+## Task 7 Formal Quality Review Follow-up
+- [x] RED: reproduce cleanup TOCTOU after visible `tmp`, `users`, and owner path replacement without losing external sentinels
+- [x] GREEN: anchor generation, move, and recursive cleanup to verified directory file descriptors and close every descriptor
+- [x] RED: reproduce generator hardlinks, validation-to-move inode swaps, owned-file hardlinks, and post-validation read races
+- [x] GREEN: bind generated outputs and owner downloads to `O_NOFOLLOW` file descriptors with single-link and inode checks
+- [x] RED: reproduce rejection of valid 50/100-character Chinese profile names after expensive generation
+- [x] GREEN: compute a bounded safe output stem before generation while preserving complete workbook profile values
+- [x] RED/GREEN: isolate every cleanup candidate before final unlink/rmdir and reject artifact FIFOs without blocking
+- [x] Update the Task 7 owned-file plan contract, run all required verification, review, and commit; keep Task 7 in progress
+
 ## Design Checklist
 - [x] Explore current project location and existing architecture
 - [x] Confirm whether to preserve the old version and build in this directory
@@ -51,3 +61,8 @@ Task 7 atomic per-user generation follow-up is in progress under strict TDD; Tas
 | Sandboxed `git add` could not create `.git/index.lock` | 1 | Keep the working tree unchanged and rerun the exact staging command outside the sandbox with approval |
 | First follow-up full-suite handoff omitted the final count and exit status | 1 | Re-ran in a persistent terminal session and captured 226 tests, `OK`, and exit status 0 |
 | Follow-up syntax command referenced nonexistent `auth.py` | 1 | Enumerated the repository modules and reran `py_compile` against the actual root Python files |
+| Formal follow-up plan patch used the wrong Task 8 test filename context | 1 | Confirmed the patch was atomic, re-read the exact plan section, and applied smaller file-specific changes |
+| Long-name service test omitted `load_workbook` import | 1 | Added the test dependency and reran the same three-test RED/GREEN set |
+| Long-name E2E retained the old `张三` PDF assertion | 1 | Changed the assertion to the complete 100-character traveler and reran the real LibreOffice test |
+| Generated-FIFO test patch used an outdated adjacent assertion | 1 | Re-read the current test section and reapplied with the exact local context |
+| Sandboxed full suite could not bind loopback sockets (`PermissionError`) | 1 | Re-run the same 244-test command with the required local-network sandbox permission |

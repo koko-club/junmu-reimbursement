@@ -137,6 +137,13 @@ class ValidationTest(unittest.TestCase):
             safe_output_stem("2026-09-04", "张三"),
         )
 
+    def test_long_unicode_stem_is_utf8_bounded_and_keeps_form_suffix(self):
+        stem = safe_output_stem("2026-09-04", "张" * 100)
+
+        self.assertLessEqual(len(stem.encode("utf-8")), 150)
+        self.assertTrue(stem.endswith("-差旅报销单"))
+        self.assertEqual(stem.encode("utf-8").decode("utf-8"), stem)
+
 
 if __name__ == "__main__":
     unittest.main()

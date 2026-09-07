@@ -19,6 +19,8 @@ _DETAIL_NUMERIC = (
 )
 _DETAIL_TEXT = ("date", "origin", "destination", "transport")
 _UNSET = object()
+MAX_OUTPUT_STEM_UTF8_BYTES = 150
+_OUTPUT_STEM_SUFFIX = "-差旅报销单"
 
 
 def _text(value: Any, field: str, required: bool = False) -> str:
@@ -128,4 +130,19 @@ def safe_output_stem(date_text: str, traveler: str) -> str:
         value = value.lstrip(".")
         return value or fallback
 
-    return f"{clean(date_text, '未知日期')}-{clean(traveler, '未命名')}-差旅报销单"
+    prefix = f"{clean(date_text, '未知日期')}-{clean(traveler, '未命名')}"
+    available_bytes = MAX_OUTPUT_STEM_UTF8_BYTES - len(
+        _OUTPUT_STEM_SUFFIX.encode("utf-8")
+    )
+    bounded_prefix: list[str] = []
+    used_bytes = 0
+    for character in prefix:
+        try:
+            encoded = character.encode("utf-8")
+        except UnicodeEncodeError:
+            continue
+        if used_bytes + len(encoded) > available_bytes:
+            break
+        bounded_prefix.append(character)
+        used_bytes += len(encoded)
+    return "".join(bounded_prefix).rstrip() + _OUTPUT_STEM_SUFFIX

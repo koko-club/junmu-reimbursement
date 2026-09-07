@@ -78,6 +78,8 @@ class EndToEndTest(unittest.TestCase):
             make_png(first_image, "route 1", (34, 105, 170))
             make_png(second_image, "route 2", (42, 135, 80))
             payload = complete_payload()
+            long_traveler = "张" * 100
+            payload["traveler"] = long_traveler
 
             first = generate_workbook(
                 TEMPLATE,
@@ -100,7 +102,7 @@ class EndToEndTest(unittest.TestCase):
                 self.assertEqual(ws.max_row, 62)
                 self.assertEqual(ws["A3"].value, "报销日期：2026/09/04")
                 self.assertEqual(ws["B4"].value, "技术部")
-                self.assertEqual(ws["B5"].value, "张三")
+                self.assertEqual(ws["B5"].value, long_traveler)
                 self.assertEqual(ws["E5"].value, "客户拜访")
                 self.assertEqual(ws["J7"].value, 2)
                 self.assertEqual(ws["K7"].value, "=J7*77.5")
@@ -157,7 +159,7 @@ class EndToEndTest(unittest.TestCase):
                     first_text = reader.pages[0].extract_text() or ""
                     self.assertIn("差旅费用报销单", first_text)
                     self.assertIn("2026/09/04", first_text)
-                    self.assertIn("张三", first_text)
+                    self.assertIn(long_traveler, first_text)
                     self.assertNotIn("Err:502", first_text)
                     self.assertIn("伍佰陆拾柒元伍角", first_text)
                     appendix_one_text = reader.pages[1].extract_text() or ""

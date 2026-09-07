@@ -181,6 +181,25 @@ class GeneratorTest(unittest.TestCase):
             self.assertTrue(first["path"].exists())
             self.assertTrue(second["path"].exists())
 
+    def test_long_unicode_traveler_keeps_full_cell_and_bounded_filename(self):
+        for length in (50, 100):
+            traveler = "张" * length
+            with self.subTest(length=length), tempfile.TemporaryDirectory() as tmp:
+                test_payload = payload()
+                test_payload["traveler"] = traveler
+
+                result = generate_workbook(
+                    TEMPLATE, Path(tmp), test_payload, image_paths=[]
+                )
+
+                self.assertLessEqual(len(result.path.stem.encode("utf-8")), 150)
+                self.assertTrue(result.path.stem.endswith("-差旅报销单"))
+                workbook = load_workbook(result.path, data_only=False)
+                try:
+                    self.assertEqual(workbook["差旅报销单"]["B5"].value, traveler)
+                finally:
+                    workbook.close()
+
     def test_concurrent_generations_reserve_distinct_output_names(self):
         with tempfile.TemporaryDirectory() as tmp:
             output_dir = Path(tmp)

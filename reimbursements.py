@@ -8,10 +8,9 @@ from datetime import datetime, timezone
 import logging
 import os
 from pathlib import Path
-import shutil
 import stat
 import threading
-from typing import Callable
+from typing import BinaryIO, Callable
 from uuid import UUID, uuid4
 
 from config import AppConfig
@@ -19,12 +18,22 @@ from database import Database
 from generator import generate_workbook
 from office import export_pdf, find_soffice
 from sessions import AuthenticatedUser
-from validation import validate_image_filename, validate_payload
+from validation import safe_output_stem, validate_image_filename, validate_payload
 
 
 _LOGGER = logging.getLogger(__name__)
 _PUBLIC_GENERATION_ERROR = "生成报销文件失败，请稍后重试"
 _MAX_DISPLAY_NAME_UTF8_BYTES = 180
+_CLEANUP_ENTRY_NAME = "entry"
+_DIRECTORY_OPEN_FLAGS = (
+    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+)
+_FILE_OPEN_FLAGS = (
+    os.O_RDONLY
+    | os.O_NOFOLLOW
+    | getattr(os, "O_CLOEXEC", 0)
+    | getattr(os, "O_NONBLOCK", 0)
+)
 
 
 class ReimbursementGenerationError(RuntimeError):
@@ -54,6 +63,24 @@ class ReimbursementRecord:
     deleted_at: str | None
 
 
+@dataclass
+class OwnedReimbursementFile:
+    record: ReimbursementRecord
+    kind: str
+    display_name: str
+    size: int
+    stream: BinaryIO
+
+    def close(self) -> None:
+        self.stream.close()
+
+    def __enter__(self) -> "OwnedReimbursementFile":
+        return self
+
+    def __exit__(self, _exc_type, _exc, _traceback) -> None:
+        self.close()
+
+
 class ReimbursementService:
     """Generate private artifacts before atomically recording their owner."""
 
@@ -67,8 +94,8 @@ class ReimbursementService:
         soffice_finder: Callable[[str], Path] = find_soffice,
         uuid_factory: Callable = uuid4,
         clock: Callable[[], datetime] | None = None,
-        move_directory: Callable[[Path, Path], None] = os.replace,
-        remove_tree: Callable[[Path], None] | None = None,
+        move_directory: Callable | None = None,
+        remove_tree: Callable | None = None,
     ):
         self._database = database
         self._config = config
@@ -77,8 +104,8 @@ class ReimbursementService:
         self._soffice_finder = soffice_finder
         self._uuid_factory = uuid_factory
         self._clock = clock or (lambda: datetime.now(timezone.utc))
-        self._move_directory = move_directory
-        self._remove_tree = remove_tree or shutil.rmtree
+        self._move_directory = move_directory or self._rename_directory
+        self._remove_tree = remove_tree
         self._generation_slots = threading.BoundedSemaphore(
             config.max_concurrent_generations
         )
@@ -92,8 +119,11 @@ class ReimbursementService:
         record_id = "unassigned"
         work_dir: Path | None = None
         final_dir: Path | None = None
-        work_created = False
-        final_claimed = False
+        open_fds: list[int] = []
+        tmp_fd: int | None = None
+        owner_fd: int | None = None
+        work_identity: tuple[int, int] | None = None
+        final_claim_identity: tuple[int, int] | None = None
         moved = False
         try:
             record_uuid = self._uuid_factory()
@@ -106,12 +136,21 @@ class ReimbursementService:
                 traveler=user.real_name,
                 department=user.department,
             )
+            output_stem = safe_output_stem(payload["date"], payload["traveler"])
+            self._validated_display_name(f"{output_stem}.xlsx")
+            payload["output_stem"] = output_stem
             image_paths = self._validated_screenshots(screenshots)
             data_dir = Path(self._config.data_dir).resolve()
-            tmp_root = self._controlled_directory(data_dir / "tmp", data_dir)
-            work_dir = tmp_root / record_id
-            work_dir.mkdir(mode=0o700, exist_ok=False)
-            work_created = True
+            data_fd = self._open_data_root(data_dir)
+            open_fds.append(data_fd)
+            tmp_fd = self._open_or_create_directory(data_fd, "tmp")
+            open_fds.append(tmp_fd)
+            work_fd = self._open_or_create_directory(
+                tmp_fd, record_id, exist_ok=False
+            )
+            open_fds.append(work_fd)
+            work_identity = self._directory_identity(os.fstat(work_fd))
+            work_dir = data_dir / "tmp" / record_id
 
             with self._generation_slots:
                 generation_result = self._generator(
@@ -120,10 +159,18 @@ class ReimbursementService:
                     payload,
                     image_paths,
                 )
-                generated_xlsx_path = self._validated_output(
-                    getattr(generation_result, "path", None), work_dir, ".xlsx"
+                (
+                    generated_xlsx_path,
+                    xlsx_work_relative,
+                    xlsx_fd,
+                    generated_xlsx_metadata,
+                ) = self._open_validated_output(
+                    getattr(generation_result, "path", None),
+                    work_dir,
+                    work_fd,
+                    ".xlsx",
                 )
-                generated_xlsx_metadata = generated_xlsx_path.lstat()
+                open_fds.append(xlsx_fd)
                 configured_soffice = str(self._config.soffice_path or "").strip()
                 soffice_path = (
                     Path(configured_soffice)
@@ -133,30 +180,83 @@ class ReimbursementService:
                 pdf_result = self._pdf_exporter(
                     generated_xlsx_path, work_dir, soffice_path
                 )
-                xlsx_path = self._validated_output(
-                    generated_xlsx_path, work_dir, ".xlsx"
+                self._verify_output_identity(
+                    work_fd,
+                    xlsx_work_relative,
+                    generated_xlsx_metadata,
+                    xlsx_fd,
                 )
-                if not os.path.samestat(generated_xlsx_metadata, xlsx_path.lstat()):
-                    raise ValueError("generated workbook was replaced")
-                pdf_path = self._validated_output(pdf_result, work_dir, ".pdf")
-                if xlsx_path.samefile(pdf_path):
+                (
+                    pdf_path,
+                    pdf_work_relative,
+                    pdf_fd,
+                    pdf_metadata,
+                ) = self._open_validated_output(
+                    pdf_result,
+                    work_dir,
+                    work_fd,
+                    ".pdf",
+                )
+                open_fds.append(pdf_fd)
+                if os.path.samestat(generated_xlsx_metadata, pdf_metadata):
                     raise ValueError("generated outputs must be different files")
-                xlsx_work_relative = xlsx_path.relative_to(work_dir)
-                pdf_work_relative = pdf_path.relative_to(work_dir)
-                display_name = self._validated_display_name(xlsx_path.name)
+                display_name = self._validated_display_name(
+                    generated_xlsx_path.name
+                )
+                self._validated_artifact_name(pdf_path.name, ".pdf")
 
-            owner_root = self._controlled_directory(data_dir / "users", data_dir)
-            owner_dir = self._controlled_directory(
-                owner_root / str(user.user_id), owner_root
+            users_fd = self._open_or_create_directory(data_fd, "users")
+            open_fds.append(users_fd)
+            owner_fd = self._open_or_create_directory(
+                users_fd, str(user.user_id)
             )
+            open_fds.append(owner_fd)
+            owner_dir = data_dir / "users" / str(user.user_id)
             final_dir = owner_dir / record_id
-            final_dir.mkdir(mode=0o700, exist_ok=False)
-            final_claimed = True
-            self._move_directory(work_dir, final_dir)
+            final_claim_fd = self._open_or_create_directory(
+                owner_fd, record_id, exist_ok=False
+            )
+            open_fds.append(final_claim_fd)
+            final_claim_identity = self._directory_identity(os.fstat(final_claim_fd))
+            self._verify_output_identity(
+                work_fd,
+                xlsx_work_relative,
+                generated_xlsx_metadata,
+                xlsx_fd,
+            )
+            self._verify_output_identity(
+                work_fd,
+                pdf_work_relative,
+                pdf_metadata,
+                pdf_fd,
+            )
+            self._move_directory(
+                work_dir,
+                final_dir,
+                src_dir_fd=tmp_fd,
+                dst_dir_fd=owner_fd,
+            )
             moved = True
+            final_fd = self._open_directory(owner_fd, record_id)
+            open_fds.append(final_fd)
+            if self._directory_identity(os.fstat(final_fd)) != work_identity:
+                raise ValueError("moved record directory identity changed")
+            self._verify_output_identity(
+                final_fd,
+                xlsx_work_relative,
+                generated_xlsx_metadata,
+                xlsx_fd,
+            )
+            self._verify_output_identity(
+                final_fd,
+                pdf_work_relative,
+                pdf_metadata,
+                pdf_fd,
+            )
 
-            xlsx_relative = (final_dir / xlsx_work_relative).relative_to(data_dir).as_posix()
-            pdf_relative = (final_dir / pdf_work_relative).relative_to(data_dir).as_posix()
+            record_relative = Path("users") / str(user.user_id) / record_id
+            xlsx_relative = (record_relative / xlsx_work_relative).as_posix()
+            pdf_relative = (record_relative / pdf_work_relative).as_posix()
             created_at = self._utc_now().isoformat()
             record = ReimbursementRecord(
                 id=record_id,
@@ -184,13 +284,26 @@ class ReimbursementService:
             database_allows_file_cleanup = True
             if moved and isinstance(error, _InsertError) and error.may_have_committed:
                 database_allows_file_cleanup = self._compensate_insert(record)
-            if moved and final_dir is not None and database_allows_file_cleanup:
-                self._cleanup(final_dir, record_id)
-            elif not moved and work_created and work_dir is not None:
-                self._cleanup(work_dir, record_id)
-            if not moved and final_claimed and final_dir is not None:
-                self._cleanup(final_dir, record_id)
+            if not moved and tmp_fd is not None and work_identity is not None:
+                self._cleanup_at(tmp_fd, record_id, {work_identity}, record_id)
+            if owner_fd is not None and final_claim_identity is not None:
+                owned_final_identities = {final_claim_identity}
+                if work_identity is not None:
+                    owned_final_identities.add(work_identity)
+                if not moved or database_allows_file_cleanup:
+                    self._cleanup_at(
+                        owner_fd,
+                        record_id,
+                        owned_final_identities,
+                        record_id,
+                    )
             raise ReimbursementGenerationError(_PUBLIC_GENERATION_ERROR) from None
+        finally:
+            for descriptor in reversed(open_fds):
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
 
     def list_active(self, user_id: int) -> list[ReimbursementRecord]:
         return self._list(user_id, deleted=False)
@@ -204,7 +317,9 @@ class ReimbursementService:
         record_id: str,
         kind: str,
         include_deleted: bool = False,
-    ) -> Path:
+    ) -> OwnedReimbursementFile:
+        open_fds: list[int] = []
+        file_fd: int | None = None
         try:
             self._require_owner_id(user_id)
             if (
@@ -226,6 +341,7 @@ class ReimbursementService:
                 ).fetchone()
             if row is None:
                 raise ValueError("history not found")
+            record = self._record_from_row(row)
 
             stored_value = row[f"{kind}_path"]
             if not isinstance(stored_value, str) or not stored_value:
@@ -238,32 +354,52 @@ class ReimbursementService:
             ):
                 raise ValueError("invalid stored path")
 
-            data_dir = Path(self._config.data_dir).resolve()
-            record_root = data_dir / "users" / str(user_id) / record_id
-            for directory in (
-                data_dir / "users",
-                data_dir / "users" / str(user_id),
-                record_root,
-            ):
-                metadata = directory.lstat()
-                if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
-                    raise ValueError("record directory is not controlled")
-            candidate = data_dir / stored_path
-            relative = candidate.relative_to(record_root)
-            if not relative.parts:
+            expected_prefix = ("users", str(user_id), record_id)
+            if stored_path.parts[:3] != expected_prefix:
+                raise ValueError("stored path is outside record directory")
+            relative_parts = stored_path.parts[3:]
+            if not relative_parts:
                 raise ValueError("invalid stored path")
-            current = record_root
-            for part in relative.parts:
-                current = current / part
-                metadata = current.lstat()
-                if stat.S_ISLNK(metadata.st_mode):
-                    raise ValueError("stored path must not use symlinks")
-            if not stat.S_ISREG(metadata.st_mode):
-                raise ValueError("stored path must be a regular file")
-            candidate.resolve().relative_to(record_root.resolve())
-            return candidate
+            self._validated_artifact_name(relative_parts[-1], f".{kind}")
+            data_fd = os.open(Path(self._config.data_dir).resolve(), _DIRECTORY_OPEN_FLAGS)
+            open_fds.append(data_fd)
+            current_fd = data_fd
+            for component in expected_prefix:
+                current_fd = self._open_directory(current_fd, component)
+                open_fds.append(current_fd)
+            for component in relative_parts[:-1]:
+                current_fd = self._open_directory(current_fd, component)
+                open_fds.append(current_fd)
+            file_fd = os.open(
+                relative_parts[-1],
+                _FILE_OPEN_FLAGS,
+                dir_fd=current_fd,
+            )
+            metadata = os.fstat(file_fd)
+            if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+                raise ValueError("stored path must be a private regular file")
+            stream = os.fdopen(file_fd, "rb")
+            file_fd = None
+            return OwnedReimbursementFile(
+                record=record,
+                kind=kind,
+                display_name=relative_parts[-1],
+                size=metadata.st_size,
+                stream=stream,
+            )
         except Exception:
             raise ReimbursementNotFound("报销记录不存在") from None
+        finally:
+            if file_fd is not None:
+                try:
+                    os.close(file_fd)
+                except OSError:
+                    pass
+            for descriptor in reversed(open_fds):
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
 
     def _list(self, user_id: int, *, deleted: bool) -> list[ReimbursementRecord]:
         self._require_owner_id(user_id)
@@ -321,8 +457,14 @@ class ReimbursementService:
             result.append(path)
         return result
 
-    @staticmethod
-    def _validated_output(value: object, work_dir: Path, extension: str) -> Path:
+    @classmethod
+    def _open_validated_output(
+        cls,
+        value: object,
+        work_dir: Path,
+        work_fd: int,
+        extension: str,
+    ) -> tuple[Path, Path, int, os.stat_result]:
         if not isinstance(value, (str, os.PathLike)):
             raise ValueError("generated output path required")
         path = Path(value)
@@ -334,60 +476,148 @@ class ReimbursementService:
             raise ValueError("generated output is outside request directory") from error
         if not relative.parts:
             raise ValueError("generated output path required")
-        current = work_dir
-        for part in relative.parts:
-            current = current / part
-            metadata = current.lstat()
-            if stat.S_ISLNK(metadata.st_mode):
-                raise ValueError("generated output must not use symlinks")
-        if not stat.S_ISREG(metadata.st_mode):
-            raise ValueError("generated output must be a regular file")
+        opened_directories: list[int] = []
+        current_fd = work_fd
         try:
-            path.resolve().relative_to(work_dir.resolve())
-        except ValueError as error:
-            raise ValueError("generated output is outside request directory") from error
-        return path
+            for component in relative.parts[:-1]:
+                current_fd = cls._open_directory(current_fd, component)
+                opened_directories.append(current_fd)
+            descriptor = os.open(
+                relative.parts[-1],
+                _FILE_OPEN_FLAGS,
+                dir_fd=current_fd,
+            )
+            try:
+                metadata = os.fstat(descriptor)
+                if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+                    raise ValueError("generated output must be a private regular file")
+                return path, relative, descriptor, metadata
+            except Exception:
+                os.close(descriptor)
+                raise
+        finally:
+            for descriptor in reversed(opened_directories):
+                os.close(descriptor)
+
+    @classmethod
+    def _verify_output_identity(
+        cls,
+        record_fd: int,
+        relative: Path,
+        expected_metadata: os.stat_result,
+        bound_fd: int,
+    ) -> None:
+        bound_metadata = os.fstat(bound_fd)
+        if (
+            bound_metadata.st_nlink != 1
+            or not os.path.samestat(expected_metadata, bound_metadata)
+        ):
+            raise ValueError("generated output identity changed")
+        opened_directories: list[int] = []
+        current_fd = record_fd
+        candidate_fd: int | None = None
+        try:
+            for component in relative.parts[:-1]:
+                current_fd = cls._open_directory(current_fd, component)
+                opened_directories.append(current_fd)
+            candidate_fd = os.open(
+                relative.parts[-1],
+                _FILE_OPEN_FLAGS,
+                dir_fd=current_fd,
+            )
+            candidate_metadata = os.fstat(candidate_fd)
+            if (
+                not stat.S_ISREG(candidate_metadata.st_mode)
+                or candidate_metadata.st_nlink != 1
+                or not os.path.samestat(expected_metadata, candidate_metadata)
+            ):
+                raise ValueError("generated output identity changed")
+        finally:
+            if candidate_fd is not None:
+                os.close(candidate_fd)
+            for descriptor in reversed(opened_directories):
+                os.close(descriptor)
 
     @staticmethod
     def _validated_display_name(value: object) -> str:
         """Return a metadata-safe XLSX name capped at 180 UTF-8 bytes."""
+        return ReimbursementService._validated_artifact_name(value, ".xlsx")
+
+    @staticmethod
+    def _validated_artifact_name(value: object, extension: str) -> str:
         if (
             not isinstance(value, str)
             or value in {"", ".", ".."}
             or "/" in value
             or "\\" in value
-            or Path(value).suffix.lower() != ".xlsx"
+            or Path(value).suffix.lower() != extension
             or any(ord(character) < 32 or ord(character) == 127 for character in value)
         ):
-            raise ValueError("invalid display name")
+            raise ValueError("invalid artifact name")
         try:
             encoded = value.encode("utf-8")
         except UnicodeEncodeError:
-            raise ValueError("invalid display name") from None
+            raise ValueError("invalid artifact name") from None
         if len(encoded) > _MAX_DISPLAY_NAME_UTF8_BYTES:
-            raise ValueError("invalid display name")
+            raise ValueError("invalid artifact name")
         return value
 
     @staticmethod
-    def _path_exists(path: Path) -> bool:
+    def _directory_identity(metadata: os.stat_result) -> tuple[int, int]:
+        return metadata.st_dev, metadata.st_ino
+
+    @staticmethod
+    def _open_data_root(path: Path) -> int:
+        path.mkdir(parents=True, exist_ok=True, mode=0o700)
+        descriptor = os.open(path, _DIRECTORY_OPEN_FLAGS)
         try:
-            path.lstat()
-        except FileNotFoundError:
-            return False
-        return True
+            if not stat.S_ISDIR(os.fstat(descriptor).st_mode):
+                raise ValueError("data root must be a directory")
+            return descriptor
+        except Exception:
+            os.close(descriptor)
+            raise
+
+    @staticmethod
+    def _open_directory(parent_fd: int, name: str) -> int:
+        descriptor = os.open(name, _DIRECTORY_OPEN_FLAGS, dir_fd=parent_fd)
+        try:
+            if not stat.S_ISDIR(os.fstat(descriptor).st_mode):
+                raise ValueError("storage component must be a directory")
+            return descriptor
+        except Exception:
+            os.close(descriptor)
+            raise
 
     @classmethod
-    def _controlled_directory(cls, path: Path, parent: Path) -> Path:
-        path.mkdir(parents=True, exist_ok=True, mode=0o700)
-        metadata = path.lstat()
-        if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
-            raise ValueError("storage directory is not controlled")
-        resolved = path.resolve()
+    def _open_or_create_directory(
+        cls,
+        parent_fd: int,
+        name: str,
+        *,
+        exist_ok: bool = True,
+    ) -> int:
         try:
-            resolved.relative_to(parent.resolve())
-        except ValueError as error:
-            raise ValueError("storage directory is outside data directory") from error
-        return path
+            os.mkdir(name, mode=0o700, dir_fd=parent_fd)
+        except FileExistsError:
+            if not exist_ok:
+                raise
+        return cls._open_directory(parent_fd, name)
+
+    @staticmethod
+    def _rename_directory(
+        source: Path,
+        destination: Path,
+        *,
+        src_dir_fd: int,
+        dst_dir_fd: int,
+    ) -> None:
+        os.rename(
+            source.name,
+            destination.name,
+            src_dir_fd=src_dir_fd,
+            dst_dir_fd=dst_dir_fd,
+        )
 
     def _utc_now(self) -> datetime:
         value = self._clock()
@@ -460,15 +690,150 @@ class ReimbursementService:
             record.deleted_at,
         )
 
-    def _cleanup(self, path: Path, record_id: str) -> None:
+    def _cleanup_at(
+        self,
+        parent_fd: int,
+        name: str,
+        expected_identities: set[tuple[int, int]],
+        record_id: str,
+    ) -> None:
+        root_fd: int | None = None
+        quarantine_fd: int | None = None
         try:
-            if path.is_symlink():
-                path.unlink()
-            elif self._path_exists(path):
-                self._remove_tree(path)
+            root_fd = self._open_directory(parent_fd, name)
+            root_metadata = os.fstat(root_fd)
+            if self._directory_identity(root_metadata) not in expected_identities:
+                return
+            if self._remove_tree is not None:
+                self._remove_tree(name, dir_fd=parent_fd, root_fd=root_fd)
+            quarantine_name, quarantine_fd, matches = self._isolate_entry(
+                parent_fd,
+                name,
+                root_metadata,
+            )
+            if not matches:
+                return
+            self._remove_directory_contents(root_fd)
+            os.rmdir(_CLEANUP_ENTRY_NAME, dir_fd=quarantine_fd)
+            os.close(quarantine_fd)
+            quarantine_fd = None
+            os.rmdir(quarantine_name, dir_fd=parent_fd)
+        except FileNotFoundError:
+            return
         except Exception as cleanup_error:
             _LOGGER.error(
                 "reimbursement cleanup failed record_id=%s exception=%s",
                 record_id,
                 type(cleanup_error).__name__,
             )
+        finally:
+            if quarantine_fd is not None:
+                os.close(quarantine_fd)
+            if root_fd is not None:
+                os.close(root_fd)
+
+    @classmethod
+    def _remove_directory_contents(cls, directory_fd: int) -> None:
+        for name in os.listdir(directory_fd):
+            child_fd: int | None = None
+            quarantine_fd: int | None = None
+            try:
+                metadata = os.stat(
+                    name,
+                    dir_fd=directory_fd,
+                    follow_symlinks=False,
+                )
+                if not stat.S_ISDIR(metadata.st_mode):
+                    quarantine_name, quarantine_fd, matches = cls._isolate_entry(
+                        directory_fd,
+                        name,
+                        metadata,
+                    )
+                    if not matches:
+                        continue
+                    os.unlink(_CLEANUP_ENTRY_NAME, dir_fd=quarantine_fd)
+                    os.close(quarantine_fd)
+                    quarantine_fd = None
+                    os.rmdir(quarantine_name, dir_fd=directory_fd)
+                    continue
+
+                child_fd = cls._open_directory(directory_fd, name)
+                child_metadata = os.fstat(child_fd)
+                if not os.path.samestat(metadata, child_metadata):
+                    continue
+                quarantine_name, quarantine_fd, matches = cls._isolate_entry(
+                    directory_fd,
+                    name,
+                    child_metadata,
+                )
+                if not matches:
+                    continue
+                cls._remove_directory_contents(child_fd)
+                os.rmdir(_CLEANUP_ENTRY_NAME, dir_fd=quarantine_fd)
+                os.close(quarantine_fd)
+                quarantine_fd = None
+                os.rmdir(quarantine_name, dir_fd=directory_fd)
+            except FileNotFoundError:
+                continue
+            finally:
+                if quarantine_fd is not None:
+                    os.close(quarantine_fd)
+                if child_fd is not None:
+                    os.close(child_fd)
+
+    @classmethod
+    def _isolate_entry(
+        cls,
+        parent_fd: int,
+        name: str,
+        expected_metadata: os.stat_result,
+    ) -> tuple[str, int, bool]:
+        quarantine_name, quarantine_fd = cls._create_quarantine_directory(parent_fd)
+        renamed = False
+        try:
+            os.rename(
+                name,
+                _CLEANUP_ENTRY_NAME,
+                src_dir_fd=parent_fd,
+                dst_dir_fd=quarantine_fd,
+            )
+            renamed = True
+            isolated_metadata = os.stat(
+                _CLEANUP_ENTRY_NAME,
+                dir_fd=quarantine_fd,
+                follow_symlinks=False,
+            )
+            return (
+                quarantine_name,
+                quarantine_fd,
+                os.path.samestat(expected_metadata, isolated_metadata),
+            )
+        except Exception:
+            os.close(quarantine_fd)
+            if not renamed:
+                try:
+                    os.rmdir(quarantine_name, dir_fd=parent_fd)
+                except OSError:
+                    pass
+            raise
+
+    @classmethod
+    def _create_quarantine_directory(cls, parent_fd: int) -> tuple[str, int]:
+        for _attempt in range(10):
+            name = f".reimbursement-cleanup-{uuid4().hex}"
+            try:
+                os.mkdir(name, mode=0o700, dir_fd=parent_fd)
+            except FileExistsError:
+                continue
+            descriptor: int | None = None
+            try:
+                metadata = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+                descriptor = cls._open_directory(parent_fd, name)
+                if not os.path.samestat(metadata, os.fstat(descriptor)):
+                    raise ValueError("cleanup directory identity changed")
+                return name, descriptor
+            except Exception:
+                if descriptor is not None:
+                    os.close(descriptor)
+                raise
+        raise FileExistsError("could not reserve cleanup directory")
