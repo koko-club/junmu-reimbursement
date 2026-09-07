@@ -1,38 +1,122 @@
 import json
 from pathlib import Path
+import sys
+import tempfile
 import unittest
 
-import sys
 
 APP_DIR = Path(__file__).resolve().parents[1]
 if str(APP_DIR) not in sys.path:
     sys.path.insert(0, str(APP_DIR))
 
-import app
-
-
-APP_DIR = Path(__file__).resolve().parents[1]
+from config import AppConfig, load_config
 
 
 class ConfigContractTest(unittest.TestCase):
+    def write_config(self, directory: Path, values: dict) -> Path:
+        path = directory / "config.json"
+        path.write_text(json.dumps(values), encoding="utf-8")
+        return path
+
     def test_config_contains_application_defaults(self):
         config_path = APP_DIR / "config.json"
-        config = json.loads(config_path.read_text(encoding="utf-8"))
+        raw = json.loads(config_path.read_text(encoding="utf-8"))
 
-        self.assertEqual(
-            config["template_path"],
-            "resources/差旅报销单模板.xlsx",
+        self.assertEqual(raw["template_path"], "resources/差旅报销单模板.xlsx")
+        self.assertEqual(raw["data_dir"], "data")
+        self.assertEqual(raw["host"], "127.0.0.1")
+        self.assertEqual(raw["port"], 8800)
+        self.assertEqual(raw["soffice_path"], "")
+        self.assertEqual(raw["max_body_bytes"], 10485760)
+        self.assertEqual(raw["max_concurrent_generations"], 2)
+        self.assertFalse(raw["cookie_secure"])
+
+    def test_relative_paths_resolve_from_config_directory(self):
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            config_path = self.write_config(root, {
+                "template_path": "resources/template.xlsx",
+                "data_dir": "state",
+                "templates_dir": "views",
+                "static_dir": "assets",
+            })
+
+            config = load_config(config_path)
+
+        self.assertIsInstance(config, AppConfig)
+        self.assertEqual(config.template_path, root / "resources/template.xlsx")
+        self.assertEqual(config.data_dir, root / "state")
+        self.assertEqual(config.templates_dir, root / "views")
+        self.assertEqual(config.static_dir, root / "assets")
+
+    def test_environment_overrides_supported_values(self):
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            config_path = self.write_config(root, {
+                "template_path": "template.xlsx",
+                "data_dir": "data",
+                "host": "127.0.0.1",
+                "port": 8800,
+                "soffice_path": "",
+                "max_body_bytes": 1,
+                "max_concurrent_generations": 1,
+                "cookie_secure": False,
+            })
+            config = load_config(config_path, {
+                "APP_HOST": "0.0.0.0",
+                "APP_PORT": "9000",
+                "APP_DATA_DIR": "runtime-data",
+                "APP_SOFFICE_PATH": "/opt/soffice",
+                "APP_MAX_BODY_BYTES": "2048",
+                "APP_MAX_CONCURRENT_GENERATIONS": "3",
+                "APP_COOKIE_SECURE": "YES",
+            })
+
+        self.assertEqual(config.host, "0.0.0.0")
+        self.assertEqual(config.port, 9000)
+        self.assertEqual(config.data_dir, root / "runtime-data")
+        self.assertEqual(config.soffice_path, "/opt/soffice")
+        self.assertEqual(config.max_body_bytes, 2048)
+        self.assertEqual(config.max_concurrent_generations, 3)
+        self.assertTrue(config.cookie_secure)
+
+    def test_port_zero_and_supported_boolean_forms_are_accepted(self):
+        with tempfile.TemporaryDirectory() as name:
+            config_path = self.write_config(Path(name), {
+                "template_path": "template.xlsx",
+                "data_dir": "data",
+                "port": 0,
+                "cookie_secure": "no",
+            })
+            config = load_config(config_path, {"APP_COOKIE_SECURE": "1"})
+
+        self.assertEqual(config.port, 0)
+        self.assertTrue(config.cookie_secure)
+
+    def test_invalid_values_are_rejected(self):
+        cases = (
+            ({"port": 65536}, "port"),
+            ({"port": -1}, "port"),
+            ({"port": 1.5}, "port"),
+            ({"max_body_bytes": 0}, "max_body_bytes"),
+            ({"max_concurrent_generations": 0}, "max_concurrent_generations"),
+            ({"cookie_secure": "maybe"}, "cookie_secure"),
         )
-        self.assertEqual(config["output_dir"], "generated")
-        self.assertEqual(config["host"], "127.0.0.1")
-        self.assertEqual(config["port"], 0)
-        self.assertEqual(config["soffice_path"], "")
-        self.assertEqual((APP_DIR / config["output_dir"]).parent, APP_DIR)
-
-    def test_relative_template_path_resolves_from_config_directory(self):
-        config = app._load_config(APP_DIR / "config.json")
-        self.assertEqual(config["template_path"], APP_DIR / "resources/差旅报销单模板.xlsx")
-        self.assertTrue(config["template_path"].is_file())
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            for overrides, expected in cases:
+                values = {
+                    "template_path": "template.xlsx",
+                    "data_dir": "data",
+                    "port": 8800,
+                    "max_body_bytes": 1,
+                    "max_concurrent_generations": 1,
+                    "cookie_secure": False,
+                }
+                values.update(overrides)
+                with self.subTest(values=overrides):
+                    with self.assertRaisesRegex(ValueError, expected):
+                        load_config(self.write_config(root, values))
 
 
 if __name__ == "__main__":
