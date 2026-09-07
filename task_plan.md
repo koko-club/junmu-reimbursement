@@ -24,6 +24,12 @@ Task 7 atomic per-user generation follow-up is in progress under strict TDD; Tas
 - [x] RED/GREEN: isolate every cleanup candidate before final unlink/rmdir and reject artifact FIFOs without blocking
 - [x] Update the Task 7 owned-file plan contract, run all required verification, review, and commit; keep Task 7 in progress
 
+## Task 7 Request-directory Creation Follow-up
+- [x] RED: inject one-shot open and post-open identity failures for work and final claim directories
+- [x] RED: prove shared tmp/users/owner directories survive common-directory open failures
+- [x] GREEN: create, open, and capture identity for request-owned directories in one rollback-safe helper
+- [x] Run focused/full ResourceWarning, real LibreOffice E2E, compile, diff, review, and commit; keep Task 7 in progress
+
 ## Design Checklist
 - [x] Explore current project location and existing architecture
 - [x] Confirm whether to preserve the old version and build in this directory
@@ -66,3 +72,5 @@ Task 7 atomic per-user generation follow-up is in progress under strict TDD; Tas
 | Long-name E2E retained the old `张三` PDF assertion | 1 | Changed the assertion to the complete 100-character traveler and reran the real LibreOffice test |
 | Generated-FIFO test patch used an outdated adjacent assertion | 1 | Re-read the current test section and reapplied with the exact local context |
 | Sandboxed full suite could not bind loopback sockets (`PermissionError`) | 1 | Re-run the same 244-test command with the required local-network sandbox permission |
+| Shared-directory characterization reused the no-files helper despite precreated sentinels | 1 | Replaced only its final assertion with zero database rows and zero XLSX/PDF artifacts |
+| Identity-failure tests counted only creation fds, but rollback safely reopened the same UUID | 1 | Assert every captured creation and rollback fd is closed instead of assuming the pre-fix fd count |

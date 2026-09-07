@@ -1460,6 +1460,181 @@ class ReimbursementServiceTest(unittest.TestCase):
         self.assertEqual(len(observed), 2)
         self.assertTrue(all(connection.closed for connection in observed))
 
+    def test_work_directory_open_failure_rolls_back_created_uuid_directory(self):
+        record_uuid = UUID("33333333-3333-4333-8333-333333333331")
+        record_id = str(record_uuid)
+        real_open = os.open
+        failed = False
+
+        def fail_once(path, *args, **kwargs):
+            nonlocal failed
+            if path == record_id and not failed:
+                failed = True
+                raise OSError("forced work directory open failure")
+            return real_open(path, *args, **kwargs)
+
+        service = self._service_with(uuid_factory=lambda: record_uuid)
+        with mock.patch("reimbursements.os.open", side_effect=fail_once):
+            with self.assertRaises(ReimbursementGenerationError):
+                service.generate(self.alice, valid_payload(), [])
+
+        self.assertTrue(failed)
+        self.assertFalse((self.data_dir / "tmp" / record_id).exists())
+        self._assert_no_history_or_artifacts()
+
+    def test_work_directory_identity_failure_rolls_back_and_closes_fd(self):
+        record_uuid = UUID("33333333-3333-4333-8333-333333333332")
+        record_id = str(record_uuid)
+        real_open = os.open
+        real_fstat = os.fstat
+        record_fds = []
+        fstat_calls = {}
+        failed = False
+
+        def tracking_open(path, *args, **kwargs):
+            descriptor = real_open(path, *args, **kwargs)
+            if path == record_id:
+                record_fds.append(descriptor)
+            return descriptor
+
+        def fail_second_fstat(descriptor):
+            nonlocal failed
+            if descriptor in record_fds:
+                count = fstat_calls.get(descriptor, 0) + 1
+                fstat_calls[descriptor] = count
+                if descriptor == record_fds[0] and count == 2 and not failed:
+                    failed = True
+                    raise OSError("forced work directory identity failure")
+            return real_fstat(descriptor)
+
+        service = self._service_with(uuid_factory=lambda: record_uuid)
+        with mock.patch(
+            "reimbursements.os.open", side_effect=tracking_open
+        ), mock.patch("reimbursements.os.fstat", side_effect=fail_second_fstat):
+            with self.assertRaises(ReimbursementGenerationError):
+                service.generate(self.alice, valid_payload(), [])
+
+        self.assertTrue(failed)
+        self.assertFalse((self.data_dir / "tmp" / record_id).exists())
+        self.assertGreaterEqual(len(record_fds), 2)
+        for descriptor in record_fds:
+            with self.assertRaises(OSError):
+                os.fstat(descriptor)
+        self._assert_no_history_or_artifacts()
+
+    def test_final_claim_open_failure_rolls_back_created_uuid_directory(self):
+        record_uuid = UUID("33333333-3333-4333-8333-333333333333")
+        record_id = str(record_uuid)
+        real_open = os.open
+        record_open_count = 0
+        failed = False
+
+        def fail_second_record_open(path, *args, **kwargs):
+            nonlocal failed, record_open_count
+            if path == record_id:
+                record_open_count += 1
+                if record_open_count == 2 and not failed:
+                    failed = True
+                    raise OSError("forced final claim open failure")
+            return real_open(path, *args, **kwargs)
+
+        service = self._service_with(uuid_factory=lambda: record_uuid)
+        with mock.patch(
+            "reimbursements.os.open", side_effect=fail_second_record_open
+        ):
+            with self.assertRaises(ReimbursementGenerationError):
+                service.generate(self.alice, valid_payload(), [])
+
+        final_dir = self.data_dir / "users" / str(self.alice.user_id) / record_id
+        self.assertTrue(failed)
+        self.assertFalse(final_dir.exists())
+        self._assert_no_history_or_artifacts()
+
+    def test_final_claim_identity_failure_rolls_back_and_closes_fd(self):
+        record_uuid = UUID("33333333-3333-4333-8333-333333333334")
+        record_id = str(record_uuid)
+        real_open = os.open
+        real_fstat = os.fstat
+        record_fds = []
+        fstat_calls = {}
+        failed = False
+
+        def tracking_open(path, *args, **kwargs):
+            descriptor = real_open(path, *args, **kwargs)
+            if path == record_id:
+                record_fds.append(descriptor)
+            return descriptor
+
+        def fail_final_second_fstat(descriptor):
+            nonlocal failed
+            if descriptor in record_fds:
+                count = fstat_calls.get(descriptor, 0) + 1
+                fstat_calls[descriptor] = count
+                if len(record_fds) == 2 and descriptor == record_fds[1] and count == 2:
+                    failed = True
+                    raise OSError("forced final claim identity failure")
+            return real_fstat(descriptor)
+
+        service = self._service_with(uuid_factory=lambda: record_uuid)
+        with mock.patch(
+            "reimbursements.os.open", side_effect=tracking_open
+        ), mock.patch("reimbursements.os.fstat", side_effect=fail_final_second_fstat):
+            with self.assertRaises(ReimbursementGenerationError):
+                service.generate(self.alice, valid_payload(), [])
+
+        final_dir = self.data_dir / "users" / str(self.alice.user_id) / record_id
+        self.assertTrue(failed)
+        self.assertFalse(final_dir.exists())
+        self.assertGreaterEqual(len(record_fds), 4)
+        for descriptor in record_fds:
+            with self.assertRaises(OSError):
+                os.fstat(descriptor)
+        self._assert_no_history_or_artifacts()
+
+    def test_shared_directory_open_failures_do_not_remove_existing_directories(self):
+        tmp_dir = self.data_dir / "tmp"
+        users_dir = self.data_dir / "users"
+        owner_dir = users_dir / str(self.alice.user_id)
+        owner_dir.mkdir(parents=True)
+        tmp_dir.mkdir(exist_ok=True)
+        sentinels = []
+        for directory, label in (
+            (tmp_dir, "tmp"),
+            (users_dir, "users"),
+            (owner_dir, "owner"),
+        ):
+            sentinel = directory / f"{label}-sentinel"
+            sentinel.write_bytes(label.encode("ascii"))
+            sentinels.append((sentinel, label.encode("ascii")))
+
+        for index, target in enumerate(("tmp", "users", str(self.alice.user_id)), 1):
+            record_uuid = UUID(f"33333333-3333-4333-8333-33333333334{index}")
+            real_open = os.open
+            failed = False
+
+            def fail_shared_once(path, *args, **kwargs):
+                nonlocal failed
+                if path == target and not failed:
+                    failed = True
+                    raise OSError("forced shared directory open failure")
+                return real_open(path, *args, **kwargs)
+
+            service = self._service_with(uuid_factory=lambda: record_uuid)
+            with self.subTest(target=target), mock.patch(
+                "reimbursements.os.open", side_effect=fail_shared_once
+            ):
+                with self.assertRaises(ReimbursementGenerationError):
+                    service.generate(self.alice, valid_payload(), [])
+                self.assertTrue(failed)
+                for sentinel, content in sentinels:
+                    self.assertEqual(sentinel.read_bytes(), content)
+
+        with self.database.connect() as connection:
+            count = connection.execute("SELECT COUNT(*) FROM reimbursements").fetchone()[0]
+        self.assertEqual(count, 0)
+        self.assertEqual(list(self.data_dir.rglob("*.xlsx")), [])
+        self.assertEqual(list(self.data_dir.rglob("*.pdf")), [])
+
     def test_generation_closes_all_opened_file_descriptors_on_success_and_failure(self):
         real_open = os.open
 

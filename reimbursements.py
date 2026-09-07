@@ -145,11 +145,12 @@ class ReimbursementService:
             open_fds.append(data_fd)
             tmp_fd = self._open_or_create_directory(data_fd, "tmp")
             open_fds.append(tmp_fd)
-            work_fd = self._open_or_create_directory(
-                tmp_fd, record_id, exist_ok=False
+            work_fd, work_identity = self._create_owned_directory(
+                tmp_fd,
+                record_id,
+                record_id,
             )
             open_fds.append(work_fd)
-            work_identity = self._directory_identity(os.fstat(work_fd))
             work_dir = data_dir / "tmp" / record_id
 
             with self._generation_slots:
@@ -213,11 +214,12 @@ class ReimbursementService:
             open_fds.append(owner_fd)
             owner_dir = data_dir / "users" / str(user.user_id)
             final_dir = owner_dir / record_id
-            final_claim_fd = self._open_or_create_directory(
-                owner_fd, record_id, exist_ok=False
+            final_claim_fd, final_claim_identity = self._create_owned_directory(
+                owner_fd,
+                record_id,
+                record_id,
             )
             open_fds.append(final_claim_fd)
-            final_claim_identity = self._directory_identity(os.fstat(final_claim_fd))
             self._verify_output_identity(
                 work_fd,
                 xlsx_work_relative,
@@ -603,6 +605,36 @@ class ReimbursementService:
             if not exist_ok:
                 raise
         return cls._open_directory(parent_fd, name)
+
+    def _create_owned_directory(
+        self,
+        parent_fd: int,
+        name: str,
+        record_id: str,
+    ) -> tuple[int, tuple[int, int]]:
+        descriptor: int | None = None
+        identity: tuple[int, int] | None = None
+        try:
+            os.mkdir(name, mode=0o700, dir_fd=parent_fd)
+            created_metadata = os.stat(
+                name,
+                dir_fd=parent_fd,
+                follow_symlinks=False,
+            )
+            if not stat.S_ISDIR(created_metadata.st_mode):
+                raise ValueError("created storage entry must be a directory")
+            identity = self._directory_identity(created_metadata)
+            descriptor = self._open_directory(parent_fd, name)
+            opened_metadata = os.fstat(descriptor)
+            if not os.path.samestat(created_metadata, opened_metadata):
+                raise ValueError("created directory identity changed")
+            return descriptor, identity
+        except Exception:
+            if descriptor is not None:
+                os.close(descriptor)
+            if identity is not None:
+                self._cleanup_at(parent_fd, name, {identity}, record_id)
+            raise
 
     @staticmethod
     def _rename_directory(
