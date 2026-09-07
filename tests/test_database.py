@@ -32,6 +32,19 @@ class DatabaseTest(unittest.TestCase):
         finally:
             connection.close()
 
+    def test_connect_closes_connection_when_pragma_setup_fails(self):
+        connection = mock.Mock()
+        original_error = sqlite3.OperationalError("pragma failed")
+        connection.execute.side_effect = original_error
+        connection.close.side_effect = RuntimeError("close failed")
+
+        with mock.patch("database.sqlite3.connect", return_value=connection):
+            with self.assertRaises(sqlite3.OperationalError) as caught:
+                self.db.connect()
+
+        self.assertIs(caught.exception, original_error)
+        connection.close.assert_called_once_with()
+
     def test_migrate_is_idempotent_and_records_version(self):
         self.db.migrate()
         self.db.migrate()
