@@ -4,7 +4,7 @@
 在现有差旅报销网页工具基础上增加管理员、普通用户登录、普通用户单会话限制，以及按用户隔离的 Excel/PDF 生成历史。
 
 ## Current Phase
-Task 7 atomic per-user generation follow-up is in progress under strict TDD; Task 8 routes and lifecycle writes remain out of scope.
+Task 8 history, download, recycle-bin, and purge APIs are in progress under strict TDD; Task 7 is complete after specification and code-quality approval.
 
 ## Task 7 Review Follow-up
 - [x] RED: prove an exporter cannot replace, delete, or change the workbook into a non-regular file after its first validation
