@@ -236,12 +236,11 @@ class UserService:
             )
             updated = self._get_in(connection, user_id)
             prior_status = user["status"]
-            prior_updated_at = user["updated_at"]
         if not enabled:
             try:
                 self._revoke(user_id)
             except Exception:
-                self._restore_status(user_id, prior_status, prior_updated_at, changed_at)
+                self._restore_status(user_id, prior_status)
                 raise
         return updated
 
@@ -260,11 +259,13 @@ class UserService:
         try:
             self._revoke(user_id)
         except Exception:
-            self._restore_password(user_id, previous, material, changed_at)
+            self._restore_password(user_id, previous, material, replacement_must_change_password=1)
             raise
         return temporary_password
 
-    def change_password(self, user_id: int, old_password: str, new_password: str) -> None:
+    def change_password(
+        self, user_id: int, current_password: str, new_password: str
+    ) -> None:
         material = self._password_hasher.hash(new_password)
         changed_at = _utc_now()
         with self._database.transaction(immediate=True) as connection:
@@ -276,7 +277,7 @@ class UserService:
                 salt=bytes(user["password_salt"]),
                 params=user["password_params"],
             )
-            if not self._password_hasher.verify(old_password, old_material):
+            if not self._password_hasher.verify(current_password, old_material):
                 raise AuthenticationFailed("invalid username or password")
             connection.execute(
                 "UPDATE users SET password_hash = ?, password_salt = ?, password_params = ?, "
@@ -286,7 +287,7 @@ class UserService:
         try:
             self._revoke(user_id)
         except Exception:
-            self._restore_password(user_id, user, material, changed_at)
+            self._restore_password(user_id, user, material, replacement_must_change_password=0)
             raise
 
     def _revoke(self, user_id: int) -> None:
@@ -296,31 +297,32 @@ class UserService:
             _LOGGER.exception("session revocation failed for user_id=%s", user_id)
             raise
 
-    def _restore_status(
-        self, user_id: int, prior_status: str, prior_updated_at: str, changed_at: str
-    ) -> None:
+    def _restore_status(self, user_id: int, prior_status: str) -> None:
         with self._database.transaction(immediate=True) as connection:
             restored = connection.execute(
-                "UPDATE users SET status = ?, updated_at = ? "
-                "WHERE id = ? AND status = 'disabled' AND updated_at = ?",
-                (prior_status, prior_updated_at, user_id, changed_at),
+                "UPDATE users SET status = ? WHERE id = ? AND status = 'disabled'",
+                (prior_status, user_id),
             )
         if restored.rowcount != 1:
             _LOGGER.error("could not restore status after failed revocation for user_id=%s", user_id)
 
     def _restore_password(
-        self, user_id: int, previous: sqlite3.Row, replacement: PasswordMaterial, changed_at: str
+        self,
+        user_id: int,
+        previous: sqlite3.Row,
+        replacement: PasswordMaterial,
+        replacement_must_change_password: int,
     ) -> None:
         with self._database.transaction(immediate=True) as connection:
             restored = connection.execute(
                 "UPDATE users SET password_hash = ?, password_salt = ?, password_params = ?, "
-                "must_change_password = ?, updated_at = ? "
+                "must_change_password = ? "
                 "WHERE id = ? AND password_hash = ? AND password_salt = ? AND password_params = ? "
-                "AND updated_at = ?",
+                "AND must_change_password = ?",
                 (
                     previous["password_hash"], previous["password_salt"], previous["password_params"],
-                    previous["must_change_password"], previous["updated_at"], user_id,
-                    replacement.digest, replacement.salt, replacement.params, changed_at,
+                    previous["must_change_password"], user_id, replacement.digest,
+                    replacement.salt, replacement.params, replacement_must_change_password,
                 ),
             )
         if restored.rowcount != 1:

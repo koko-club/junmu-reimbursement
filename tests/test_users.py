@@ -165,6 +165,13 @@ class UserServiceTest(unittest.TestCase):
                 with self.assertRaises(AuthenticationFailed):
                     self.service.authenticate(username, password)
 
+    def test_pending_user_is_rejected_even_with_the_correct_password(self):
+        self.setup_admin()
+        self.service.register("pending", "correct horse battery staple", "Pending", "Engineering")
+
+        with self.assertRaises(AuthenticationFailed):
+            self.service.authenticate("pending", "correct horse battery staple")
+
     def test_reset_and_change_password_revoke_sessions_and_never_persist_plaintext(self):
         admin, user = self.register_and_approve()
         with mock.patch("users.secrets.token_urlsafe", return_value="temporary-secret"):
@@ -174,7 +181,11 @@ class UserServiceTest(unittest.TestCase):
         stored = self.service.get(user.id)
         self.assertTrue(stored.must_change_password)
         self.assertEqual(self.service.authenticate("alex", temporary).id, user.id)
-        self.service.change_password(user.id, temporary, "a new correct horse battery staple")
+        self.service.change_password(
+            user.id,
+            current_password=temporary,
+            new_password="a new correct horse battery staple",
+        )
         self.assertEqual(self.revocations, [user.id, user.id])
         self.assertFalse(self.service.get(user.id).must_change_password)
         with self.assertRaises(AuthenticationFailed):
@@ -218,8 +229,67 @@ class UserServiceTest(unittest.TestCase):
         self.assertEqual(self.service.authenticate("alex", "correct horse battery staple").id, user.id)
         with self.assertLogs("users", level="ERROR"):
             with self.assertRaisesRegex(RuntimeError, "revoke failed"):
-                failing.change_password(user.id, "correct horse battery staple", "a new correct horse battery staple")
+                failing.change_password(
+                    user.id,
+                    "correct horse battery staple",
+                    "a new correct horse battery staple",
+                )
         self.assertEqual(self.service.authenticate("alex", "correct horse battery staple").id, user.id)
+
+    def test_failed_revocation_restores_only_security_fields_after_concurrent_profile_edit(self):
+        admin, user = self.register_and_approve()
+
+        def change_profile_then_fail(user_id):
+            self.service.update_profile(admin.id, user_id, "Concurrent Name", "Concurrent Department")
+            raise RuntimeError("revoke failed")
+
+        failing = UserService(
+            self.database,
+            PasswordHasher(n=1024, r=8, p=1),
+            revoke_sessions=change_profile_then_fail,
+        )
+        with self.assertLogs("users", level="ERROR"):
+            with self.assertRaisesRegex(RuntimeError, "revoke failed"):
+                failing.reset_password(admin.id, user.id)
+        restored = self.service.get(user.id)
+        self.assertEqual((restored.real_name, restored.department), ("Concurrent Name", "Concurrent Department"))
+        self.assertFalse(restored.must_change_password)
+        self.assertEqual(self.service.authenticate("alex", "correct horse battery staple").id, user.id)
+
+        with self.assertLogs("users", level="ERROR"):
+            with self.assertRaisesRegex(RuntimeError, "revoke failed"):
+                failing.set_enabled(admin.id, user.id, False)
+        restored = self.service.get(user.id)
+        self.assertEqual(restored.status, "active")
+        self.assertEqual((restored.real_name, restored.department), ("Concurrent Name", "Concurrent Department"))
+
+    def test_failed_revocation_does_not_overwrite_a_later_password_change(self):
+        admin, user = self.register_and_approve()
+
+        def replace_password_then_fail(user_id):
+            material = PasswordHasher(n=1024, r=8, p=1).hash("concurrent correct horse battery staple")
+            with self.database.transaction(immediate=True) as connection:
+                connection.execute(
+                    "UPDATE users SET password_hash = ?, password_salt = ?, password_params = ?, "
+                    "must_change_password = 1 WHERE id = ?",
+                    (material.digest, material.salt, material.params, user_id),
+                )
+            raise RuntimeError("revoke failed")
+
+        failing = UserService(
+            self.database,
+            PasswordHasher(n=1024, r=8, p=1),
+            revoke_sessions=replace_password_then_fail,
+        )
+        with self.assertLogs("users", level="ERROR") as logged:
+            with self.assertRaisesRegex(RuntimeError, "revoke failed"):
+                failing.reset_password(admin.id, user.id)
+        self.assertIn("could not restore password", "\n".join(logged.output))
+        self.assertTrue(self.service.get(user.id).must_change_password)
+        self.assertEqual(
+            self.service.authenticate("alex", "concurrent correct horse battery staple").id,
+            user.id,
+        )
 
     def test_get_raises_for_unknown_user_and_lists_have_stable_order(self):
         admin = self.setup_admin()
