@@ -33,4 +33,5 @@
 - Wrote and self-reviewed `docs/superpowers/specs/2026-09-07-auth-user-history-design.md`; awaiting user approval before implementation planning.
 - User approved the written design specification.
 - Wrote and self-reviewed `docs/superpowers/plans/2026-09-07-auth-user-history.md`; all design requirements map to implementation and verification tasks.
+- Task 1 complete: copied the verified baseline into a new Git repository, restored the receipt fixture, made tests use the repository template, and verified all 57 baseline tests pass with the bundled runtime.
 - Self-review clarified pre-setup route restrictions, protected administrator targets, and the stopped-service one-shot backup flow.

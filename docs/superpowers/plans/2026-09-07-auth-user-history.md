@@ -38,7 +38,7 @@
 - Copy: `build_deployment_package.py`, `README_部署说明.md`, and the three existing launchers
 - Source: `/Users/koko/Documents/Codex/其他/reimbursement_form_app_20260903`
 
-- [ ] **Step 1: Copy only source, resources, and tests**
+- [x] **Step 1: Copy only source, resources, and tests**
 
 ```bash
 cp /Users/koko/Documents/Codex/其他/reimbursement_form_app_20260903/app.py .
@@ -60,7 +60,7 @@ cp -R /Users/koko/Documents/Codex/其他/reimbursement_form_app_20260903/tests .
 
 Expected: do not copy `generated/`, `dist/`, `runtime/`, caches, or old planning files. Only the explicitly listed legacy launchers and packager are copied temporarily so the inherited baseline suite can run; Task 13 replaces them.
 
-- [ ] **Step 2: Create `.gitignore`**
+- [x] **Step 2: Create `.gitignore`**
 
 ```gitignore
 __pycache__/
@@ -75,7 +75,7 @@ backups/
 .superpowers/
 ```
 
-- [ ] **Step 3: Run the inherited suite**
+- [x] **Step 3: Run the inherited suite**
 
 ```bash
 python3 -m unittest discover -s tests -v
@@ -83,7 +83,7 @@ python3 -m unittest discover -s tests -v
 
 Expected: all inherited tests pass; only the existing optional PDF branch may skip when local LibreOffice is unavailable.
 
-- [ ] **Step 4: Initialize Git and commit the baseline**
+- [x] **Step 4: Initialize Git and commit the baseline**
 
 ```bash
 git init
