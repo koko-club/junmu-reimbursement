@@ -547,6 +547,37 @@ class WebAuthenticationTest(unittest.TestCase):
             application._safely(handler, mock.Mock(side_effect=TimeoutError))
         render_json.assert_not_called()
 
+    def test_callback_disconnects_close_without_a_second_response(self):
+        application = self.running.server.application
+        for error in (TimeoutError(), ConnectionError(), BrokenPipeError()):
+            with self.subTest(error=type(error).__name__):
+                handler = mock.Mock(
+                    path="/healthz", headers={}, command="GET", close_connection=False
+                )
+                with mock.patch.object(
+                    application, "_health", side_effect=error
+                ), mock.patch.object(application, "_json") as render_json, mock.patch(
+                    "web._LOGGER.exception"
+                ) as log_exception:
+                    application._dispatch(handler, "GET")
+                render_json.assert_not_called()
+                log_exception.assert_not_called()
+                self.assertTrue(handler.close_connection)
+
+    def test_callback_runtime_error_returns_safe_500(self):
+        application = self.running.server.application
+        handler = mock.Mock(path="/healthz", headers={}, command="GET")
+        with mock.patch.object(
+            application, "_health", side_effect=RuntimeError("private callback detail")
+        ), mock.patch.object(application, "_json") as render_json, mock.patch(
+            "web._LOGGER.exception"
+        ) as log_exception:
+            application._dispatch(handler, "GET")
+        log_exception.assert_called_once()
+        render_json.assert_called_once_with(
+            handler, 500, {"error": "服务暂时不可用，请稍后重试"}
+        )
+
     def test_legacy_anonymous_generate_and_filename_download_routes_are_absent(self):
         self.setup_admin()
         anonymous = self.running.new_client()

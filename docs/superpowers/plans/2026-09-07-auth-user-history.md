@@ -497,6 +497,8 @@ git commit -m "feat: protect web routes with sessions"
 
 Expected: authentication and adapted server tests pass.
 
+Completion note: Task 6 also implements one shared two-operation scrypt concurrency budget, setup/register per-IP rate limits, and login rate limits keyed by normalized username plus client IP. Each limit permits 5 attempts in 15 minutes, returns `Retry-After` when blocked, and successful login clears its key.
+
 ---
 
 ### Task 7: Implement atomic per-user generation
@@ -641,7 +643,7 @@ Expected: permission, cleanup, and server tests pass.
 
 ---
 
-### Task 9: Add administration APIs, throttling, and safe logging
+### Task 9: Add administration APIs and safe logging
 
 **Files:**
 - Modify: `web.py`
@@ -649,7 +651,7 @@ Expected: permission, cleanup, and server tests pass.
 - Modify: `tests/test_web_auth.py`
 - Create: `tests/test_request_security.py`
 
-- [ ] **Step 1: Write failing API and hardening tests**
+- [ ] **Step 1: Write failing administration/logging tests and extend hardening regressions**
 
 ```python
 def test_admin_manages_an_ordinary_user(self):
@@ -670,7 +672,7 @@ def test_csrf_and_size_checks_run_before_domain_logic(self):
     self.assertEqual(response.status, 413)
 ```
 
-Also cover reject/re-register, non-admin denial for every admin route, admin-target rejection, malformed input, secret-free logs, and login throttling by normalized username plus client address.
+Also cover reject/re-register, non-admin denial for every admin route, admin-target rejection, malformed input, and secret-free logs. Retain Task 6 regressions for setup/register/login rate limiting and the shared scrypt concurrency budget; those imports and behaviors must already pass when Task 9 starts, and any Task 9 cases extend them as regression coverage rather than expecting them to be absent.
 
 - [ ] **Step 2: Verify failure**
 
@@ -678,7 +680,7 @@ Also cover reject/re-register, non-admin denial for every admin route, admin-tar
 python3 -m unittest tests.test_web_auth tests.test_request_security -v
 ```
 
-Expected: admin routes, throttle, and request logging tests fail.
+Expected: existing Task 6 throttle/scrypt regressions pass; administration routes and request logging tests fail.
 
 - [ ] **Step 3: Implement exact administration routes**
 
@@ -696,11 +698,11 @@ POST /api/logout
 
 Every admin write requires active admin role and CSRF. User-management routes reject `role='admin'` targets. Password reset returns plaintext once under `Cache-Control: no-store`; no database or log field contains it.
 
-- [ ] **Step 4: Add request IDs, safe JSON logs, and throttle**
+- [ ] **Step 4: Add request IDs and safe JSON logs**
 
 Create `secrets.token_hex(8)` request ID per request. Log timestamp, request ID, remote IP, known user ID, method, named route, status, duration, and exception class. Never log headers, Cookie, body, passwords, temporary passwords, tokens, form data, or full file paths.
 
-The lock-protected in-memory throttle key is `(normalized_username, client_ip)`. Permit 5 failures in 15 minutes; then return 429 and `Retry-After`. Successful login clears the key. Prune expired buckets on each attempt.
+Reuse the lock-protected setup/register/login throttling and shared scrypt budget completed in Task 6; do not add a second limiter or reimplement those behaviors in Task 9.
 
 - [ ] **Step 5: Run tests and commit**
 

@@ -83,23 +83,24 @@ class BoundedThreadingHTTPServer(ThreadingHTTPServer):
 
     def _reject_saturated(self, request) -> None:
         body = '{"error":"\u670d\u52a1\u5668\u5fd9\uff0c\u8bf7\u7a0d\u540e\u91cd\u8bd5"}'.encode("utf-8")
-        response = (
+        response_head = (
             b"HTTP/1.1 503 Service Unavailable\r\n"
             b"Content-Type: application/json; charset=utf-8\r\n"
             + f"Content-Length: {len(body)}\r\n".encode("ascii")
             + b"Cache-Control: no-store\r\n"
             b"X-Content-Type-Options: nosniff\r\n"
             b"Connection: close\r\n\r\n"
-            + body
         )
+        request_prefix = b""
         try:
             request.setblocking(False)
             try:
-                request.recv(64 * 1024)
+                request_prefix = request.recv(64 * 1024)
             except BlockingIOError:
                 pass
             request.settimeout(min(self.request_idle_timeout, 1.0))
-            request.sendall(response)
+            possible_head = b"HEAD ".startswith(request_prefix[:5])
+            request.sendall(response_head if possible_head else response_head + body)
         except OSError:
             pass
         finally:

@@ -46,3 +46,6 @@
 - Download authorization is currently based only on the filename being inside the shared output directory; adding a login page alone would not isolate users.
 - Per-user history requires durable ownership metadata and server-side checks on both history listing and file download.
 - `ThreadingHTTPServer` already supports simultaneous requests, but authentication/session/database operations must be concurrency-safe.
+- Task 6 specification re-review found that callback-level connection timeouts can be converted into a second JSON 500 inside `_dispatch`, even though the outer `_safely` path already treats disconnects as terminal.
+- The pre-handler saturation response is constructed directly in `BoundedThreadingHTTPServer`, so it must apply HEAD body suppression itself rather than relying on `WebApplication._send()`.
+- Task 6 already owns setup/register/login throttling and the shared scrypt concurrency budget; Task 9 must retain only its remaining admin API, request-ID, logging, and security-extension work.

@@ -4,7 +4,7 @@
 在现有差旅报销网页工具基础上增加管理员、普通用户登录、普通用户单会话限制，以及按用户隔离的 Excel/PDF 生成历史。
 
 ## Current Phase
-Task 6 complete and verified; Task 7 has not started.
+Task 6 complete and verified after specification review; Task 7 has not started.
 
 ## Design Checklist
 - [x] Explore current project location and existing architecture

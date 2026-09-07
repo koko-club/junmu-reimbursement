@@ -274,6 +274,25 @@ class ServerTest(unittest.TestCase):
             self.assertIn(b"Cache-Control: no-store", response)
             self.assertIn(b"X-Content-Type-Options: nosniff", response)
 
+    def test_saturated_head_response_has_content_length_but_no_body(self):
+        with RunningApp() as running:
+            running.server.set_request_limits(timeout_seconds=1, max_concurrent_requests=1)
+            blocker = socket.create_connection(running.server.server_address, timeout=1)
+            try:
+                blocker.sendall(b"GET /healthz HTTP/1.1\r\nHost: localhost\r\n")
+                self._wait_for_active(running.server, 1)
+
+                response = self._raw_exchange(
+                    running.server,
+                    b"HEAD /healthz HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+                )
+            finally:
+                blocker.close()
+            head, body = response.split(b"\r\n\r\n", 1)
+            self.assertIn(b" 503 ", head.split(b"\r\n", 1)[0])
+            self.assertRegex(head, rb"\r\nContent-Length: [1-9][0-9]*\r\n")
+            self.assertEqual(body, b"")
+
     def test_database_and_secret_are_created_under_configured_data_directory(self):
         with RunningApp() as running:
             self.assertEqual(running.server.database.path, running.data_dir / "database" / "app.db")

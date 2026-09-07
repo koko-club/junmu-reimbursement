@@ -251,7 +251,8 @@ class WebApplication:
         callback = getattr(self, route.callback)
         try:
             callback(handler, current_user, token)
-        except (ConnectionError, BrokenPipeError):
+        except (ConnectionError, TimeoutError):
+            handler.close_connection = True
             return
         except Exception:
             _LOGGER.exception("unhandled web request failure for %s %s", method, path)
