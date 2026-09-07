@@ -5,7 +5,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import hashlib
-import hmac
 import secrets
 from typing import Callable
 
@@ -112,9 +111,11 @@ class SessionService:
             or not submitted
             or not isinstance(user.csrf_token, str)
             or not user.csrf_token
+            or not submitted.isascii()
+            or not user.csrf_token.isascii()
         ):
             return False
-        return hmac.compare_digest(user.csrf_token, submitted)
+        return secrets.compare_digest(user.csrf_token, submitted)
 
     def revoke_token(self, token: object) -> None:
         token_hash = _safe_token_hash(token)

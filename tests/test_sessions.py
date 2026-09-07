@@ -136,6 +136,12 @@ class SessionServiceTest(unittest.TestCase):
                 self.assertFalse(self.sessions.verify_csrf(authenticated, submitted))
         self.assertFalse(self.sessions.verify_csrf(None, issued.csrf_token))
 
+    def test_verify_csrf_rejects_non_ascii_submission_without_raising(self):
+        issued = self.sessions.issue(self.user.id)
+        authenticated = self.sessions.resolve(issued.token)
+
+        self.assertFalse(self.sessions.verify_csrf(authenticated, "中文"))
+
     def test_revoke_token_and_user_are_idempotent(self):
         issued = self.sessions.issue(self.user.id)
 
