@@ -119,6 +119,32 @@ class ConfigContractTest(unittest.TestCase):
         self.assertEqual(config.port, 0)
         self.assertTrue(config.cookie_secure)
 
+    def test_non_string_path_and_string_fields_are_rejected(self):
+        fields = (
+            "template_path",
+            "data_dir",
+            "templates_dir",
+            "static_dir",
+            "host",
+            "soffice_path",
+        )
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            for field in fields:
+                for invalid_value in (None, False, {}):
+                    values = {
+                        "template_path": "template.xlsx",
+                        "data_dir": "data",
+                        "templates_dir": "templates",
+                        "static_dir": "static",
+                        "host": "127.0.0.1",
+                        "soffice_path": "",
+                    }
+                    values[field] = invalid_value
+                    with self.subTest(field=field, invalid_value=invalid_value):
+                        with self.assertRaisesRegex(ValueError, field):
+                            load_config(self.write_config(root, values))
+
     def test_invalid_values_are_rejected(self):
         cases = (
             ({"port": 65536}, "port"),

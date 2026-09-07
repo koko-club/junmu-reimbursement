@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 import sqlite3
@@ -112,10 +112,9 @@ class Database:
     def backup(self, destination: Path) -> None:
         destination_path = Path(destination)
         destination_path.parent.mkdir(parents=True, exist_ok=True)
-        source = self.connect()
-        target = sqlite3.connect(destination_path)
-        try:
+        with ExitStack() as cleanup:
+            source = self.connect()
+            cleanup.callback(source.close)
+            target = sqlite3.connect(destination_path)
+            cleanup.callback(target.close)
             source.backup(target)
-        finally:
-            target.close()
-            source.close()

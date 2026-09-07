@@ -37,9 +37,17 @@ _DEFAULTS = {
 }
 
 
-def _path_from_config(value: object, base: Path) -> Path:
-    path = Path(str(value)).expanduser()
+def _path_from_config(value: str, base: Path) -> Path:
+    path = Path(value).expanduser()
     return path if path.is_absolute() else base / path
+
+
+def _string(value: object, name: str, allow_empty: bool = False) -> str:
+    if not isinstance(value, str):
+        raise ValueError(f"{name} must be a string")
+    if not allow_empty and not value.strip():
+        raise ValueError(f"{name} must not be empty")
+    return value
 
 
 def _integer(value: object, name: str) -> int:
@@ -106,18 +114,21 @@ def load_config(
     )
     if max_concurrent_generations <= 0:
         raise ValueError("max_concurrent_generations must be positive")
-    host = str(merged["host"]).strip()
-    if not host:
-        raise ValueError("host must not be empty")
+    template_path = _string(merged["template_path"], "template_path")
+    data_dir = _string(merged["data_dir"], "data_dir")
+    templates_dir = _string(merged["templates_dir"], "templates_dir")
+    static_dir = _string(merged["static_dir"], "static_dir")
+    host = _string(merged["host"], "host").strip()
+    soffice_path = _string(merged["soffice_path"], "soffice_path", allow_empty=True)
 
     return AppConfig(
-        template_path=_path_from_config(merged["template_path"], base),
-        data_dir=_path_from_config(merged["data_dir"], base),
-        templates_dir=_path_from_config(merged["templates_dir"], base),
-        static_dir=_path_from_config(merged["static_dir"], base),
+        template_path=_path_from_config(template_path, base),
+        data_dir=_path_from_config(data_dir, base),
+        templates_dir=_path_from_config(templates_dir, base),
+        static_dir=_path_from_config(static_dir, base),
         host=host,
         port=port,
-        soffice_path=str(merged["soffice_path"]),
+        soffice_path=soffice_path,
         max_body_bytes=max_body_bytes,
         max_concurrent_generations=max_concurrent_generations,
         cookie_secure=_boolean(merged["cookie_secure"], "cookie_secure"),

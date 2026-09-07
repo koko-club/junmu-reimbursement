@@ -3,6 +3,7 @@ import sqlite3
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 
 APP_DIR = Path(__file__).resolve().parents[1]
@@ -161,3 +162,14 @@ class DatabaseTest(unittest.TestCase):
             )
         finally:
             copied.close()
+
+    def test_backup_closes_source_when_target_connection_fails(self):
+        source = self.db.connect()
+        destination = self.root / "backups" / "app.sqlite3"
+        with mock.patch.object(self.db, "connect", return_value=source), \
+             mock.patch("database.sqlite3.connect", side_effect=sqlite3.OperationalError("unavailable")):
+            with self.assertRaisesRegex(sqlite3.OperationalError, "unavailable"):
+                self.db.backup(destination)
+
+        with self.assertRaises(sqlite3.ProgrammingError):
+            source.execute("SELECT 1")
