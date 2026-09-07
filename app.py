@@ -99,8 +99,8 @@ class BoundedThreadingHTTPServer(ThreadingHTTPServer):
             except BlockingIOError:
                 pass
             request.settimeout(min(self.request_idle_timeout, 1.0))
-            possible_head = b"HEAD ".startswith(request_prefix[:5])
-            request.sendall(response_head if possible_head else response_head + body)
+            confirmed_head = request_prefix.startswith(b"HEAD ")
+            request.sendall(response_head if confirmed_head else response_head + body)
         except OSError:
             pass
         finally:

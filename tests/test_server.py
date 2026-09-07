@@ -214,6 +214,29 @@ class ServerTest(unittest.TestCase):
         self.assertIn(b" 503 ", request.sendall.call_args.args[0].split(b"\r\n", 1)[0])
         server.shutdown_request.assert_called_once_with(request)
 
+    def test_saturation_rejection_sends_body_for_unconfirmed_head_prefixes(self):
+        for request_prefix in (b"", b"H", b"HE", b"HEA"):
+            with self.subTest(request_prefix=request_prefix):
+                server = object.__new__(app.BoundedThreadingHTTPServer)
+                server.request_idle_timeout = 15
+                server.shutdown_request = mock.Mock()
+                request = mock.Mock()
+                request.recv.return_value = request_prefix
+
+                server._reject_saturated(request)
+
+                response = request.sendall.call_args.args[0]
+                head, body = response.split(b"\r\n\r\n", 1)
+                content_length = int(
+                    next(
+                        line.split(b":", 1)[1]
+                        for line in head.split(b"\r\n")
+                        if line.lower().startswith(b"content-length:")
+                    )
+                )
+                self.assertIn("error", json.loads(body.decode("utf-8")))
+                self.assertEqual(len(body), content_length)
+
     def test_partial_headers_time_out_with_408_json(self):
         with RunningApp() as running:
             running.server.set_request_limits(timeout_seconds=0.1, max_concurrent_requests=4)
@@ -274,24 +297,95 @@ class ServerTest(unittest.TestCase):
             self.assertIn(b"Cache-Control: no-store", response)
             self.assertIn(b"X-Content-Type-Options: nosniff", response)
 
-    def test_saturated_head_response_has_content_length_but_no_body(self):
-        with RunningApp() as running:
+    def test_saturated_delayed_get_receives_complete_json_body(self):
+        first_peek = threading.Event()
+        request_sent = threading.Event()
+        original_reject = app.BoundedThreadingHTTPServer._reject_saturated
+
+        class DelayedReadableSocket:
+            def __init__(self, wrapped):
+                self.wrapped = wrapped
+                self.first_recv = True
+
+            def recv(self, size):
+                if self.first_recv:
+                    self.first_recv = False
+                    first_peek.set()
+                    if not request_sent.wait(timeout=1):
+                        raise AssertionError("client did not send request after accept")
+                    raise BlockingIOError
+                return self.wrapped.recv(size)
+
+            def __getattr__(self, name):
+                return getattr(self.wrapped, name)
+
+        def reject_after_empty_peek(server, request):
+            original_reject(server, DelayedReadableSocket(request))
+
+        with RunningApp() as running, mock.patch.object(
+            app.BoundedThreadingHTTPServer,
+            "_reject_saturated",
+            autospec=True,
+            side_effect=reject_after_empty_peek,
+        ):
             running.server.set_request_limits(timeout_seconds=1, max_concurrent_requests=1)
             blocker = socket.create_connection(running.server.server_address, timeout=1)
+            rejected = None
             try:
                 blocker.sendall(b"GET /healthz HTTP/1.1\r\nHost: localhost\r\n")
                 self._wait_for_active(running.server, 1)
-
-                response = self._raw_exchange(
-                    running.server,
-                    b"HEAD /healthz HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+                rejected = socket.create_connection(running.server.server_address, timeout=1)
+                self.assertTrue(first_peek.wait(timeout=1))
+                rejected.sendall(
+                    b"GET /healthz HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
                 )
+                request_sent.set()
+                rejected.shutdown(socket.SHUT_WR)
+                response = self._read_socket(rejected)
             finally:
+                request_sent.set()
+                if rejected is not None:
+                    rejected.close()
                 blocker.close()
-            head, body = response.split(b"\r\n\r\n", 1)
-            self.assertIn(b" 503 ", head.split(b"\r\n", 1)[0])
-            self.assertRegex(head, rb"\r\nContent-Length: [1-9][0-9]*\r\n")
-            self.assertEqual(body, b"")
+
+        head, body = response.split(b"\r\n\r\n", 1)
+        content_length = int(
+            next(
+                line.split(b":", 1)[1]
+                for line in head.split(b"\r\n")
+                if line.lower().startswith(b"content-length:")
+            )
+        )
+        self.assertIn(b" 503 ", head.split(b"\r\n", 1)[0])
+        self.assertIn("error", json.loads(body.decode("utf-8")))
+        self.assertEqual(len(body), content_length)
+
+    def test_saturated_head_response_has_content_length_but_no_body(self):
+        server = object.__new__(app.BoundedThreadingHTTPServer)
+        server.request_idle_timeout = 1
+        server_side, client_side = socket.socketpair()
+        try:
+            client_side.sendall(
+                b"HEAD /healthz HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+            )
+            server._reject_saturated(server_side)
+            response = self._read_socket(client_side)
+        finally:
+            server_side.close()
+            client_side.close()
+
+        head, body = response.split(b"\r\n\r\n", 1)
+        content_length = int(
+            next(
+                line.split(b":", 1)[1]
+                for line in head.split(b"\r\n")
+                if line.lower().startswith(b"content-length:")
+            )
+        )
+        expected_body = '{"error":"服务器忙，请稍后重试"}'.encode("utf-8")
+        self.assertIn(b" 503 ", head.split(b"\r\n", 1)[0])
+        self.assertEqual(content_length, len(expected_body))
+        self.assertEqual(body, b"")
 
     def test_database_and_secret_are_created_under_configured_data_directory(self):
         with RunningApp() as running:

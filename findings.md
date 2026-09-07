@@ -48,4 +48,5 @@
 - `ThreadingHTTPServer` already supports simultaneous requests, but authentication/session/database operations must be concurrency-safe.
 - Task 6 specification re-review found that callback-level connection timeouts can be converted into a second JSON 500 inside `_dispatch`, even though the outer `_safely` path already treats disconnects as terminal.
 - The pre-handler saturation response is constructed directly in `BoundedThreadingHTTPServer`, so it must apply HEAD body suppression itself rather than relying on `WebApplication._send()`.
+- At `1fea5d7`, saturation treated an empty nonblocking read as a possible HEAD request because `b"HEAD ".startswith(b"")` is true. The corrected rule suppresses the body only after observing a complete `HEAD ` token; empty, partial, and unknown prefixes retain complete JSON framing without delaying admission.
 - Task 6 already owns setup/register/login throttling and the shared scrypt concurrency budget; Task 9 must retain only its remaining admin API, request-ID, logging, and security-extension work.
