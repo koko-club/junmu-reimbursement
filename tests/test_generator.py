@@ -15,7 +15,7 @@ if str(APP_DIR) not in sys.path:
 from generator import generate_workbook
 
 
-TEMPLATE = Path("/Users/koko/Work/3.报销/差旅报销单模版（拷贝备用）_副本.xlsx")
+TEMPLATE = APP_DIR / "resources" / "差旅报销单模板.xlsx"
 
 
 def payload(allowance=50, rows=None):

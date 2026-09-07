@@ -19,7 +19,7 @@ from generator import generate_workbook
 from office import OfficeError, export_pdf, find_soffice
 
 
-TEMPLATE = Path("/Users/koko/Work/3.报销/差旅报销单模版（拷贝备用）_副本.xlsx")
+TEMPLATE = APP_DIR / "resources" / "差旅报销单模板.xlsx"
 BUNDLED_SOFFICE = Path(
     "/Users/koko/.cache/codex-runtimes/codex-primary-runtime/"
     "dependencies/bin/override/soffice"
