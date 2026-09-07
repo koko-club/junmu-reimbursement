@@ -497,7 +497,7 @@ git commit -m "feat: protect web routes with sessions"
 
 Expected: authentication and adapted server tests pass.
 
-Completion note: Task 6 also implements one shared two-operation scrypt concurrency budget, setup/register per-IP rate limits, and login rate limits keyed by normalized username plus client IP. Each limit permits 5 attempts in 15 minutes, returns `Retry-After` when blocked, and successful login clears its key.
+Completion follow-up: Task 6 also implements one shared two-operation scrypt concurrency budget, setup/register per-IP rate limits, and bounded login budgets for canonical account+IP, independent client IP, and a fixed global key. In each 15-minute window, account+IP permits 5 attempts, client IP permits 10, and the global key permits 100. Attacker-controlled login fields are mapped to fixed-length limiter keys, limiter storage is capped at 4096 keys and fails closed when full, and successful login clears only its account+IP key. Request-line plus headers share one absolute monotonic deadline; body reading gets a separate absolute deadline. A deadline-aware raw reader recalculates the remaining budget before every socket read and clears the phase synchronously before the business callback, so later long-running generation work is not covered by parsing deadlines and there is no timer/close race.
 
 ---
 

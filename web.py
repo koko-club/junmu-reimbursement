@@ -13,7 +13,7 @@ import mimetypes
 from pathlib import Path, PurePosixPath
 import threading
 import time
-from typing import Callable, Hashable
+from typing import Callable, Hashable, Iterable
 import unicodedata
 from urllib.parse import unquote, urlsplit
 
@@ -34,6 +34,11 @@ _COOKIE_NAME = "reimbursement_session"
 _COOKIE_MAX_AGE = 7 * 24 * 60 * 60
 RATE_LIMIT_ATTEMPTS = 5
 RATE_LIMIT_WINDOW_SECONDS = 15 * 60
+RATE_LIMIT_MAX_KEYS = 4096
+LOGIN_IP_RATE_LIMIT_ATTEMPTS = 10
+LOGIN_GLOBAL_RATE_LIMIT_ATTEMPTS = 100
+_LOGIN_USERNAME_MAX_CHARS = 50
+_INVALID_LOGIN_USERNAME_KEY = ("invalid", "<invalid>")
 _STATIC_EXTENSIONS = {
     ".css", ".js", ".html", ".ico", ".png", ".jpg", ".jpeg", ".svg", ".webp",
     ".woff", ".woff2", ".ttf",
@@ -58,16 +63,39 @@ class AttemptRateLimiter:
         limit: int = RATE_LIMIT_ATTEMPTS,
         window_seconds: float = RATE_LIMIT_WINDOW_SECONDS,
         clock: Callable[[], float] = time.monotonic,
+        max_keys: int = RATE_LIMIT_MAX_KEYS,
     ):
-        if type(limit) is not int or limit <= 0 or window_seconds <= 0:
+        if (
+            type(limit) is not int
+            or limit <= 0
+            or window_seconds <= 0
+            or type(max_keys) is not int
+            or max_keys <= 0
+        ):
             raise ValueError("rate limit values must be positive")
         self.limit = limit
         self.window_seconds = float(window_seconds)
+        self.max_keys = max_keys
         self._clock = clock
         self._lock = threading.Lock()
         self._attempts: dict[Hashable, list[float]] = {}
 
     def reserve(self, key: Hashable) -> int | None:
+        return self.reserve_many(((key, self.limit),))
+
+    def reserve_many(
+        self, reservations: Iterable[tuple[Hashable, int]]
+    ) -> int | None:
+        limits: dict[Hashable, int] = {}
+        for key, limit in reservations:
+            if type(limit) is not int or limit <= 0:
+                raise ValueError("rate limit values must be positive")
+            prior_limit = limits.setdefault(key, limit)
+            if prior_limit != limit:
+                raise ValueError("one key cannot have multiple limits")
+        if not limits:
+            raise ValueError("at least one rate limit reservation is required")
+
         with self._lock:
             now = self._clock()
             cutoff = now - self.window_seconds
@@ -77,10 +105,29 @@ class AttemptRateLimiter:
                     self._attempts[existing_key] = retained
                 else:
                     del self._attempts[existing_key]
-            timestamps = self._attempts.setdefault(key, [])
-            if len(timestamps) >= self.limit:
-                return max(1, math.ceil(timestamps[0] + self.window_seconds - now))
-            timestamps.append(now)
+
+            retry_after = [
+                max(1, math.ceil(timestamps[0] + self.window_seconds - now))
+                for key, limit in limits.items()
+                if len(timestamps := self._attempts.get(key, [])) >= limit
+            ]
+            if retry_after:
+                return max(retry_after)
+
+            missing_keys = sum(key not in self._attempts for key in limits)
+            if len(self._attempts) + missing_keys > self.max_keys:
+                if not self._attempts:
+                    return max(1, math.ceil(self.window_seconds))
+                return max(
+                    1,
+                    min(
+                        math.ceil(timestamps[0] + self.window_seconds - now)
+                        for timestamps in self._attempts.values()
+                    ),
+                )
+
+            for key in limits:
+                self._attempts.setdefault(key, []).append(now)
             return None
 
     def clear(self, key: Hashable) -> None:
@@ -338,16 +385,21 @@ class WebApplication:
             return
         username = payload.get("username")
         password = payload.get("password")
-        normalized_username = (
-            unicodedata.normalize("NFKC", username).strip().casefold()
-            if isinstance(username, str)
-            else None
+        username_key = self._login_username_key(username)
+        client_ip = self._client_ip(handler)
+        account_limit_key = (
+            "login-account-ip",
+            username_key,
+            client_ip,
         )
-        limit_key = (
-            "login", normalized_username,
-            self._client_ip(handler),
-        )
-        if self._rate_limited(handler, limit_key):
+        if self._rate_limited_many(
+            handler,
+            (
+                (account_limit_key, RATE_LIMIT_ATTEMPTS),
+                (("login-ip", client_ip), LOGIN_IP_RATE_LIMIT_ATTEMPTS),
+                (("login-global",), LOGIN_GLOBAL_RATE_LIMIT_ATTEMPTS),
+            ),
+        ):
             return
         try:
             authenticated_user = self.user_service.authenticate(username, password)
@@ -355,7 +407,7 @@ class WebApplication:
         except (AuthenticationFailed, ValueError):
             self._login_failed(handler)
             return
-        self.rate_limiter.clear(limit_key)
+        self.rate_limiter.clear(account_limit_key)
         self._json(
             handler,
             200,
@@ -469,7 +521,7 @@ class WebApplication:
             self._json(handler, 415, {"error": "仅支持 application/json"})
             return None
         try:
-            body = handler.rfile.read(length)
+            body = handler.read_request_body(length)
         except TimeoutError:
             handler.close_connection = True
             self._json(
@@ -554,6 +606,19 @@ class WebApplication:
 
     def _rate_limited(self, handler: BaseHTTPRequestHandler, key: Hashable) -> bool:
         retry_after = self.rate_limiter.reserve(key)
+        return self._send_rate_limit_if_needed(handler, retry_after)
+
+    def _rate_limited_many(
+        self,
+        handler: BaseHTTPRequestHandler,
+        reservations: Iterable[tuple[Hashable, int]],
+    ) -> bool:
+        retry_after = self.rate_limiter.reserve_many(reservations)
+        return self._send_rate_limit_if_needed(handler, retry_after)
+
+    def _send_rate_limit_if_needed(
+        self, handler: BaseHTTPRequestHandler, retry_after: int | None
+    ) -> bool:
         if retry_after is None:
             return False
         self._json(
@@ -563,6 +628,18 @@ class WebApplication:
             headers={"Retry-After": str(retry_after)},
         )
         return True
+
+    @staticmethod
+    def _login_username_key(username: object) -> tuple[str, str]:
+        if not isinstance(username, str):
+            return _INVALID_LOGIN_USERNAME_KEY
+        stripped = username.strip()
+        if not 3 <= len(stripped) <= _LOGIN_USERNAME_MAX_CHARS:
+            return _INVALID_LOGIN_USERNAME_KEY
+        normalized = unicodedata.normalize("NFKC", stripped).strip().casefold()
+        if not normalized or len(normalized) > _LOGIN_USERNAME_MAX_CHARS:
+            return _INVALID_LOGIN_USERNAME_KEY
+        return ("valid", normalized)
 
     @staticmethod
     def _client_ip(handler: BaseHTTPRequestHandler) -> str:

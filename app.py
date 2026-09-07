@@ -4,9 +4,11 @@ from __future__ import annotations
 
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import io
 from pathlib import Path
 import socket
 import threading
+import time
 
 from config import load_config
 from database import Database
@@ -18,6 +20,53 @@ from web import WebApplication
 
 DEFAULT_REQUEST_IDLE_TIMEOUT_SECONDS = 15.0
 DEFAULT_MAX_CONCURRENT_REQUESTS = 32
+
+
+class _DeadlineSocketReader(io.RawIOBase):
+    """Apply one monotonic deadline across every raw read in a request phase."""
+
+    def __init__(self, connection: socket.socket, timeout_seconds: float):
+        super().__init__()
+        self._connection = connection
+        self._default_timeout = timeout_seconds
+        self._deadline_sequence = 0
+        self._active_deadline: tuple[int, float] | None = None
+
+    def readable(self) -> bool:
+        return True
+
+    def begin_deadline(self) -> int:
+        self._deadline_sequence += 1
+        token = self._deadline_sequence
+        self._active_deadline = (
+            token,
+            time.monotonic() + self._default_timeout,
+        )
+        return token
+
+    def finish_deadline(self, token: int) -> None:
+        if self._active_deadline is None or self._active_deadline[0] != token:
+            return
+        self._active_deadline = None
+        try:
+            self._connection.settimeout(self._default_timeout)
+        except OSError:
+            pass
+
+    def readinto(self, buffer) -> int:
+        if not buffer:
+            return 0
+        timeout = self._default_timeout
+        if self._active_deadline is not None:
+            remaining = self._active_deadline[1] - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("request phase deadline expired")
+            timeout = min(timeout, remaining)
+        self._connection.settimeout(timeout)
+        try:
+            return self._connection.recv_into(buffer)
+        except TimeoutError as error:
+            raise TimeoutError("request phase deadline expired") from error
 
 
 class BoundedThreadingHTTPServer(ThreadingHTTPServer):
@@ -138,12 +187,40 @@ def create_server(config_path: Path) -> ThreadingHTTPServer:
         def setup(self) -> None:
             super().setup()
             self.connection.settimeout(self.server.request_idle_timeout)
+            self.rfile.close()
+            self._deadline_reader = _DeadlineSocketReader(
+                self.connection, self.server.request_idle_timeout
+            )
+            self.rfile = io.BufferedReader(self._deadline_reader)
 
         def handle_one_request(self) -> None:
+            deadline_token = self._deadline_reader.begin_deadline()
+            read_timed_out = False
+            read_failed = False
+            parsed = False
             try:
-                self.raw_requestline = self._read_request_line(65537)
-            except TimeoutError:
+                try:
+                    self.raw_requestline = self._read_request_line(65537)
+                except TimeoutError:
+                    read_timed_out = True
+                except OSError:
+                    read_failed = True
+                if not read_timed_out and not read_failed and self.raw_requestline:
+                    if len(self.raw_requestline) <= 65536:
+                        try:
+                            parsed = self.parse_request()
+                        except TimeoutError:
+                            read_timed_out = True
+                        except OSError:
+                            read_failed = True
+            finally:
+                self._deadline_reader.finish_deadline(deadline_token)
+
+            if read_timed_out:
                 self._request_timed_out()
+                return
+            if read_failed:
+                self.close_connection = True
                 return
             if len(self.raw_requestline) > 65536:
                 self.requestline = ""
@@ -153,11 +230,6 @@ def create_server(config_path: Path) -> ThreadingHTTPServer:
                 return
             if not self.raw_requestline:
                 self.close_connection = True
-                return
-            try:
-                parsed = self.parse_request()
-            except TimeoutError:
-                self._request_timed_out()
                 return
             if not parsed:
                 return
@@ -173,6 +245,13 @@ def create_server(config_path: Path) -> ThreadingHTTPServer:
                 self.wfile.flush()
             except TimeoutError:
                 self.close_connection = True
+
+        def read_request_body(self, length: int) -> bytes:
+            deadline_token = self._deadline_reader.begin_deadline()
+            try:
+                return self.rfile.read(length)
+            finally:
+                self._deadline_reader.finish_deadline(deadline_token)
 
         def _read_request_line(self, limit: int) -> bytes:
             consumed = bytearray()

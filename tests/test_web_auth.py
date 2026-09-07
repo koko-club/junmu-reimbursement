@@ -1,15 +1,19 @@
 from __future__ import annotations
 
+import inspect
 import threading
 import unittest
 from unittest import mock
 
 from tests.http_helpers import RunningApp
+import web
 from web import AttemptRateLimiter
 
 
 ADMIN_PASSWORD = "administrator1"
 USER_PASSWORD = "correct horse battery staple"
+EXPECTED_LOGIN_IP_RATE_LIMIT_ATTEMPTS = 10
+EXPECTED_LOGIN_GLOBAL_RATE_LIMIT_ATTEMPTS = 100
 
 
 class AttemptRateLimiterTest(unittest.TestCase):
@@ -55,6 +59,45 @@ class AttemptRateLimiterTest(unittest.TestCase):
         self.assertFalse(first.is_alive())
         self.assertFalse(second.is_alive())
         self.assertEqual(limiter.reserve("login"), 8)
+
+    def test_multi_key_reservation_is_atomic_across_distinct_limits(self):
+        limiter = AttemptRateLimiter(limit=5, window_seconds=10)
+        reservations = (("account", 1), ("ip", 2), ("global", 3))
+
+        self.assertTrue(hasattr(limiter, "reserve_many"))
+        self.assertIsNone(limiter.reserve_many(reservations))
+        self.assertEqual(limiter.reserve_many(reservations), 10)
+        self.assertEqual(len(limiter._attempts["ip"]), 1)
+        self.assertEqual(len(limiter._attempts["global"]), 1)
+
+    def test_capacity_is_bounded_and_fails_closed_under_concurrency(self):
+        max_keys = 8
+        self.assertEqual(getattr(web, "RATE_LIMIT_MAX_KEYS", None), 4096)
+        self.assertIn("max_keys", inspect.signature(AttemptRateLimiter).parameters)
+        limiter = AttemptRateLimiter(
+            limit=2, window_seconds=10, max_keys=max_keys
+        )
+        start = threading.Barrier(17)
+        results = []
+        results_lock = threading.Lock()
+
+        def reserve(index):
+            start.wait(timeout=1)
+            result = limiter.reserve(("login", index))
+            with results_lock:
+                results.append(result)
+
+        threads = [threading.Thread(target=reserve, args=(index,)) for index in range(16)]
+        for thread in threads:
+            thread.start()
+        start.wait(timeout=1)
+        for thread in threads:
+            thread.join(timeout=1)
+
+        self.assertTrue(all(not thread.is_alive() for thread in threads))
+        self.assertEqual(sum(result is None for result in results), max_keys)
+        self.assertEqual(sum(result is not None for result in results), 16 - max_keys)
+        self.assertEqual(len(limiter._attempts), max_keys)
 
 
 class WebAuthenticationTest(unittest.TestCase):
@@ -309,6 +352,123 @@ class WebAuthenticationTest(unittest.TestCase):
         self.assertGreaterEqual(int(limited.headers["Retry-After"]), 1)
         self.assertEqual(other_key.status, 401)
         self.assertEqual(verify.call_count, 6)
+
+    def test_login_rotating_usernames_is_stopped_by_independent_ip_budget(self):
+        self.assertEqual(
+            getattr(web, "LOGIN_IP_RATE_LIMIT_ATTEMPTS", None),
+            EXPECTED_LOGIN_IP_RATE_LIMIT_ATTEMPTS,
+        )
+        self.setup_admin()
+        token = self.client.csrf_for("/api/login")
+        hasher = self.running.users._password_hasher
+
+        with mock.patch.object(hasher, "verify", wraps=hasher.verify) as verify:
+            statuses = [
+                self.client.post_json(
+                    "/api/login",
+                    {"username": f"missing-{index}", "password": "wrong-password"},
+                    csrf=token,
+                ).status
+                for index in range(12)
+            ]
+
+        self.assertEqual(
+            statuses,
+            [401] * EXPECTED_LOGIN_IP_RATE_LIMIT_ATTEMPTS
+            + [429] * (12 - EXPECTED_LOGIN_IP_RATE_LIMIT_ATTEMPTS),
+        )
+        self.assertEqual(verify.call_count, EXPECTED_LOGIN_IP_RATE_LIMIT_ATTEMPTS)
+
+    def test_login_global_budget_is_shared_across_client_ips(self):
+        self.setup_admin()
+        token = self.client.csrf_for("/api/login")
+        application = self.running.server.application
+        hasher = self.running.users._password_hasher
+
+        with mock.patch("web.LOGIN_GLOBAL_RATE_LIMIT_ATTEMPTS", 3, create=True), mock.patch(
+            "web.LOGIN_IP_RATE_LIMIT_ATTEMPTS", 100, create=True
+        ), mock.patch.object(
+            application,
+            "_client_ip",
+            side_effect=[f"192.0.2.{index}" for index in range(1, 5)],
+        ), mock.patch.object(hasher, "verify", wraps=hasher.verify) as verify:
+            statuses = [
+                self.client.post_json(
+                    "/api/login",
+                    {"username": f"missing-{index}", "password": "wrong-password"},
+                    csrf=token,
+                ).status
+                for index in range(4)
+            ]
+
+        self.assertEqual(statuses, [401, 401, 401, 429])
+        self.assertEqual(verify.call_count, 3)
+
+    def test_invalid_login_usernames_share_one_fixed_short_limiter_sentinel(self):
+        self.setup_admin()
+        token = self.client.csrf_for("/api/login")
+        hasher = self.running.users._password_hasher
+        huge_username = "x" * 900_000
+        expanding_username = "ß" * 50
+
+        with mock.patch.object(hasher, "verify", wraps=hasher.verify) as verify:
+            for username in (None, huge_username, "x" * 51, expanding_username):
+                with self.subTest(username_type=type(username).__name__):
+                    response = self.client.post_json(
+                        "/api/login",
+                        {"username": username, "password": "wrong-password"},
+                        csrf=token,
+                    )
+                    self.assertEqual(response.status, 401)
+
+        login_keys = [
+            key
+            for key in self.running.server.application.rate_limiter._attempts
+            if isinstance(key, tuple) and str(key[0]).startswith("login")
+        ]
+
+        def strings(value):
+            if isinstance(value, str):
+                return [value]
+            if isinstance(value, tuple):
+                return [part for item in value for part in strings(item)]
+            return []
+
+        stored_strings = [part for key in login_keys for part in strings(key)]
+        self.assertLessEqual(max(len(part) for part in stored_strings), 64)
+        account_keys = [key for key in login_keys if key[0] == "login-account-ip"]
+        self.assertEqual(len(account_keys), 1)
+        self.assertEqual(account_keys[0][1], ("invalid", "<invalid>"))
+        self.assertEqual(verify.call_count, 4)
+
+    def test_successful_login_clears_only_account_key_not_ip_or_global_budget(self):
+        self.assertEqual(
+            getattr(web, "LOGIN_GLOBAL_RATE_LIMIT_ATTEMPTS", None),
+            EXPECTED_LOGIN_GLOBAL_RATE_LIMIT_ATTEMPTS,
+        )
+        self.setup_admin()
+        token = self.client.csrf_for("/api/login")
+
+        for _ in range(EXPECTED_LOGIN_IP_RATE_LIMIT_ATTEMPTS):
+            self.assertEqual(
+                self.client.post_json(
+                    "/api/login",
+                    {"username": "admin", "password": ADMIN_PASSWORD},
+                    csrf=token,
+                ).status,
+                200,
+            )
+
+        limited = self.client.post_json(
+            "/api/login",
+            {"username": "admin", "password": ADMIN_PASSWORD},
+            csrf=token,
+        )
+        self.assertEqual(limited.status, 429)
+        self.assertLess(
+            EXPECTED_LOGIN_IP_RATE_LIMIT_ATTEMPTS,
+            EXPECTED_LOGIN_GLOBAL_RATE_LIMIT_ATTEMPTS,
+        )
 
     def test_successful_login_clears_prior_failures_for_its_normalized_key(self):
         self.setup_admin()

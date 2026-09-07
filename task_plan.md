@@ -4,7 +4,7 @@
 在现有差旅报销网页工具基础上增加管理员、普通用户登录、普通用户单会话限制，以及按用户隔离的 Excel/PDF 生成历史。
 
 ## Current Phase
-Task 6 saturation-framing follow-up complete and verified; Task 7 has not started.
+Task 6 absolute-deadline and bounded-login-limiter follow-up complete and verified; Task 7 has not started.
 
 ## Design Checklist
 - [x] Explore current project location and existing architecture
@@ -30,3 +30,5 @@ Task 6 saturation-framing follow-up complete and verified; Task 7 has not starte
 |---|---:|---|
 | Current workspace is empty | 1 | Treat existing project under `其他/reimbursement_form_app_20260903` as source after user confirms copy strategy |
 | Visual companion could not bind inside the sandbox | 1 | Started the approved localhost-only design server outside the sandbox |
+| Confirmed-HEAD test replacement had an indentation error | 1 | Corrected the assertion block and reran focused, HTTP, and full verification before commit |
+| Repeated deadline stress produced one delayed header response and one unframed body response | 1 | Replaced timer plus `SHUT_RD` with a synchronous deadline-aware raw reader; the same 9-test stress sequence passes |

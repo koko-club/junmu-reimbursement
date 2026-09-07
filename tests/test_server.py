@@ -46,6 +46,45 @@ class ServerTest(unittest.TestCase):
         finally:
             sock.close()
 
+    @classmethod
+    def _trickle_exchange(
+        cls,
+        server,
+        initial: bytes,
+        trickle: bytes,
+        *,
+        interval: float = 0.03,
+        duration: float = 0.35,
+    ) -> tuple[bytes, float]:
+        sock = socket.create_connection(server.server_address, timeout=1)
+        stop = threading.Event()
+
+        def send_slowly():
+            deadline = time.monotonic() + duration
+            index = 0
+            while not stop.is_set() and time.monotonic() < deadline:
+                try:
+                    sock.sendall(trickle[index % len(trickle):index % len(trickle) + 1])
+                except OSError:
+                    return
+                index += 1
+                time.sleep(interval)
+
+        try:
+            if initial:
+                sock.sendall(initial)
+            started = time.monotonic()
+            sender = threading.Thread(target=send_slowly)
+            sender.start()
+            try:
+                response = cls._read_socket(sock)
+            finally:
+                stop.set()
+                sender.join(timeout=1)
+            return response, time.monotonic() - started
+        finally:
+            sock.close()
+
     def test_running_app_rolls_back_temporary_directory_when_server_creation_fails(self):
         running = RunningApp()
         with mock.patch(
@@ -138,6 +177,100 @@ class ServerTest(unittest.TestCase):
                         self.assertIn("error", json.loads(body.decode("utf-8")))
                     else:
                         self.assertEqual(body, b"")
+
+    def test_request_line_and_headers_have_one_absolute_deadline(self):
+        with RunningApp() as running:
+            running.server.set_request_limits(timeout_seconds=0.1, max_concurrent_requests=1)
+            cases = (
+                (b"", b"GET /healthz HTTP/1.1\r\n"),
+                (b"GET /healthz HTTP/1.1\r\nX-Slow: ", b"x"),
+            )
+            for initial, trickle in cases:
+                with self.subTest(initial=initial):
+                    response, elapsed = self._trickle_exchange(
+                        running.server, initial, trickle
+                    )
+                    head, body = response.split(b"\r\n\r\n", 1)
+                    self.assertIn(b" 408 ", head.split(b"\r\n", 1)[0])
+                    self.assertIn("error", json.loads(body.decode("utf-8")))
+                    self.assertLess(elapsed, 0.3)
+                    self._wait_for_active(running.server, 0)
+                    self.assertEqual(running.client.get("/healthz").status, 200)
+
+    def test_request_body_has_a_separate_absolute_deadline(self):
+        with RunningApp() as running:
+            running.client.post_json(
+                "/api/setup",
+                {
+                    "username": "admin",
+                    "password": "administrator1",
+                    "real_name": "A",
+                    "department": "D",
+                },
+            )
+            csrf = running.client.csrf_for("/api/login")
+            running.server.set_request_limits(timeout_seconds=0.1, max_concurrent_requests=1)
+            initial = (
+                b"POST /api/login HTTP/1.1\r\n"
+                b"Host: localhost\r\n"
+                b"Content-Type: application/json\r\n"
+                b"Content-Length: 100\r\n"
+                + f"X-CSRF-Token: {csrf}\r\n".encode("ascii")
+                + b"Connection: close\r\n\r\n"
+            )
+
+            response, elapsed = self._trickle_exchange(running.server, initial, b"{")
+
+            head, body = response.split(b"\r\n\r\n", 1)
+            self.assertIn(b" 408 ", head.split(b"\r\n", 1)[0])
+            self.assertIn("error", json.loads(body.decode("utf-8")))
+            self.assertLess(elapsed, 0.3)
+            self._wait_for_active(running.server, 0)
+            self.assertEqual(running.client.get("/healthz").status, 200)
+
+    def test_header_deadline_is_removed_before_business_callback(self):
+        with RunningApp() as running:
+            running.server.set_request_limits(timeout_seconds=0.1, max_concurrent_requests=1)
+            application = running.server.application
+            original_health = application._health
+
+            def slow_health(*args):
+                time.sleep(0.2)
+                original_health(*args)
+
+            with mock.patch.object(application, "_health", side_effect=slow_health):
+                response = running.client.get("/healthz")
+
+            self.assertEqual(response.status, 200)
+
+    def test_body_deadline_is_removed_before_business_callback(self):
+        with RunningApp() as running:
+            running.client.post_json(
+                "/api/setup",
+                {
+                    "username": "admin",
+                    "password": "administrator1",
+                    "real_name": "A",
+                    "department": "D",
+                },
+            )
+            running.server.set_request_limits(timeout_seconds=0.1, max_concurrent_requests=1)
+            users = running.server.application.user_service
+            original_authenticate = users.authenticate
+
+            def slow_authenticate(*args):
+                time.sleep(0.2)
+                return original_authenticate(*args)
+
+            with mock.patch.object(
+                users, "authenticate", side_effect=slow_authenticate
+            ):
+                response = running.client.post_json(
+                    "/api/login",
+                    {"username": "admin", "password": "administrator1"},
+                )
+
+            self.assertEqual(response.status, 200)
 
     def test_request_admission_is_atomic_with_runtime_limit_replacement(self):
         entered_acquire = threading.Event()
