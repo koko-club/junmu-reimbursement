@@ -47,6 +47,44 @@ class DatabaseTest(unittest.TestCase):
         self.assertTrue(versions[0]["applied_at"])
         self.assertEqual(setting["value"], "false")
 
+    def test_v1_schema_matches_storage_contract(self):
+        self.db.migrate()
+
+        with self.db.transaction() as connection:
+            users = {
+                row["name"]: row
+                for row in connection.execute("PRAGMA table_info(users)")
+            }
+            sessions = {
+                row["name"]: row
+                for row in connection.execute("PRAGMA table_info(sessions)")
+            }
+            reimbursements = {
+                row["name"]: row
+                for row in connection.execute("PRAGMA table_info(reimbursements)")
+            }
+            indexes = {
+                row["name"]
+                for row in connection.execute("PRAGMA index_list(reimbursements)")
+            }
+            indexed_columns = [
+                (row["name"], row["desc"])
+                for row in connection.execute("PRAGMA index_xinfo(reimbursements_owner_created)")
+                if row["key"]
+            ]
+
+        self.assertEqual(users["password_hash"]["type"], "BLOB")
+        self.assertEqual(users["password_salt"]["type"], "BLOB")
+        self.assertEqual(users["must_change_password"]["dflt_value"], "0")
+        self.assertEqual(sessions["token_hash"]["type"], "BLOB")
+        self.assertEqual(reimbursements["id"]["type"], "TEXT")
+        self.assertEqual(reimbursements["id"]["pk"], 1)
+        self.assertIn("reimbursements_owner_created", indexes)
+        self.assertEqual(
+            indexed_columns,
+            [("user_id", 0), ("deleted_at", 0), ("created_at", 1)],
+        )
+
     def test_transaction_rolls_back_when_body_raises(self):
         self.db.migrate()
 

@@ -80,7 +80,29 @@ class ConfigContractTest(unittest.TestCase):
         self.assertEqual(config.max_concurrent_generations, 3)
         self.assertTrue(config.cookie_secure)
 
-    def test_port_zero_and_supported_boolean_forms_are_accepted(self):
+    def test_port_zero_is_rejected_without_explicit_opt_in(self):
+        with tempfile.TemporaryDirectory() as name:
+            config_path = self.write_config(Path(name), {
+                "template_path": "template.xlsx",
+                "data_dir": "data",
+                "port": 0,
+            })
+
+            with self.assertRaisesRegex(ValueError, "port"):
+                load_config(config_path)
+
+    def test_environment_port_zero_is_rejected_without_explicit_opt_in(self):
+        with tempfile.TemporaryDirectory() as name:
+            config_path = self.write_config(Path(name), {
+                "template_path": "template.xlsx",
+                "data_dir": "data",
+                "port": 8800,
+            })
+
+            with self.assertRaisesRegex(ValueError, "port"):
+                load_config(config_path, {"APP_PORT": "0"})
+
+    def test_port_zero_and_supported_boolean_forms_are_accepted_with_opt_in(self):
         with tempfile.TemporaryDirectory() as name:
             config_path = self.write_config(Path(name), {
                 "template_path": "template.xlsx",
@@ -88,7 +110,11 @@ class ConfigContractTest(unittest.TestCase):
                 "port": 0,
                 "cookie_secure": "no",
             })
-            config = load_config(config_path, {"APP_COOKIE_SECURE": "1"})
+            config = load_config(
+                config_path,
+                {"APP_COOKIE_SECURE": "1"},
+                allow_ephemeral_port=True,
+            )
 
         self.assertEqual(config.port, 0)
         self.assertTrue(config.cookie_secure)

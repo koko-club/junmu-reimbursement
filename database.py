@@ -14,27 +14,27 @@ _SCHEMA_V1 = (
     id INTEGER PRIMARY KEY,
     username TEXT NOT NULL,
     username_key TEXT NOT NULL UNIQUE,
-    password_hash TEXT NOT NULL,
-    password_salt TEXT NOT NULL,
+    password_hash BLOB NOT NULL,
+    password_salt BLOB NOT NULL,
     password_params TEXT NOT NULL,
     real_name TEXT NOT NULL,
     department TEXT NOT NULL,
     role TEXT NOT NULL CHECK (role IN ('admin', 'user')),
     status TEXT NOT NULL CHECK (status IN ('pending', 'active', 'disabled')),
-    must_change_password INTEGER NOT NULL CHECK (must_change_password IN (0, 1)),
+    must_change_password INTEGER NOT NULL DEFAULT 0 CHECK (must_change_password IN (0, 1)),
     created_at TEXT NOT NULL,
     approved_at TEXT,
     updated_at TEXT NOT NULL
 );""",
     """CREATE TABLE sessions (
-    token_hash TEXT PRIMARY KEY,
+    token_hash BLOB PRIMARY KEY,
     user_id INTEGER NOT NULL UNIQUE REFERENCES users(id) ON DELETE CASCADE,
     csrf_token TEXT NOT NULL,
     created_at TEXT NOT NULL,
     expires_at TEXT NOT NULL
 );""",
     """CREATE TABLE reimbursements (
-    id INTEGER PRIMARY KEY,
+    id TEXT PRIMARY KEY,
     user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
     reimbursement_date TEXT,
     display_name TEXT NOT NULL,
@@ -43,8 +43,8 @@ _SCHEMA_V1 = (
     created_at TEXT NOT NULL,
     deleted_at TEXT
 );""",
-    """CREATE INDEX idx_reimbursements_owner_deleted_created
-    ON reimbursements(user_id, deleted_at, created_at);""",
+    """CREATE INDEX reimbursements_owner_created
+    ON reimbursements(user_id, deleted_at, created_at DESC);""",
     """CREATE TABLE app_settings (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL

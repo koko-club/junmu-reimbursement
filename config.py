@@ -65,7 +65,11 @@ def _boolean(value: object, name: str) -> bool:
     raise ValueError(f"{name} must be a boolean")
 
 
-def load_config(path: Path, environ: Mapping[str, str] | None = None) -> AppConfig:
+def load_config(
+    path: Path,
+    environ: Mapping[str, str] | None = None,
+    allow_ephemeral_port: bool = False,
+) -> AppConfig:
     """Load configuration, resolving relative paths against the JSON file location."""
     config_path = Path(path)
     try:
@@ -92,8 +96,8 @@ def load_config(path: Path, environ: Mapping[str, str] | None = None) -> AppConf
 
     base = config_path.parent
     port = _integer(merged["port"], "port")
-    if not 0 <= port <= 65535:
-        raise ValueError("port must be between 0 and 65535")
+    if not 1 <= port <= 65535 and not (allow_ephemeral_port and port == 0):
+        raise ValueError("port must be between 1 and 65535")
     max_body_bytes = _integer(merged["max_body_bytes"], "max_body_bytes")
     if max_body_bytes <= 0:
         raise ValueError("max_body_bytes must be positive")
