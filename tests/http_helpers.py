@@ -163,6 +163,13 @@ class RunningApp:
             (self.static_dir / "app.js").write_text(
                 "window.appLoaded = true;", encoding="utf-8"
             )
+            project_static = Path(__file__).resolve().parents[1] / "static"
+            for static_name in ("common.js", "history.js", "admin.js", "styles.css"):
+                source = project_static / static_name
+                if source.is_file():
+                    (self.static_dir / static_name).write_text(
+                        source.read_text(encoding="utf-8"), encoding="utf-8"
+                    )
             (self.root / "template.xlsx").write_bytes(b"template")
             self.config_path = self.root / "config.json"
             self.config_path.write_text(
