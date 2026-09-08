@@ -4,7 +4,7 @@
 在现有差旅报销网页工具基础上增加管理员、普通用户登录、普通用户单会话限制，以及按用户隔离的 Excel/PDF 生成历史。
 
 ## Current Phase
-Tasks 1-11 are complete after specification and independent quality approval. Task 13 backup/deployment assets are complete but container verification remains environment-blocked. Tasks 12 and 14 remain pending. User confirmed continuous execution.
+Tasks 1-12 are complete after specification and independent quality approval. Task 13 backup/deployment assets are complete but container verification remains environment-blocked. Task 14 remains pending. User confirmed continuous execution.
 
 ## Task 8 Review Follow-up
 - [x] Implement private history, descriptor-streamed downloads, recycle bin, and daily purge
