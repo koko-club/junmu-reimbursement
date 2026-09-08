@@ -71,6 +71,25 @@ class CloseFailureStream(TrackingStream):
         raise OSError("private close failure")
 
 
+class PartialRuntimeFailureStream(TrackingStream):
+    def read(self, size=-1):
+        if self.tell() >= 65536:
+            self.read_sizes.append(size)
+            raise RuntimeError("private runtime read failure")
+        return super().read(size)
+
+
+class RuntimeCloseFailureStream(TrackingStream):
+    def __init__(self, value: bytes):
+        super().__init__(value)
+        self.close_attempts = 0
+
+    def close(self):
+        self.close_attempts += 1
+        super().close()
+        raise RuntimeError("private runtime close failure")
+
+
 class WebReimbursementTest(unittest.TestCase):
     def setUp(self):
         self.running = RunningApp().__enter__()
@@ -365,6 +384,115 @@ class WebReimbursementTest(unittest.TestCase):
             None,
         )
         stream = CloseFailureStream(b"body")
+        owned = OwnedReimbursementFile(record, "xlsx", "claim.xlsx", 4, stream)
+        application = self.running.server.application
+        headers = Message()
+        headers["Cookie"] = "reimbursement_session=fake"
+        handler = SimpleNamespace(
+            path=f"/api/reimbursements/{record_id}/xlsx",
+            command="GET",
+            headers=headers,
+            client_address=("127.0.0.1", 1),
+            send_response=mock.Mock(),
+            send_header=mock.Mock(),
+            end_headers=mock.Mock(),
+            wfile=mock.Mock(),
+            close_connection=False,
+        )
+        service = mock.Mock()
+        service.owned_file.return_value = owned
+        user = SimpleNamespace(
+            user_id=self.alice_id,
+            role="user",
+            must_change_password=False,
+        )
+
+        with mock.patch.object(
+            application.session_service,
+            "resolve",
+            return_value=user,
+        ), mock.patch.object(
+            application,
+            "reimbursement_service",
+            service,
+        ), self.assertNoLogs("web", level="ERROR"):
+            application.handle_get(handler)
+
+        self.assertEqual(handler.send_response.call_args_list, [mock.call(200)])
+        handler.wfile.write.assert_called_once_with(b"body")
+        self.assertEqual(stream.close_attempts, 1)
+        self.assertTrue(stream.closed)
+        self.assertTrue(handler.close_connection)
+
+    def test_partial_download_runtime_failure_does_not_emit_second_response(self):
+        record_id = "30000000-0000-4000-8000-000000000006"
+        record = ReimbursementRecord(
+            record_id,
+            self.alice_id,
+            None,
+            "claim.xlsx",
+            "poison",
+            "poison",
+            "2026-09-08T00:00:00+00:00",
+            None,
+        )
+        stream = PartialRuntimeFailureStream(b"a" * 65537)
+        owned = OwnedReimbursementFile(record, "xlsx", "claim.xlsx", 65537, stream)
+        application = self.running.server.application
+        headers = Message()
+        headers["Cookie"] = "reimbursement_session=fake"
+        handler = SimpleNamespace(
+            path=f"/api/reimbursements/{record_id}/xlsx",
+            command="GET",
+            headers=headers,
+            client_address=("127.0.0.1", 1),
+            send_response=mock.Mock(),
+            send_header=mock.Mock(),
+            end_headers=mock.Mock(),
+            wfile=mock.Mock(),
+            close_connection=False,
+        )
+        service = mock.Mock()
+        service.owned_file.return_value = owned
+        user = SimpleNamespace(
+            user_id=self.alice_id,
+            role="user",
+            must_change_password=False,
+        )
+
+        with mock.patch.object(
+            application.session_service,
+            "resolve",
+            return_value=user,
+        ), mock.patch.object(
+            application,
+            "reimbursement_service",
+            service,
+        ), self.assertNoLogs("web", level="ERROR"):
+            application.handle_get(handler)
+
+        self.assertEqual(handler.send_response.call_args_list, [mock.call(200)])
+        self.assertEqual(
+            handler.wfile.write.call_args_list,
+            [mock.call(b"a" * 65536)],
+        )
+        self.assertEqual(stream.read_sizes, [65536, 65536])
+        self.assertTrue(stream.closed)
+        self.assertTrue(handler.close_connection)
+
+    def test_download_runtime_close_failure_does_not_emit_second_response(self):
+        record_id = "30000000-0000-4000-8000-000000000007"
+        record = ReimbursementRecord(
+            record_id,
+            self.alice_id,
+            None,
+            "claim.xlsx",
+            "poison",
+            "poison",
+            "2026-09-08T00:00:00+00:00",
+            None,
+        )
+        stream = RuntimeCloseFailureStream(b"body")
         owned = OwnedReimbursementFile(record, "xlsx", "claim.xlsx", 4, stream)
         application = self.running.server.application
         headers = Message()

@@ -192,6 +192,7 @@ class ReimbursementCleanupTest(unittest.TestCase):
         )
         self.assertEqual(len(quarantines), 1)
         self.assertIn(claim, quarantines[0].name)
+        self.assertIn(f"-complete-{claim}-", quarantines[0].name)
         self.assertEqual(list(quarantines[0].iterdir()), [])
         return row, quarantines[0]
 
@@ -295,6 +296,166 @@ class ReimbursementCleanupTest(unittest.TestCase):
 
         self.assertIsNone(self._row(self.record_id))
         self.assertFalse(marker.exists())
+
+    def test_retry_does_not_treat_pre_isolation_empty_marker_as_complete(self):
+        app_secret = b"a" * 32
+        service = ReimbursementService(
+            self.database,
+            self.config,
+            app_secret=app_secret,
+        )
+        record_dir = self._record_directory_with_files()
+        service.trash(self.user_id, self.record_id)
+        real_open = ReimbursementService._open_directory
+        failed_marker_open = False
+
+        def fail_first_marker_open(parent_fd, name):
+            nonlocal failed_marker_open
+            if (
+                not failed_marker_open
+                and name.startswith(f".reimbursement-purge-{self.record_id}-")
+            ):
+                failed_marker_open = True
+                raise OSError("simulated crash after pending marker creation")
+            return real_open(parent_fd, name)
+
+        with mock.patch.object(
+            ReimbursementService,
+            "_open_directory",
+            side_effect=fail_first_marker_open,
+        ), self.assertLogs("reimbursements", level="ERROR"):
+            with self.assertRaises(reimbursements.ReimbursementStorageError):
+                service.purge_one(self.user_id, self.record_id)
+
+        row = self._row(self.record_id)
+        self.assertIsNotNone(row)
+        self.assertRegex(row["purge_claim"], "^[0-9a-f]{64}$")
+        owner_dir = record_dir.parent
+        markers = list(
+            owner_dir.glob(f".reimbursement-purge-{self.record_id}-*")
+        )
+        self.assertTrue(failed_marker_open)
+        self.assertEqual(len(markers), 1)
+        self.assertEqual(list(markers[0].iterdir()), [])
+        self.assertEqual((record_dir / "claim.xlsx").read_bytes(), b"xlsx")
+        self.assertEqual((record_dir / "claim.pdf").read_bytes(), b"pdf")
+
+        restarted = ReimbursementService(
+            self.database,
+            self.config,
+            app_secret=app_secret,
+        )
+        restarted.purge_one(self.user_id, self.record_id)
+
+        self.assertIsNone(self._row(self.record_id))
+        self.assertFalse(record_dir.exists())
+        self.assertFalse(markers[0].exists())
+
+    def test_completion_transition_rejects_replaced_marker_identity(self):
+        service = ReimbursementService(
+            self.database,
+            self.config,
+            app_secret=b"a" * 32,
+        )
+        record_dir = self._record_directory_with_files()
+        service.trash(self.user_id, self.record_id)
+        owner_dir = record_dir.parent
+        detached = self.root / "detached-completion-marker"
+        replacement = self.root / "replacement-completion-marker"
+        replacement.mkdir()
+        replacement_metadata = replacement.stat()
+        real_stat = reimbursements.os.stat
+        completion_stats = 0
+        completion_path = None
+
+        def replace_before_completion_identity_check(path, *args, **kwargs):
+            nonlocal completion_stats, completion_path
+            if (
+                isinstance(path, str)
+                and path.startswith(f".reimbursement-purge-{self.record_id}-")
+                and "-complete-" in path
+            ):
+                completion_stats += 1
+                if completion_stats == 2:
+                    completion_path = owner_dir / path
+                    completion_path.rename(detached)
+                    replacement.rename(completion_path)
+            return real_stat(path, *args, **kwargs)
+
+        with mock.patch(
+            "reimbursements.os.stat",
+            side_effect=replace_before_completion_identity_check,
+        ):
+            with self.assertRaises(reimbursements.ReimbursementStorageError):
+                service.purge_one(self.user_id, self.record_id)
+
+        self.assertEqual(completion_stats, 2)
+        self.assertIsNotNone(completion_path)
+        self.assertFalse(record_dir.exists())
+        self.assertIsNotNone(self._row(self.record_id))
+        self.assertEqual((detached / "entry" / "claim.xlsx").read_bytes(), b"xlsx")
+        self.assertEqual((detached / "entry" / "claim.pdf").read_bytes(), b"pdf")
+        self.assertTrue(
+            os.path.samestat(replacement_metadata, completion_path.stat())
+        )
+
+        with self.assertRaises(reimbursements.ReimbursementStorageError):
+            service.purge_one(self.user_id, self.record_id)
+
+        self.assertIsNotNone(self._row(self.record_id))
+        self.assertTrue(
+            os.path.samestat(replacement_metadata, completion_path.stat())
+        )
+
+    def test_retry_rejects_replaced_empty_pending_when_canonical_disappears(self):
+        app_secret = b"a" * 32
+        first_service = ReimbursementService(
+            self.database,
+            self.config,
+            app_secret=app_secret,
+        )
+        record_dir = self._record_directory_with_files()
+        first_service.trash(self.user_id, self.record_id)
+        with mock.patch.object(
+            first_service,
+            "_resume_purge_at",
+            return_value=None,
+        ):
+            with self.assertRaises(reimbursements.ReimbursementStorageError):
+                first_service.purge_one(self.user_id, self.record_id)
+        owner_dir = record_dir.parent
+        pending_markers = list(
+            owner_dir.glob(f".reimbursement-purge-{self.record_id}-*")
+        )
+        self.assertEqual(len(pending_markers), 1)
+        pending_marker = pending_markers[0]
+        self.assertNotIn("-complete-", pending_marker.name)
+        self.assertEqual(list(pending_marker.iterdir()), [])
+        detached_marker = self.root / "detached-pending-marker"
+        detached_record = self.root / "detached-pending-record"
+        replacement = self.root / "replacement-pending-marker"
+        replacement.mkdir()
+        replacement_metadata = replacement.stat()
+        pending_marker.rename(detached_marker)
+        replacement.rename(pending_marker)
+        record_dir.rename(detached_record)
+
+        restarted_service = ReimbursementService(
+            self.database,
+            self.config,
+            app_secret=app_secret,
+        )
+        with self.assertRaises(reimbursements.ReimbursementStorageError):
+            restarted_service.purge_one(self.user_id, self.record_id)
+
+        self.assertIsNotNone(self._row(self.record_id))
+        self.assertEqual(list(detached_marker.iterdir()), [])
+        self.assertEqual((detached_record / "claim.xlsx").read_bytes(), b"xlsx")
+        self.assertEqual((detached_record / "claim.pdf").read_bytes(), b"pdf")
+        self.assertTrue(pending_marker.exists())
+        self.assertTrue(
+            os.path.samestat(replacement_metadata, pending_marker.stat())
+        )
 
     def test_delete_abort_retains_claim_and_empty_marker_for_restart(self):
         app_secret = b"a" * 32
@@ -506,7 +667,15 @@ class ReimbursementCleanupTest(unittest.TestCase):
 
         self.assertIsNone(self._row(self.record_id))
         owner_dir = self.data_dir / "users" / str(self.user_id)
-        self.assertEqual(list(owner_dir.iterdir()), [])
+        tombstones = list(owner_dir.glob(".reimbursement-cleanup-*"))
+        self.assertEqual(len(tombstones), 2)
+        self.assertTrue(
+            all(
+                candidate.is_dir()
+                for tombstone in tombstones
+                for candidate in tombstone.rglob("*")
+            )
+        )
 
     def test_purge_retains_row_when_record_disappears_after_inode_capture(self):
         record_dir = self.data_dir / "users" / str(self.user_id) / self.record_id
@@ -733,8 +902,10 @@ class ReimbursementCleanupTest(unittest.TestCase):
             with self.database.transaction(immediate=True) as connection:
                 connection.execute("DROP TRIGGER fail_resumed_delete")
 
-        self.assertEqual(list(quarantine.iterdir()), [])
-        self.assertIsNotNone(self._row(self.record_id))
+        _row, completion_marker = self._assert_claimed_empty_marker(
+            self.record_id
+        )
+        self.assertEqual(completion_marker, quarantine)
 
         restarted_service = ReimbursementService(
             self.database,
@@ -746,7 +917,7 @@ class ReimbursementCleanupTest(unittest.TestCase):
         except ReimbursementNotFound:
             self.fail("same-secret retry must complete the empty quarantine")
 
-        self.assertFalse(quarantine.exists())
+        self.assertFalse(completion_marker.exists())
         self.assertIsNone(self._row(self.record_id))
 
     def test_empty_quarantine_with_different_secret_is_retained(self):
@@ -876,6 +1047,275 @@ class ReimbursementCleanupTest(unittest.TestCase):
             )
         )
         self.assertIsNone(self._row(self.record_id))
+
+    def test_completion_cleanup_does_not_remove_post_validation_replacement(self):
+        service = ReimbursementService(
+            self.database,
+            self.config,
+            app_secret=b"a" * 32,
+        )
+        completion_marker = self._create_empty_purge_quarantine(service)
+        completion_metadata = completion_marker.stat()
+        detached_marker = self.root / "detached-final-completion-marker"
+        replacement = self.root / "replacement-final-completion-marker"
+        replacement.mkdir()
+        replacement_metadata = replacement.stat()
+        real_rmdir = reimbursements.os.rmdir
+        replaced = False
+
+        def replace_after_final_validation(path, *args, **kwargs):
+            nonlocal replaced
+            if path == "entry" and not replaced:
+                wrapper_fd = kwargs["dir_fd"]
+                os.rename(
+                    "entry",
+                    detached_marker,
+                    src_dir_fd=wrapper_fd,
+                )
+                os.rename(
+                    replacement,
+                    "entry",
+                    dst_dir_fd=wrapper_fd,
+                )
+                replaced = True
+            return real_rmdir(path, *args, **kwargs)
+
+        with mock.patch(
+            "reimbursements.os.rmdir",
+            side_effect=replace_after_final_validation,
+        ):
+            service.purge_one(self.user_id, self.record_id)
+
+        self.assertFalse(replaced)
+        self.assertFalse(completion_marker.exists())
+        self.assertIsNone(self._row(self.record_id))
+        retained_metadata = [candidate.lstat() for candidate in self.root.rglob("*")]
+        self.assertTrue(
+            any(
+                os.path.samestat(replacement_metadata, metadata)
+                for metadata in retained_metadata
+            )
+        )
+        self.assertTrue(
+            any(
+                os.path.samestat(completion_metadata, metadata)
+                for metadata in retained_metadata
+            )
+        )
+
+    def test_fresh_purge_does_not_rmdir_validated_record_entry(self):
+        service = ReimbursementService(
+            self.database,
+            self.config,
+            app_secret=b"a" * 32,
+        )
+        record_dir = self._record_directory_with_files()
+        record_metadata = record_dir.stat()
+        service.trash(self.user_id, self.record_id)
+        detached_record = self.root / "detached-fresh-record-entry"
+        replacement = self.root / "replacement-fresh-record-entry"
+        replacement.mkdir()
+        replacement_metadata = replacement.stat()
+        real_rmdir = reimbursements.os.rmdir
+        replaced = False
+
+        def replace_before_entry_rmdir(path, *args, **kwargs):
+            nonlocal replaced
+            if path == "entry" and not replaced:
+                marker_fd = kwargs["dir_fd"]
+                os.rename("entry", detached_record, src_dir_fd=marker_fd)
+                os.rename(replacement, "entry", dst_dir_fd=marker_fd)
+                replaced = True
+            return real_rmdir(path, *args, **kwargs)
+
+        with mock.patch(
+            "reimbursements.os.rmdir",
+            side_effect=replace_before_entry_rmdir,
+        ):
+            service.purge_one(self.user_id, self.record_id)
+
+        self.assertFalse(replaced)
+        self.assertIsNone(self._row(self.record_id))
+        retained_metadata = [candidate.lstat() for candidate in self.root.rglob("*")]
+        self.assertTrue(
+            any(
+                os.path.samestat(record_metadata, metadata)
+                for metadata in retained_metadata
+            )
+        )
+        self.assertTrue(
+            any(
+                os.path.samestat(replacement_metadata, metadata)
+                for metadata in retained_metadata
+            )
+        )
+
+    def test_complete_retry_does_not_rmdir_validated_record_entry(self):
+        app_secret = b"a" * 32
+        first_service = ReimbursementService(
+            self.database,
+            self.config,
+            app_secret=app_secret,
+        )
+        completion_marker = self._create_partial_purge(first_service)
+        record_metadata = (completion_marker / "entry").stat()
+        detached_record = self.root / "detached-retried-record-entry"
+        replacement = self.root / "replacement-retried-record-entry"
+        replacement.mkdir()
+        replacement_metadata = replacement.stat()
+        real_rmdir = reimbursements.os.rmdir
+        replaced = False
+
+        def replace_before_entry_rmdir(path, *args, **kwargs):
+            nonlocal replaced
+            if path == "entry" and not replaced:
+                marker_fd = kwargs["dir_fd"]
+                os.rename("entry", detached_record, src_dir_fd=marker_fd)
+                os.rename(replacement, "entry", dst_dir_fd=marker_fd)
+                replaced = True
+            return real_rmdir(path, *args, **kwargs)
+
+        restarted_service = ReimbursementService(
+            self.database,
+            self.config,
+            app_secret=app_secret,
+        )
+        with mock.patch(
+            "reimbursements.os.rmdir",
+            side_effect=replace_before_entry_rmdir,
+        ):
+            restarted_service.purge_one(self.user_id, self.record_id)
+
+        self.assertFalse(replaced)
+        self.assertIsNone(self._row(self.record_id))
+        retained_metadata = [candidate.lstat() for candidate in self.root.rglob("*")]
+        self.assertTrue(
+            any(
+                os.path.samestat(record_metadata, metadata)
+                for metadata in retained_metadata
+            )
+        )
+        self.assertTrue(
+            any(
+                os.path.samestat(replacement_metadata, metadata)
+                for metadata in retained_metadata
+            )
+        )
+
+    def test_complete_retry_rechecks_canonical_absence_after_cleanup(self):
+        app_secret = b"a" * 32
+        first_service = ReimbursementService(
+            self.database,
+            self.config,
+            app_secret=app_secret,
+        )
+        completion_marker = self._create_partial_purge(first_service)
+        marker_identity = first_service._directory_identity(completion_marker.stat())
+        record_dir = completion_marker.parent / self.record_id
+        real_listdir = reimbursements.os.listdir
+        canonical_created = False
+
+        def create_canonical_after_cleanup(path):
+            nonlocal canonical_created
+            entries = real_listdir(path)
+            if (
+                not canonical_created
+                and isinstance(path, int)
+                and first_service._directory_identity(os.fstat(path))
+                == marker_identity
+                and not entries
+            ):
+                record_dir.mkdir()
+                (record_dir / "replacement-sentinel").write_bytes(b"replacement")
+                canonical_created = True
+            return entries
+
+        restarted_service = ReimbursementService(
+            self.database,
+            self.config,
+            app_secret=app_secret,
+        )
+        with mock.patch(
+            "reimbursements.os.listdir",
+            side_effect=create_canonical_after_cleanup,
+        ):
+            with self.assertRaises(reimbursements.ReimbursementStorageError):
+                restarted_service.purge_one(self.user_id, self.record_id)
+
+        self.assertTrue(canonical_created)
+        self.assertIsNotNone(self._row(self.record_id))
+        self.assertEqual(
+            (record_dir / "replacement-sentinel").read_bytes(),
+            b"replacement",
+        )
+
+    def test_successful_purge_retires_data_free_completion_tombstone(self):
+        service = ReimbursementService(
+            self.database,
+            self.config,
+            app_secret=b"a" * 32,
+        )
+        record_dir = self._record_directory_with_files()
+        service.trash(self.user_id, self.record_id)
+
+        service.purge_one(self.user_id, self.record_id)
+
+        owner_dir = record_dir.parent
+        tombstones = list(owner_dir.glob(".reimbursement-cleanup-*"))
+        self.assertEqual(len(tombstones), 2)
+        for tombstone in tombstones:
+            self.assertEqual(
+                [candidate.name for candidate in tombstone.iterdir()],
+                ["entry"],
+            )
+            self.assertTrue(
+                all(candidate.is_dir() for candidate in tombstone.rglob("*"))
+            )
+        self.assertFalse(record_dir.exists())
+        self.assertIsNone(self._row(self.record_id))
+
+    def test_completion_tombstone_does_not_block_reused_record_lifecycle(self):
+        service = ReimbursementService(
+            self.database,
+            self.config,
+            app_secret=b"a" * 32,
+        )
+        first_record_dir = self._record_directory_with_files()
+        service.trash(self.user_id, self.record_id)
+        service.purge_one(self.user_id, self.record_id)
+        owner_dir = first_record_dir.parent
+        first_tombstones = list(owner_dir.glob(".reimbursement-cleanup-*"))
+        self.assertEqual(len(first_tombstones), 2)
+        first_tombstone_metadata = [
+            tombstone.stat() for tombstone in first_tombstones
+        ]
+        reused_record_dir = self._insert_record(
+            self.user_id,
+            self.record_id,
+            created_at="2026-09-08T01:00:00+00:00",
+            deleted_at="2026-09-08T02:00:00+00:00",
+            create_files=True,
+        )
+
+        restored = service.restore(self.user_id, self.record_id)
+        self.assertIsNone(restored.deleted_at)
+        service.trash(self.user_id, self.record_id)
+        service.purge_one(self.user_id, self.record_id)
+
+        self.assertFalse(reused_record_dir.exists())
+        self.assertIsNone(self._row(self.record_id))
+        tombstone_metadata = [
+            candidate.stat()
+            for candidate in owner_dir.glob(".reimbursement-cleanup-*")
+        ]
+        self.assertEqual(len(tombstone_metadata), 4)
+        for first_metadata in first_tombstone_metadata:
+            self.assertTrue(
+                any(
+                    os.path.samestat(first_metadata, metadata)
+                    for metadata in tombstone_metadata
+                )
+            )
 
     def test_wrapper_close_failure_does_not_downgrade_empty_completion(self):
         service = ReimbursementService(
@@ -1137,6 +1577,43 @@ class ReimbursementCleanupTest(unittest.TestCase):
             old_markers,
         )
 
+    def test_restore_ignores_and_retains_old_marker_for_reused_record_id(self):
+        service = ReimbursementService(
+            self.database,
+            self.config,
+            app_secret=b"a" * 32,
+        )
+        self._record_directory_with_files()
+        service.trash(self.user_id, self.record_id)
+        with mock.patch.object(service, "_remove_purge_completion_marker"):
+            service.purge_one(self.user_id, self.record_id)
+
+        owner_dir = self.data_dir / "users" / str(self.user_id)
+        old_markers = list(
+            owner_dir.glob(f".reimbursement-purge-{self.record_id}-*")
+        )
+        self.assertEqual(len(old_markers), 1)
+        old_marker_metadata = old_markers[0].stat()
+        record_dir = self._insert_record(
+            self.user_id,
+            self.record_id,
+            created_at="2026-09-08T01:00:00+00:00",
+            deleted_at="2026-09-08T02:00:00+00:00",
+            create_files=True,
+        )
+
+        restored = service.restore(self.user_id, self.record_id)
+
+        self.assertIsNone(restored.deleted_at)
+        row = self._row(self.record_id)
+        self.assertIsNotNone(row)
+        self.assertIsNone(row["deleted_at"])
+        self.assertIsNone(row["purge_claim"])
+        self.assertEqual((record_dir / "claim.xlsx").read_bytes(), b"xlsx")
+        self.assertEqual((record_dir / "claim.pdf").read_bytes(), b"pdf")
+        self.assertTrue(old_markers[0].exists())
+        self.assertTrue(os.path.samestat(old_marker_metadata, old_markers[0].stat()))
+
     def test_purge_retry_with_different_secret_retains_quarantine_and_row(self):
         first_service = ReimbursementService(
             self.database,
@@ -1242,6 +1719,58 @@ class ReimbursementCleanupTest(unittest.TestCase):
 
         self.assertEqual(parsed, identity)
         compare_digest.assert_called_once()
+
+    def test_purge_completion_name_authenticates_state_and_both_identities(self):
+        service = ReimbursementService(
+            self.database,
+            self.config,
+            app_secret=b"a" * 32,
+        )
+        claim = "c" * 64
+        record_identity = (0xABCDEF, 0x123ABC)
+        marker_identity = (0x456DEF, 0x789ABC)
+
+        name = service._purge_completion_name(
+            self.record_id,
+            claim,
+            record_identity,
+            marker_identity,
+        )
+        parsed = service._purge_completion_identity(
+            name,
+            self.record_id,
+            claim,
+        )
+
+        self.assertEqual(parsed, (record_identity, marker_identity))
+        self.assertIn(f"-{self.record_id}-complete-{claim}-", name)
+        prefix = f".reimbursement-purge-{self.record_id}-"
+        components = name[len(prefix):].split("-")
+        self.assertEqual(len(components), 7)
+        (
+            state,
+            encoded_claim,
+            record_device,
+            record_inode,
+            marker_device,
+            marker_inode,
+            mac,
+        ) = components
+        invalid_names = (
+            name.replace("-complete-", "-pending-", 1),
+            f"{prefix}{state}-{'d' * 64}-{record_device}-{record_inode}-{marker_device}-{marker_inode}-{mac}",
+            f"{prefix}{state}-{encoded_claim}-{record_device}-{record_inode}-{int(marker_device, 16) + 1:x}-{marker_inode}-{mac}",
+            f"{prefix}{state}-{encoded_claim}-{record_device}-{record_inode}-{marker_device}-{marker_inode}-{'0' if mac[0] != '0' else '1'}{mac[1:]}",
+        )
+        for invalid_name in invalid_names:
+            with self.subTest(invalid_name=invalid_name):
+                self.assertIsNone(
+                    service._purge_completion_identity(
+                        invalid_name,
+                        self.record_id,
+                        claim,
+                    )
+                )
 
     def test_restore_rejects_record_retained_after_partial_purge(self):
         owner_dir = self.data_dir / "users" / str(self.user_id)
@@ -1352,20 +1881,25 @@ class ReimbursementCleanupTest(unittest.TestCase):
         orphan.mkdir(parents=True)
         (orphan / "unknown").write_bytes(b"keep")
 
-        real_cleanup = self.service._cleanup_at
+        real_resume = self.service._resume_purge_at
 
-        def fail_one(parent_fd, name, identities, record_id, **kwargs):
+        def fail_one(parent_fd, name, identity, record_id, claim, **kwargs):
             if record_id == failed_id:
-                return False
-            return real_cleanup(
+                return None
+            return real_resume(
                 parent_fd,
                 name,
-                identities,
+                identity,
                 record_id,
+                claim,
                 **kwargs,
             )
 
-        with mock.patch.object(self.service, "_cleanup_at", side_effect=fail_one):
+        with mock.patch.object(
+            self.service,
+            "_resume_purge_at",
+            side_effect=fail_one,
+        ):
             purged = self.service.purge_expired(now=now)
 
         self.assertEqual(purged, 2)

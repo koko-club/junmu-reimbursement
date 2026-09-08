@@ -32,6 +32,8 @@ _TRASH_RETENTION = timedelta(days=30)
 _CLEANUP_ENTRY_NAME = "entry"
 _PURGE_QUARANTINE_PREFIX = ".reimbursement-purge-"
 _PURGE_QUARANTINE_AUTH_PURPOSE = b"reimbursement-purge-quarantine:v2"
+_PURGE_COMPLETION_STATE = "complete"
+_PURGE_COMPLETION_AUTH_PURPOSE = b"reimbursement-purge-completion:v1"
 _PURGE_SERIALIZER = threading.Lock()
 _DIRECTORY_OPEN_FLAGS = (
     os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
@@ -369,8 +371,6 @@ class ReimbursementService:
         if row is None or row["purge_claim"] is not None:
             raise ReimbursementNotFound("报销记录不存在")
         record = self._record_from_row(row)
-        if self._purge_quarantine_present(record):
-            raise ReimbursementNotFound("报销记录不存在")
         with self.owned_file(
             user_id,
             record_id,
@@ -672,28 +672,39 @@ class ReimbursementService:
             descriptors.append(users_fd)
             owner_fd = self._open_directory(users_fd, str(record.user_id))
             descriptors.append(owner_fd)
-            quarantines = [
-                (name, identity)
+            purge_markers = [
+                (name, marker)
                 for name in os.listdir(owner_fd)
                 if (
-                    identity := self._purge_quarantine_identity(
+                    marker := self._purge_marker_identity(
                         name,
                         record.id,
                         purge_claim,
                     )
                 ) is not None
             ]
-            if len(quarantines) > 1:
+            if len(purge_markers) > 1:
                 raise ValueError("ambiguous reimbursement purge quarantine")
-            if quarantines:
-                quarantine_name, identity = quarantines[0]
-                completed = self._resume_purge_at(
+            if purge_markers:
+                marker_name, marker = purge_markers[0]
+                state, identity, marker_identity = marker
+                if state == _PURGE_COMPLETION_STATE:
+                    assert marker_identity is not None
+                    completed = self._verified_purge_completion_at(
+                        owner_fd,
+                        marker_name,
+                        identity,
+                        marker_identity,
+                        record.id,
+                    )
+                    return marker_name if completed else None
+                return self._resume_purge_at(
                     owner_fd,
-                    quarantine_name,
+                    marker_name,
                     identity,
                     record.id,
+                    purge_claim,
                 )
-                return quarantine_name if completed else None
             record_fd = self._open_directory(owner_fd, record.id)
             descriptors.append(record_fd)
             identity = self._directory_identity(os.fstat(record_fd))
@@ -702,15 +713,18 @@ class ReimbursementService:
                 purge_claim,
                 identity,
             )
-            completed = self._cleanup_at(
+            quarantine_fd = self._create_named_quarantine_directory(
                 owner_fd,
-                record.id,
-                {identity},
-                record.id,
-                quarantine_name=quarantine_name,
-                retain_quarantine=True,
+                quarantine_name,
             )
-            return quarantine_name if completed else None
+            return self._resume_purge_at(
+                owner_fd,
+                quarantine_name,
+                identity,
+                record.id,
+                purge_claim,
+                quarantine_fd=quarantine_fd,
+            )
         except Exception as error:
             _LOGGER.error(
                 "reimbursement purge filesystem check failed record_id=%s exception=%s",
@@ -734,15 +748,14 @@ class ReimbursementService:
         descriptors: list[int] = []
         quarantine_fd: int | None = None
         try:
-            if (
-                self._purge_quarantine_identity(
-                    quarantine_name,
-                    record.id,
-                    purge_claim,
-                )
-                is None
-            ):
+            completion = self._purge_completion_identity(
+                quarantine_name,
+                record.id,
+                purge_claim,
+            )
+            if completion is None:
                 return
+            _record_identity, expected_marker_identity = completion
             data_fd = os.open(
                 Path(self._config.data_dir).resolve(),
                 _DIRECTORY_OPEN_FLAGS,
@@ -758,11 +771,14 @@ class ReimbursementService:
                 follow_symlinks=False,
             )
             quarantine_fd = self._open_directory(owner_fd, quarantine_name)
+            opened_metadata = os.fstat(quarantine_fd)
             if (
                 not os.path.samestat(
                     quarantine_metadata,
-                    os.fstat(quarantine_fd),
+                    opened_metadata,
                 )
+                or self._directory_identity(opened_metadata)
+                != expected_marker_identity
                 or os.listdir(quarantine_fd)
             ):
                 return
@@ -786,26 +802,6 @@ class ReimbursementService:
                     os.close(descriptor)
                 except OSError:
                     pass
-            for descriptor in reversed(descriptors):
-                try:
-                    os.close(descriptor)
-                except OSError:
-                    pass
-
-    def _purge_quarantine_present(self, record: ReimbursementRecord) -> bool:
-        descriptors: list[int] = []
-        try:
-            data_fd = os.open(Path(self._config.data_dir).resolve(), _DIRECTORY_OPEN_FLAGS)
-            descriptors.append(data_fd)
-            users_fd = self._open_directory(data_fd, "users")
-            descriptors.append(users_fd)
-            owner_fd = self._open_directory(users_fd, str(record.user_id))
-            descriptors.append(owner_fd)
-            prefix = f"{_PURGE_QUARANTINE_PREFIX}{record.id}-"
-            return any(name.startswith(prefix) for name in os.listdir(owner_fd))
-        except Exception:
-            return True
-        finally:
             for descriptor in reversed(descriptors):
                 try:
                     os.close(descriptor)
@@ -877,6 +873,133 @@ class ReimbursementService:
             return None
         return values[0], values[1]
 
+    def _purge_marker_identity(
+        self,
+        name: str,
+        record_id: str,
+        purge_claim: str,
+    ) -> tuple[str, tuple[int, int], tuple[int, int] | None] | None:
+        pending_identity = self._purge_quarantine_identity(
+            name,
+            record_id,
+            purge_claim,
+        )
+        if pending_identity is not None:
+            return "pending", pending_identity, None
+        completion = self._purge_completion_identity(
+            name,
+            record_id,
+            purge_claim,
+        )
+        if completion is None:
+            return None
+        record_identity, marker_identity = completion
+        return _PURGE_COMPLETION_STATE, record_identity, marker_identity
+
+    def _purge_completion_name(
+        self,
+        record_id: str,
+        purge_claim: str,
+        record_identity: tuple[int, int],
+        marker_identity: tuple[int, int],
+    ) -> str:
+        if not self._valid_purge_claim(purge_claim):
+            raise ValueError("invalid reimbursement purge claim")
+        record_device, record_inode = record_identity
+        marker_device, marker_inode = marker_identity
+        components = tuple(
+            f"{value:x}"
+            for value in (
+                record_device,
+                record_inode,
+                marker_device,
+                marker_inode,
+            )
+        )
+        mac = self._purge_completion_mac(
+            record_id,
+            purge_claim,
+            *components,
+        )
+        return (
+            f"{_PURGE_QUARANTINE_PREFIX}{record_id}-"
+            f"{_PURGE_COMPLETION_STATE}-{purge_claim}-"
+            f"{'-'.join(components)}-{mac}"
+        )
+
+    def _purge_completion_identity(
+        self,
+        name: str,
+        record_id: str,
+        purge_claim: str,
+    ) -> tuple[tuple[int, int], tuple[int, int]] | None:
+        if not self._valid_purge_claim(purge_claim):
+            return None
+        prefix = f"{_PURGE_QUARANTINE_PREFIX}{record_id}-"
+        if not isinstance(name, str) or not name.startswith(prefix):
+            return None
+        components = name[len(prefix):].split("-")
+        if (
+            len(components) != 7
+            or components[0] != _PURGE_COMPLETION_STATE
+            or components[1] != purge_claim
+        ):
+            return None
+        values = []
+        for component in components[2:6]:
+            if (
+                not component
+                or any(character not in "0123456789abcdef" for character in component)
+            ):
+                return None
+            value = int(component, 16)
+            if f"{value:x}" != component:
+                return None
+            values.append(value)
+        supplied_mac = components[6]
+        if (
+            len(supplied_mac) != hashlib.sha256().digest_size * 2
+            or any(
+                character not in "0123456789abcdef" for character in supplied_mac
+            )
+        ):
+            return None
+        expected_mac = self._purge_completion_mac(
+            record_id,
+            purge_claim,
+            *components[2:6],
+        )
+        if not hmac.compare_digest(supplied_mac, expected_mac):
+            return None
+        return (values[0], values[1]), (values[2], values[3])
+
+    def _purge_completion_mac(
+        self,
+        record_id: str,
+        purge_claim: str,
+        record_device_hex: str,
+        record_inode_hex: str,
+        marker_device_hex: str,
+        marker_inode_hex: str,
+    ) -> str:
+        message = b"\0".join(
+            (
+                _PURGE_COMPLETION_AUTH_PURPOSE,
+                _PURGE_COMPLETION_STATE.encode("ascii"),
+                record_id.encode("ascii"),
+                purge_claim.encode("ascii"),
+                record_device_hex.encode("ascii"),
+                record_inode_hex.encode("ascii"),
+                marker_device_hex.encode("ascii"),
+                marker_inode_hex.encode("ascii"),
+            )
+        )
+        return hmac.new(
+            self._quarantine_auth_key,
+            message,
+            hashlib.sha256,
+        ).hexdigest()
+
     def _purge_quarantine_mac(
         self,
         record_id: str,
@@ -899,14 +1022,214 @@ class ReimbursementService:
             hashlib.sha256,
         ).hexdigest()
 
+    def _transition_purge_completion_at(
+        self,
+        owner_fd: int,
+        pending_name: str,
+        expected_metadata: os.stat_result,
+        pending_fd: int,
+        record_id: str,
+        purge_claim: str,
+        record_identity: tuple[int, int],
+        *,
+        expected_entries: tuple[str, ...] = (),
+    ) -> str | None:
+        opened_metadata = os.fstat(pending_fd)
+        if (
+            not os.path.samestat(expected_metadata, opened_metadata)
+            or tuple(os.listdir(pending_fd)) != expected_entries
+        ):
+            return None
+        marker_identity = self._directory_identity(opened_metadata)
+        completion_name = self._purge_completion_name(
+            record_id,
+            purge_claim,
+            record_identity,
+            marker_identity,
+        )
+        try:
+            os.stat(
+                completion_name,
+                dir_fd=owner_fd,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            pass
+        else:
+            return None
+        current_metadata = os.stat(
+            pending_name,
+            dir_fd=owner_fd,
+            follow_symlinks=False,
+        )
+        if (
+            not os.path.samestat(expected_metadata, current_metadata)
+            or not os.path.samestat(current_metadata, opened_metadata)
+        ):
+            return None
+        os.rename(
+            pending_name,
+            completion_name,
+            src_dir_fd=owner_fd,
+            dst_dir_fd=owner_fd,
+        )
+        completion_metadata = os.stat(
+            completion_name,
+            dir_fd=owner_fd,
+            follow_symlinks=False,
+        )
+        if (
+            not os.path.samestat(opened_metadata, completion_metadata)
+            or self._directory_identity(completion_metadata) != marker_identity
+        ):
+            return None
+        return completion_name
+
+    def _verified_purge_completion_at(
+        self,
+        owner_fd: int,
+        completion_name: str,
+        expected_record_identity: tuple[int, int],
+        expected_marker_identity: tuple[int, int],
+        record_id: str,
+    ) -> bool:
+        completion_fd: int | None = None
+        record_fd: int | None = None
+        filesystem_complete = False
+        try:
+            completion_metadata = os.stat(
+                completion_name,
+                dir_fd=owner_fd,
+                follow_symlinks=False,
+            )
+            completion_fd = self._open_directory(owner_fd, completion_name)
+            opened_metadata = os.fstat(completion_fd)
+            if (
+                not os.path.samestat(completion_metadata, opened_metadata)
+                or self._directory_identity(opened_metadata)
+                != expected_marker_identity
+            ):
+                return False
+            try:
+                os.stat(
+                    record_id,
+                    dir_fd=owner_fd,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                pass
+            else:
+                return False
+            completion_entries = os.listdir(completion_fd)
+            if not completion_entries:
+                filesystem_complete = True
+                try:
+                    os.stat(
+                        record_id,
+                        dir_fd=owner_fd,
+                        follow_symlinks=False,
+                    )
+                except FileNotFoundError:
+                    return True
+                return False
+            if completion_entries != [_CLEANUP_ENTRY_NAME]:
+                return False
+            record_metadata = os.stat(
+                _CLEANUP_ENTRY_NAME,
+                dir_fd=completion_fd,
+                follow_symlinks=False,
+            )
+            record_fd = self._open_directory(
+                completion_fd,
+                _CLEANUP_ENTRY_NAME,
+            )
+            opened_record_metadata = os.fstat(record_fd)
+            if (
+                not os.path.samestat(record_metadata, opened_record_metadata)
+                or self._directory_identity(opened_record_metadata)
+                != expected_record_identity
+            ):
+                return False
+            if self._remove_tree is not None:
+                self._remove_tree(
+                    _CLEANUP_ENTRY_NAME,
+                    dir_fd=completion_fd,
+                    root_fd=record_fd,
+                )
+            self._remove_directory_contents(record_fd, retain_directories=True)
+            final_record_metadata = os.stat(
+                _CLEANUP_ENTRY_NAME,
+                dir_fd=completion_fd,
+                follow_symlinks=False,
+            )
+            if not os.path.samestat(
+                opened_record_metadata,
+                final_record_metadata,
+            ):
+                return False
+            if not self._retire_data_free_directory_at(
+                completion_fd,
+                _CLEANUP_ENTRY_NAME,
+                final_record_metadata,
+                record_fd,
+                owner_fd,
+            ):
+                return False
+            filesystem_complete = True
+            current_completion = os.stat(
+                completion_name,
+                dir_fd=owner_fd,
+                follow_symlinks=False,
+            )
+            if (
+                not os.path.samestat(opened_metadata, current_completion)
+                or os.listdir(completion_fd)
+            ):
+                return False
+            try:
+                os.stat(
+                    record_id,
+                    dir_fd=owner_fd,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                return True
+            return False
+        except Exception as cleanup_error:
+            _LOGGER.error(
+                "reimbursement cleanup failed record_id=%s exception=%s",
+                record_id,
+                type(cleanup_error).__name__,
+            )
+            return False
+        finally:
+            if record_fd is not None:
+                if filesystem_complete:
+                    try:
+                        os.close(record_fd)
+                    except OSError:
+                        pass
+                else:
+                    os.close(record_fd)
+            if completion_fd is not None:
+                if filesystem_complete:
+                    try:
+                        os.close(completion_fd)
+                    except OSError:
+                        pass
+                else:
+                    os.close(completion_fd)
+
     def _resume_purge_at(
         self,
         owner_fd: int,
         quarantine_name: str,
         expected_identity: tuple[int, int],
         record_id: str,
-    ) -> bool:
-        quarantine_fd: int | None = None
+        purge_claim: str,
+        *,
+        quarantine_fd: int | None = None,
+    ) -> str | None:
         record_fd: int | None = None
         filesystem_complete = False
         try:
@@ -915,51 +1238,125 @@ class ReimbursementService:
                 dir_fd=owner_fd,
                 follow_symlinks=False,
             )
-            quarantine_fd = self._open_directory(owner_fd, quarantine_name)
+            if quarantine_fd is None:
+                quarantine_fd = self._open_directory(owner_fd, quarantine_name)
             if not os.path.samestat(quarantine_metadata, os.fstat(quarantine_fd)):
-                return False
+                return None
             quarantine_entries = os.listdir(quarantine_fd)
             if not quarantine_entries:
-                filesystem_complete = True
-                return True
-            if quarantine_entries != [_CLEANUP_ENTRY_NAME]:
-                return False
-            record_metadata = os.stat(
-                _CLEANUP_ENTRY_NAME,
-                dir_fd=quarantine_fd,
-                follow_symlinks=False,
+                try:
+                    record_metadata = os.stat(
+                        record_id,
+                        dir_fd=owner_fd,
+                        follow_symlinks=False,
+                    )
+                except FileNotFoundError:
+                    return None
+                record_fd = self._open_directory(owner_fd, record_id)
+                opened_metadata = os.fstat(record_fd)
+                if (
+                    not os.path.samestat(record_metadata, opened_metadata)
+                    or self._directory_identity(opened_metadata)
+                    != expected_identity
+                ):
+                    return None
+                os.rename(
+                    record_id,
+                    _CLEANUP_ENTRY_NAME,
+                    src_dir_fd=owner_fd,
+                    dst_dir_fd=quarantine_fd,
+                )
+                isolated_metadata = os.stat(
+                    _CLEANUP_ENTRY_NAME,
+                    dir_fd=quarantine_fd,
+                    follow_symlinks=False,
+                )
+                if (
+                    not os.path.samestat(record_metadata, isolated_metadata)
+                    or not os.path.samestat(opened_metadata, isolated_metadata)
+                ):
+                    return None
+            elif quarantine_entries == [_CLEANUP_ENTRY_NAME]:
+                record_metadata = os.stat(
+                    _CLEANUP_ENTRY_NAME,
+                    dir_fd=quarantine_fd,
+                    follow_symlinks=False,
+                )
+                record_fd = self._open_directory(
+                    quarantine_fd,
+                    _CLEANUP_ENTRY_NAME,
+                )
+                opened_metadata = os.fstat(record_fd)
+                if (
+                    not os.path.samestat(record_metadata, opened_metadata)
+                    or self._directory_identity(opened_metadata)
+                    != expected_identity
+                ):
+                    return None
+            else:
+                return None
+            completion_name = self._transition_purge_completion_at(
+                owner_fd,
+                quarantine_name,
+                quarantine_metadata,
+                quarantine_fd,
+                record_id,
+                purge_claim,
+                expected_identity,
+                expected_entries=(_CLEANUP_ENTRY_NAME,),
             )
-            record_fd = self._open_directory(quarantine_fd, _CLEANUP_ENTRY_NAME)
-            opened_metadata = os.fstat(record_fd)
-            if (
-                not os.path.samestat(record_metadata, opened_metadata)
-                or self._directory_identity(opened_metadata) != expected_identity
-            ):
-                return False
+            if completion_name is None:
+                return None
             if self._remove_tree is not None:
                 self._remove_tree(
                     _CLEANUP_ENTRY_NAME,
                     dir_fd=quarantine_fd,
                     root_fd=record_fd,
                 )
-            self._remove_directory_contents(record_fd)
+            self._remove_directory_contents(record_fd, retain_directories=True)
             final_metadata = os.stat(
                 _CLEANUP_ENTRY_NAME,
                 dir_fd=quarantine_fd,
                 follow_symlinks=False,
             )
             if not os.path.samestat(opened_metadata, final_metadata):
-                return False
-            os.rmdir(_CLEANUP_ENTRY_NAME, dir_fd=quarantine_fd)
+                return None
+            if not self._retire_data_free_directory_at(
+                quarantine_fd,
+                _CLEANUP_ENTRY_NAME,
+                final_metadata,
+                record_fd,
+                owner_fd,
+            ):
+                return None
             filesystem_complete = True
-            return True
+            completion_metadata = os.stat(
+                completion_name,
+                dir_fd=owner_fd,
+                follow_symlinks=False,
+            )
+            if (
+                not os.path.samestat(quarantine_metadata, completion_metadata)
+                or not os.path.samestat(completion_metadata, os.fstat(quarantine_fd))
+                or os.listdir(quarantine_fd)
+            ):
+                return None
+            try:
+                os.stat(
+                    record_id,
+                    dir_fd=owner_fd,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                return completion_name
+            return None
         except Exception as cleanup_error:
             _LOGGER.error(
                 "reimbursement cleanup failed record_id=%s exception=%s",
                 record_id,
                 type(cleanup_error).__name__,
             )
-            return False
+            return None
         finally:
             if record_fd is not None:
                 descriptor = record_fd
@@ -982,6 +1379,50 @@ class ReimbursementService:
                 else:
                     os.close(descriptor)
 
+    def _retire_data_free_directory_at(
+        self,
+        source_parent_fd: int,
+        name: str,
+        expected_metadata: os.stat_result,
+        directory_fd: int,
+        tombstone_parent_fd: int,
+    ) -> bool:
+        tombstone_fd: int | None = None
+        retired = False
+        try:
+            if not self._directory_tree_is_data_free(directory_fd):
+                return False
+            _tombstone_name, tombstone_fd, matches = self._isolate_entry(
+                source_parent_fd,
+                name,
+                expected_metadata,
+                quarantine_parent_fd=tombstone_parent_fd,
+            )
+            if not matches:
+                return False
+            isolated_metadata = os.stat(
+                _CLEANUP_ENTRY_NAME,
+                dir_fd=tombstone_fd,
+                follow_symlinks=False,
+            )
+            if (
+                not os.path.samestat(expected_metadata, isolated_metadata)
+                or not os.path.samestat(isolated_metadata, os.fstat(directory_fd))
+                or not self._directory_tree_is_data_free(directory_fd)
+            ):
+                return False
+            retired = True
+            return True
+        finally:
+            if tombstone_fd is not None:
+                if retired:
+                    try:
+                        os.close(tombstone_fd)
+                    except OSError:
+                        pass
+                else:
+                    os.close(tombstone_fd)
+
     def _complete_empty_purge_at(
         self,
         owner_fd: int,
@@ -989,9 +1430,9 @@ class ReimbursementService:
         expected_metadata: os.stat_result,
         quarantine_fd: int,
     ) -> bool:
-        completion_name: str | None = None
+        tombstone_name: str | None = None
         completion_fd: int | None = None
-        authenticated_directory_removed = False
+        authenticated_directory_isolated = False
         try:
             current_metadata = os.stat(
                 quarantine_name,
@@ -1004,7 +1445,7 @@ class ReimbursementService:
                 or os.listdir(quarantine_fd)
             ):
                 return False
-            completion_name, completion_fd, matches = self._isolate_entry(
+            tombstone_name, completion_fd, matches = self._isolate_entry(
                 owner_fd,
                 quarantine_name,
                 current_metadata,
@@ -1022,33 +1463,15 @@ class ReimbursementService:
                 or os.listdir(quarantine_fd)
             ):
                 return False
-            os.rmdir(_CLEANUP_ENTRY_NAME, dir_fd=completion_fd)
-            authenticated_directory_removed = True
-
-            # The authenticated empty directory is gone; wrapper cleanup is ancillary.
-            try:
-                wrapper_metadata = os.fstat(completion_fd)
-                current_wrapper = os.stat(
-                    completion_name,
-                    dir_fd=owner_fd,
-                    follow_symlinks=False,
-                )
-                if (
-                    not os.listdir(completion_fd)
-                    and os.path.samestat(wrapper_metadata, current_wrapper)
-                ):
-                    descriptor = completion_fd
-                    completion_fd = None
-                    os.close(descriptor)
-                    os.rmdir(completion_name, dir_fd=owner_fd)
-            except OSError:
-                pass
+            # Portable POSIX has no directory unlink-by-fd. Keep the empty,
+            # private tombstone instead of reopening a replacement race.
+            authenticated_directory_isolated = True
             return True
         finally:
             if completion_fd is not None:
                 descriptor = completion_fd
                 completion_fd = None
-                if authenticated_directory_removed:
+                if authenticated_directory_isolated:
                     try:
                         os.close(descriptor)
                     except OSError:
@@ -1440,7 +1863,12 @@ class ReimbursementService:
                     os.close(descriptor)
 
     @classmethod
-    def _remove_directory_contents(cls, directory_fd: int) -> None:
+    def _remove_directory_contents(
+        cls,
+        directory_fd: int,
+        *,
+        retain_directories: bool = False,
+    ) -> None:
         for name in os.listdir(directory_fd):
             child_fd: int | None = None
             quarantine_fd: int | None = None
@@ -1461,12 +1889,19 @@ class ReimbursementService:
                     os.unlink(_CLEANUP_ENTRY_NAME, dir_fd=quarantine_fd)
                     os.close(quarantine_fd)
                     quarantine_fd = None
-                    os.rmdir(quarantine_name, dir_fd=directory_fd)
+                    if not retain_directories:
+                        os.rmdir(quarantine_name, dir_fd=directory_fd)
                     continue
 
                 child_fd = cls._open_directory(directory_fd, name)
                 child_metadata = os.fstat(child_fd)
                 if not os.path.samestat(metadata, child_metadata):
+                    continue
+                if retain_directories:
+                    cls._remove_directory_contents(
+                        child_fd,
+                        retain_directories=True,
+                    )
                     continue
                 quarantine_name, quarantine_fd, matches = cls._isolate_entry(
                     directory_fd,
@@ -1489,6 +1924,30 @@ class ReimbursementService:
                     os.close(child_fd)
 
     @classmethod
+    def _directory_tree_is_data_free(cls, directory_fd: int) -> bool:
+        for name in os.listdir(directory_fd):
+            child_fd: int | None = None
+            try:
+                metadata = os.stat(
+                    name,
+                    dir_fd=directory_fd,
+                    follow_symlinks=False,
+                )
+                if not stat.S_ISDIR(metadata.st_mode):
+                    return False
+                child_fd = cls._open_directory(directory_fd, name)
+                if not os.path.samestat(metadata, os.fstat(child_fd)):
+                    return False
+                if not cls._directory_tree_is_data_free(child_fd):
+                    return False
+            except FileNotFoundError:
+                return False
+            finally:
+                if child_fd is not None:
+                    os.close(child_fd)
+        return True
+
+    @classmethod
     def _isolate_entry(
         cls,
         parent_fd: int,
@@ -1496,12 +1955,18 @@ class ReimbursementService:
         expected_metadata: os.stat_result,
         *,
         quarantine_name: str | None = None,
+        quarantine_parent_fd: int | None = None,
     ) -> tuple[str, int, bool]:
+        destination_parent_fd = (
+            parent_fd if quarantine_parent_fd is None else quarantine_parent_fd
+        )
         if quarantine_name is None:
-            quarantine_name, quarantine_fd = cls._create_quarantine_directory(parent_fd)
+            quarantine_name, quarantine_fd = cls._create_quarantine_directory(
+                destination_parent_fd
+            )
         else:
             quarantine_fd = cls._create_named_quarantine_directory(
-                parent_fd,
+                destination_parent_fd,
                 quarantine_name,
             )
         renamed = False
@@ -1527,7 +1992,7 @@ class ReimbursementService:
             os.close(quarantine_fd)
             if not renamed:
                 try:
-                    os.rmdir(quarantine_name, dir_fd=parent_fd)
+                    os.rmdir(quarantine_name, dir_fd=destination_parent_fd)
                 except OSError:
                     pass
             raise

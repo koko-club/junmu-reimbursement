@@ -599,7 +599,7 @@ class WebApplication:
                     if not chunk:
                         break
                     handler.wfile.write(chunk)
-        except OSError:
+        except Exception:
             if response_started:
                 handler.close_connection = True
                 return
