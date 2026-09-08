@@ -28,6 +28,7 @@ from reimbursements import (
     ReimbursementNotFound,
     ReimbursementRecord,
     ReimbursementService,
+    ReimbursementStorageError,
 )
 from security import AnonymousCsrfSigner
 from sessions import AuthenticatedUser, SessionService
@@ -174,6 +175,9 @@ class WebApplication:
         self.anonymous_csrf = anonymous_csrf
         self.reimbursement_service = reimbursement_service
         self.rate_limiter = rate_limiter or AttemptRateLimiter()
+        self._upload_slots = threading.BoundedSemaphore(
+            config.max_concurrent_generations
+        )
         self.get_routes = {
             "/healthz": Route("_health", setup="any"),
             "/setup": Route("_setup_page", setup="incomplete"),
@@ -341,9 +345,15 @@ class WebApplication:
         parts = path[len(_REIMBURSEMENT_PREFIX):].split("/")
         if len(parts) != 2 or not all(parts):
             return None
-        if method == "GET":
+        try:
+            record_uuid = UUID(parts[0])
+        except ValueError:
+            return None
+        if record_uuid.version != 4 or str(record_uuid) != parts[0]:
+            return None
+        if method == "GET" and parts[1] in {"xlsx", "pdf"}:
             return Route("_reimbursement_download", authentication=True)
-        if parts[1] in {"trash", "restore", "purge"}:
+        if method == "POST" and parts[1] in {"trash", "restore", "purge"}:
             return Route(
                 "_reimbursement_lifecycle", authentication=True, roles=("user",),
                 csrf="session",
@@ -564,28 +574,36 @@ class WebApplication:
         except ReimbursementNotFound:
             self._record_not_found(handler)
             return
-        with owned_file as owned:
-            content_types = {
-                "xlsx": _XLSX_CONTENT_TYPE,
-                "pdf": "application/pdf",
-            }
-            dispositions = {"xlsx": "attachment", "pdf": "inline"}
-            handler.send_response(200)
-            handler.send_header("Content-Type", content_types[owned.kind])
-            handler.send_header("Content-Length", str(owned.size))
-            handler.send_header("X-Content-Type-Options", "nosniff")
-            handler.send_header("Cache-Control", "no-store")
-            handler.send_header(
-                "Content-Disposition",
-                f"{dispositions[owned.kind]}; filename*=UTF-8''"
-                + quote(owned.display_name, safe=""),
-            )
-            handler.end_headers()
-            while True:
-                chunk = owned.stream.read(65536)
-                if not chunk:
-                    break
-                handler.wfile.write(chunk)
+        response_started = False
+        try:
+            with owned_file as owned:
+                content_types = {
+                    "xlsx": _XLSX_CONTENT_TYPE,
+                    "pdf": "application/pdf",
+                }
+                dispositions = {"xlsx": "attachment", "pdf": "inline"}
+                response_started = True
+                handler.send_response(200)
+                handler.send_header("Content-Type", content_types[owned.kind])
+                handler.send_header("Content-Length", str(owned.size))
+                handler.send_header("X-Content-Type-Options", "nosniff")
+                handler.send_header("Cache-Control", "no-store")
+                handler.send_header(
+                    "Content-Disposition",
+                    f"{dispositions[owned.kind]}; filename*=UTF-8''"
+                    + quote(owned.display_name, safe=""),
+                )
+                handler.end_headers()
+                while True:
+                    chunk = owned.stream.read(65536)
+                    if not chunk:
+                        break
+                    handler.wfile.write(chunk)
+        except OSError:
+            if response_started:
+                handler.close_connection = True
+                return
+            raise
 
     def _reimbursement_lifecycle(self, handler, user, _token) -> None:
         assert user is not None
@@ -620,9 +638,19 @@ class WebApplication:
                 self._json(handler, 200, {"message": "报销记录已永久删除"})
         except ReimbursementNotFound:
             self._record_not_found(handler)
+        except ReimbursementStorageError:
+            self._json(
+                handler,
+                503,
+                {"error": "报销记录暂时无法删除，请稍后重试"},
+            )
 
     def _reimbursement_generate(self, handler, user, _token) -> None:
         assert user is not None
+        with self._upload_slots:
+            self._reimbursement_generate_admitted(handler, user)
+
+    def _reimbursement_generate_admitted(self, handler, user) -> None:
         body = self._multipart_body(handler)
         if body is None:
             return

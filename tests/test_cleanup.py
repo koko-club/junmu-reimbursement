@@ -1,12 +1,16 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 import hmac
+import inspect
 import json
 import os
+import sqlite3
 import tempfile
 from pathlib import Path
 import threading
+import time
 import unittest
 from unittest import mock
 
@@ -112,6 +116,13 @@ class ReimbursementCleanupTest(unittest.TestCase):
                 "SELECT * FROM reimbursements WHERE id = ?", (record_id,)
             ).fetchone()
 
+    def _record_directory_with_files(self) -> Path:
+        record_dir = self.data_dir / "users" / str(self.user_id) / self.record_id
+        record_dir.mkdir(parents=True)
+        (record_dir / "claim.xlsx").write_bytes(b"xlsx")
+        (record_dir / "claim.pdf").write_bytes(b"pdf")
+        return record_dir
+
     def _create_partial_purge(self, service: ReimbursementService) -> Path:
         owner_dir = self.data_dir / "users" / str(self.user_id)
         record_dir = owner_dir / self.record_id
@@ -126,7 +137,7 @@ class ReimbursementCleanupTest(unittest.TestCase):
             "_remove_tree",
             side_effect=OSError("forced partial purge"),
         ), self.assertLogs("reimbursements", level="ERROR"):
-            with self.assertRaises(ReimbursementNotFound):
+            with self.assertRaises(reimbursements.ReimbursementStorageError):
                 service.purge_one(self.user_id, self.record_id)
 
         quarantines = list(
@@ -145,35 +156,44 @@ class ReimbursementCleanupTest(unittest.TestCase):
         (record_dir / "claim.xlsx").write_bytes(b"xlsx")
         (record_dir / "claim.pdf").write_bytes(b"pdf")
         service.trash(self.user_id, self.record_id)
-        real_rmdir = reimbursements.os.rmdir
-        failed_outer_rmdir = False
-
-        def fail_outer_quarantine_once(path, *args, **kwargs):
-            nonlocal failed_outer_rmdir
-            if (
-                not failed_outer_rmdir
-                and isinstance(path, str)
-                and path.startswith(f".reimbursement-purge-{self.record_id}-")
-            ):
-                failed_outer_rmdir = True
-                raise OSError("forced final quarantine rmdir failure")
-            return real_rmdir(path, *args, **kwargs)
-
-        with mock.patch(
-            "reimbursements.os.rmdir",
-            side_effect=fail_outer_quarantine_once,
-        ), self.assertLogs("reimbursements", level="ERROR"):
-            with self.assertRaises(ReimbursementNotFound):
+        with self.database.transaction(immediate=True) as connection:
+            connection.execute(
+                f"""CREATE TRIGGER fail_empty_marker_delete
+                BEFORE DELETE ON reimbursements
+                WHEN OLD.id = '{self.record_id}'
+                BEGIN
+                    SELECT RAISE(ABORT, 'retain empty marker');
+                END"""
+            )
+        try:
+            with self.assertRaises(reimbursements.ReimbursementStorageError):
                 service.purge_one(self.user_id, self.record_id)
+        finally:
+            with self.database.transaction(immediate=True) as connection:
+                connection.execute("DROP TRIGGER fail_empty_marker_delete")
 
         quarantines = list(
             owner_dir.glob(f".reimbursement-purge-{self.record_id}-*")
         )
-        self.assertTrue(failed_outer_rmdir)
         self.assertEqual(len(quarantines), 1)
         self.assertEqual(list(quarantines[0].iterdir()), [])
         self.assertIsNotNone(self._row(self.record_id))
         return quarantines[0]
+
+    def _assert_claimed_empty_marker(self, record_id: str):
+        row = self._row(record_id)
+        self.assertIsNotNone(row)
+        claim = row["purge_claim"]
+        self.assertIsInstance(claim, str)
+        self.assertRegex(claim, "^[0-9a-f]{64}$")
+        owner_dir = self.data_dir / "users" / str(row["user_id"])
+        quarantines = list(
+            owner_dir.glob(f".reimbursement-purge-{record_id}-*")
+        )
+        self.assertEqual(len(quarantines), 1)
+        self.assertIn(claim, quarantines[0].name)
+        self.assertEqual(list(quarantines[0].iterdir()), [])
+        return row, quarantines[0]
 
     def test_owner_can_trash_active_record_at_supplied_time(self):
         deleted_at = datetime(2026, 9, 8, 12, tzinfo=timezone.utc)
@@ -233,6 +253,192 @@ class ReimbursementCleanupTest(unittest.TestCase):
         self.assertEqual(sentinel.read_bytes(), b"keep")
         self.assertIsNotNone(self._row(self.record_id))
 
+    def test_crash_before_delete_transaction_is_restartable_from_empty_marker(self):
+        app_secret = b"a" * 32
+        service = ReimbursementService(
+            self.database,
+            self.config,
+            app_secret=app_secret,
+        )
+        record_dir = self._record_directory_with_files()
+        service.trash(self.user_id, self.record_id)
+        real_transaction = self.database.transaction
+        transaction_count = 0
+
+        @contextmanager
+        def crash_before_second_transaction(*, immediate=False):
+            nonlocal transaction_count
+            transaction_count += 1
+            if transaction_count == 2:
+                raise SystemExit("simulated process crash")
+            with real_transaction(immediate=immediate) as connection:
+                yield connection
+
+        with mock.patch.object(
+            self.database,
+            "transaction",
+            new=crash_before_second_transaction,
+        ), self.assertRaisesRegex(SystemExit, "simulated process crash"):
+            service.purge_one(self.user_id, self.record_id)
+
+        _row, marker = self._assert_claimed_empty_marker(self.record_id)
+        self.assertFalse(record_dir.exists())
+        with self.assertRaises(ReimbursementNotFound):
+            service.restore(self.user_id, self.record_id)
+
+        restarted = ReimbursementService(
+            self.database,
+            self.config,
+            app_secret=app_secret,
+        )
+        restarted.purge_one(self.user_id, self.record_id)
+
+        self.assertIsNone(self._row(self.record_id))
+        self.assertFalse(marker.exists())
+
+    def test_delete_abort_retains_claim_and_empty_marker_for_restart(self):
+        app_secret = b"a" * 32
+        service = ReimbursementService(
+            self.database,
+            self.config,
+            app_secret=app_secret,
+        )
+        record_dir = self._record_directory_with_files()
+        service.trash(self.user_id, self.record_id)
+        with self.database.transaction(immediate=True) as connection:
+            connection.execute(
+                f"""CREATE TRIGGER fail_reimbursement_delete
+                BEFORE DELETE ON reimbursements
+                WHEN OLD.id = '{self.record_id}'
+                BEGIN
+                    SELECT RAISE(ABORT, 'forced delete abort');
+                END"""
+            )
+
+        with self.assertRaisesRegex(
+            reimbursements.ReimbursementStorageError,
+            "^报销记录暂时无法删除，请稍后重试$",
+        ):
+            service.purge_one(self.user_id, self.record_id)
+
+        _row, marker = self._assert_claimed_empty_marker(self.record_id)
+        self.assertFalse(record_dir.exists())
+        with self.database.transaction(immediate=True) as connection:
+            connection.execute("DROP TRIGGER fail_reimbursement_delete")
+
+        restarted = ReimbursementService(
+            self.database,
+            self.config,
+            app_secret=app_secret,
+        )
+        restarted.purge_one(self.user_id, self.record_id)
+
+        self.assertIsNone(self._row(self.record_id))
+        self.assertFalse(marker.exists())
+
+    def test_delete_commit_failure_retains_claim_and_empty_marker_for_retry(self):
+        app_secret = b"a" * 32
+        service = ReimbursementService(
+            self.database,
+            self.config,
+            app_secret=app_secret,
+        )
+        record_dir = self._record_directory_with_files()
+        service.trash(self.user_id, self.record_id)
+        transaction_count = 0
+
+        @contextmanager
+        def fail_second_commit(*, immediate=False):
+            nonlocal transaction_count
+            transaction_count += 1
+            connection = self.database.connect()
+            try:
+                connection.execute("BEGIN IMMEDIATE" if immediate else "BEGIN")
+                yield connection
+            except Exception:
+                connection.rollback()
+                raise
+            else:
+                if transaction_count == 2:
+                    connection.rollback()
+                    raise sqlite3.OperationalError("forced delete commit failure")
+                connection.commit()
+            finally:
+                connection.close()
+
+        with mock.patch.object(
+            self.database,
+            "transaction",
+            new=fail_second_commit,
+        ), self.assertRaises(reimbursements.ReimbursementStorageError):
+            service.purge_one(self.user_id, self.record_id)
+
+        _row, marker = self._assert_claimed_empty_marker(self.record_id)
+        self.assertFalse(record_dir.exists())
+
+        service.purge_one(self.user_id, self.record_id)
+
+        self.assertIsNone(self._row(self.record_id))
+        self.assertFalse(marker.exists())
+
+    def test_recursive_purge_does_not_hold_sqlite_writer_lock(self):
+        service = ReimbursementService(
+            self.database,
+            self.config,
+            app_secret=b"a" * 32,
+        )
+        self._record_directory_with_files()
+        service.trash(self.user_id, self.record_id)
+        removal_started = threading.Event()
+        allow_removal = threading.Event()
+        writer_done = threading.Event()
+        purge_errors = []
+        writer_errors = []
+
+        def block_recursive_removal(_name, **_kwargs):
+            removal_started.set()
+            if not allow_removal.wait(timeout=2):
+                raise TimeoutError("test did not release recursive removal")
+
+        service._remove_tree = block_recursive_removal
+
+        def purge():
+            try:
+                service.purge_one(self.user_id, self.record_id)
+            except BaseException as error:
+                purge_errors.append(error)
+
+        def write_unrelated_setting():
+            try:
+                with self.database.transaction(immediate=True) as connection:
+                    connection.execute(
+                        "INSERT INTO app_settings(key, value) VALUES ('during_purge', 'ok')"
+                    )
+            except BaseException as error:
+                writer_errors.append(error)
+            finally:
+                writer_done.set()
+
+        purge_thread = threading.Thread(target=purge)
+        writer_thread = threading.Thread(target=write_unrelated_setting)
+        purge_thread.start()
+        self.assertTrue(removal_started.wait(timeout=1))
+        writer_thread.start()
+        try:
+            self.assertTrue(
+                writer_done.wait(timeout=0.25),
+                "recursive filesystem deletion held the SQLite writer lock",
+            )
+        finally:
+            allow_removal.set()
+            purge_thread.join(timeout=2)
+            writer_thread.join(timeout=2)
+
+        self.assertFalse(purge_thread.is_alive())
+        self.assertFalse(writer_thread.is_alive())
+        self.assertEqual(purge_errors, [])
+        self.assertEqual(writer_errors, [])
+
     def test_filesystem_removal_failure_retains_database_row_for_retry(self):
         record_dir = self.data_dir / "users" / str(self.user_id) / self.record_id
         record_dir.mkdir(parents=True)
@@ -249,8 +455,13 @@ class ReimbursementCleanupTest(unittest.TestCase):
             self.config,
             remove_tree=fail_removal,
         )
+        storage_error = getattr(reimbursements, "ReimbursementStorageError", None)
+        self.assertIsNotNone(storage_error)
         with self.assertLogs("reimbursements", level="ERROR") as captured:
-            with self.assertRaises(ReimbursementNotFound):
+            with self.assertRaisesRegex(
+                storage_error,
+                "^报销记录暂时无法删除，请稍后重试$",
+            ):
                 service.purge_one(self.user_id, self.record_id)
 
         self.assertIsNotNone(self._row(self.record_id))
@@ -285,7 +496,7 @@ class ReimbursementCleanupTest(unittest.TestCase):
         with self.assertLogs("reimbursements", level="ERROR"), mock.patch(
             "reimbursements.os.unlink", side_effect=fail_second_entry_once
         ):
-            with self.assertRaises(ReimbursementNotFound):
+            with self.assertRaises(reimbursements.ReimbursementStorageError):
                 self.service.purge_one(self.user_id, self.record_id)
 
         self.assertEqual(unlink_count, 2)
@@ -323,7 +534,7 @@ class ReimbursementCleanupTest(unittest.TestCase):
             "_directory_identity",
             side_effect=detach_after_first_identity,
         ):
-            with self.assertRaises(ReimbursementNotFound):
+            with self.assertRaises(reimbursements.ReimbursementStorageError):
                 self.service.purge_one(self.user_id, self.record_id)
 
         self.assertEqual(identity_checks, 1)
@@ -363,7 +574,7 @@ class ReimbursementCleanupTest(unittest.TestCase):
             "_directory_identity",
             side_effect=replace_after_second_identity,
         ):
-            with self.assertRaises(ReimbursementNotFound):
+            with self.assertRaises(reimbursements.ReimbursementStorageError):
                 self.service.purge_one(self.user_id, self.record_id)
 
         self.assertEqual(identity_checks, 2)
@@ -396,7 +607,7 @@ class ReimbursementCleanupTest(unittest.TestCase):
         replacement_sentinel.write_bytes(b"replacement")
         self.service.trash(self.user_id, self.record_id)
 
-        with self.assertRaises(ReimbursementNotFound):
+        with self.assertRaises(reimbursements.ReimbursementStorageError):
             self.service.purge_one(self.user_id, self.record_id)
 
         self.assertEqual((detached / original_sentinel.name).read_bytes(), b"original")
@@ -418,7 +629,7 @@ class ReimbursementCleanupTest(unittest.TestCase):
             "_remove_tree",
             side_effect=OSError("forced partial purge"),
         ), self.assertLogs("reimbursements", level="ERROR"):
-            with self.assertRaises(ReimbursementNotFound):
+            with self.assertRaises(reimbursements.ReimbursementStorageError):
                 self.service.purge_one(self.user_id, self.record_id)
 
         legitimate = list(
@@ -439,7 +650,7 @@ class ReimbursementCleanupTest(unittest.TestCase):
         )
         forged_staging.rename(forged)
 
-        with self.assertRaises(ReimbursementNotFound):
+        with self.assertRaises(reimbursements.ReimbursementStorageError):
             self.service.purge_one(self.user_id, self.record_id)
 
         self.assertEqual(
@@ -506,24 +717,22 @@ class ReimbursementCleanupTest(unittest.TestCase):
             self.config,
             app_secret=app_secret,
         )
-        real_rmdir = reimbursements.os.rmdir
-        failed_outer_rmdir = False
-
-        def fail_outer_quarantine_once(path, *args, **kwargs):
-            nonlocal failed_outer_rmdir
-            if path == quarantine.name and not failed_outer_rmdir:
-                failed_outer_rmdir = True
-                raise OSError("forced resumed quarantine rmdir failure")
-            return real_rmdir(path, *args, **kwargs)
-
-        with mock.patch(
-            "reimbursements.os.rmdir",
-            side_effect=fail_outer_quarantine_once,
-        ), self.assertLogs("reimbursements", level="ERROR"):
-            with self.assertRaises(ReimbursementNotFound):
+        with self.database.transaction(immediate=True) as connection:
+            connection.execute(
+                f"""CREATE TRIGGER fail_resumed_delete
+                BEFORE DELETE ON reimbursements
+                WHEN OLD.id = '{self.record_id}'
+                BEGIN
+                    SELECT RAISE(ABORT, 'retain resumed empty marker');
+                END"""
+            )
+        try:
+            with self.assertRaises(reimbursements.ReimbursementStorageError):
                 resumed_service.purge_one(self.user_id, self.record_id)
+        finally:
+            with self.database.transaction(immediate=True) as connection:
+                connection.execute("DROP TRIGGER fail_resumed_delete")
 
-        self.assertTrue(failed_outer_rmdir)
         self.assertEqual(list(quarantine.iterdir()), [])
         self.assertIsNotNone(self._row(self.record_id))
 
@@ -553,7 +762,7 @@ class ReimbursementCleanupTest(unittest.TestCase):
             app_secret=b"b" * 32,
         )
 
-        with self.assertRaises(ReimbursementNotFound):
+        with self.assertRaises(reimbursements.ReimbursementStorageError):
             different_service.purge_one(self.user_id, self.record_id)
 
         self.assertEqual(list(quarantine.iterdir()), [])
@@ -568,7 +777,7 @@ class ReimbursementCleanupTest(unittest.TestCase):
             restarted_service = ReimbursementService(self.database, self.config)
         quarantine = self._create_empty_purge_quarantine(first_service)
 
-        with self.assertRaises(ReimbursementNotFound):
+        with self.assertRaises(reimbursements.ReimbursementStorageError):
             restarted_service.purge_one(self.user_id, self.record_id)
 
         self.assertEqual(list(quarantine.iterdir()), [])
@@ -581,15 +790,27 @@ class ReimbursementCleanupTest(unittest.TestCase):
             app_secret=b"a" * 32,
         )
         service.trash(self.user_id, self.record_id)
+        claim = "c" * 64
+        with self.database.transaction(immediate=True) as connection:
+            connection.execute(
+                "UPDATE reimbursements SET purge_claim = ? WHERE id = ?",
+                (claim, self.record_id),
+            )
         owner_dir = self.data_dir / "users" / str(self.user_id)
         owner_dir.mkdir(parents=True)
-        valid_name = service._purge_quarantine_name(self.record_id, (1, 2))
+        valid_name = service._purge_quarantine_name(
+            self.record_id,
+            claim,
+            (1, 2),
+        )
         prefix = f".reimbursement-purge-{self.record_id}-"
-        device, inode, mac = valid_name[len(prefix):].split("-")
-        forged = owner_dir / f"{prefix}{int(device, 16) + 1:x}-{inode}-{mac}"
+        encoded_claim, device, inode, mac = valid_name[len(prefix):].split("-")
+        forged = owner_dir / (
+            f"{prefix}{encoded_claim}-{int(device, 16) + 1:x}-{inode}-{mac}"
+        )
         forged.mkdir()
 
-        with self.assertRaises(ReimbursementNotFound):
+        with self.assertRaises(reimbursements.ReimbursementStorageError):
             service.purge_one(self.user_id, self.record_id)
 
         self.assertEqual(list(forged.iterdir()), [])
@@ -605,7 +826,7 @@ class ReimbursementCleanupTest(unittest.TestCase):
         unknown = quarantine / "unknown"
         unknown.write_bytes(b"keep")
 
-        with self.assertRaises(ReimbursementNotFound):
+        with self.assertRaises(reimbursements.ReimbursementStorageError):
             service.purge_one(self.user_id, self.record_id)
 
         self.assertEqual(unknown.read_bytes(), b"keep")
@@ -640,8 +861,7 @@ class ReimbursementCleanupTest(unittest.TestCase):
             "reimbursements.os.stat",
             side_effect=replace_after_final_identity_check,
         ):
-            with self.assertRaises(ReimbursementNotFound):
-                service.purge_one(self.user_id, self.record_id)
+            service.purge_one(self.user_id, self.record_id)
 
         self.assertEqual(quarantine_stats, 2)
         self.assertTrue(os.path.samestat(original_metadata, detached.stat()))
@@ -655,7 +875,7 @@ class ReimbursementCleanupTest(unittest.TestCase):
                 for metadata in retained_metadata
             )
         )
-        self.assertIsNotNone(self._row(self.record_id))
+        self.assertIsNone(self._row(self.record_id))
 
     def test_wrapper_close_failure_does_not_downgrade_empty_completion(self):
         service = ReimbursementService(
@@ -719,6 +939,204 @@ class ReimbursementCleanupTest(unittest.TestCase):
             (False, False, 1, False, False),
         )
 
+    def test_fresh_purge_close_failure_after_entry_removal_is_attempted_once(self):
+        service = ReimbursementService(
+            self.database,
+            self.config,
+            app_secret=b"a" * 32,
+        )
+        record_dir = self._record_directory_with_files()
+        service.trash(self.user_id, self.record_id)
+        real_create = ReimbursementService._create_named_quarantine_directory
+        real_close = reimbursements.os.close
+        quarantine_fd = None
+        close_attempts = 0
+
+        def capture_quarantine(parent_fd, name):
+            nonlocal quarantine_fd
+            descriptor = real_create(parent_fd, name)
+            if name.startswith(f".reimbursement-purge-{self.record_id}-"):
+                quarantine_fd = descriptor
+            return descriptor
+
+        def fail_quarantine_close(descriptor):
+            nonlocal close_attempts
+            if descriptor == quarantine_fd:
+                close_attempts += 1
+                self.assertEqual(reimbursements.os.listdir(descriptor), [])
+                raise OSError("forced persistent fresh quarantine close failure")
+            return real_close(descriptor)
+
+        try:
+            with mock.patch.object(
+                ReimbursementService,
+                "_create_named_quarantine_directory",
+                side_effect=capture_quarantine,
+            ), mock.patch(
+                "reimbursements.os.close",
+                side_effect=fail_quarantine_close,
+            ):
+                service.purge_one(self.user_id, self.record_id)
+        finally:
+            if quarantine_fd is not None:
+                real_close(quarantine_fd)
+
+        self.assertEqual(close_attempts, 1)
+        self.assertFalse(record_dir.exists())
+        self.assertIsNone(self._row(self.record_id))
+
+    def test_resumed_empty_close_failure_is_attempted_once(self):
+        service = ReimbursementService(
+            self.database,
+            self.config,
+            app_secret=b"a" * 32,
+        )
+        marker = self._create_empty_purge_quarantine(service)
+        real_open = ReimbursementService._open_directory
+        real_close = reimbursements.os.close
+        marker_fd = None
+        close_attempts = 0
+
+        def capture_marker(parent_fd, name):
+            nonlocal marker_fd
+            descriptor = real_open(parent_fd, name)
+            if name == marker.name and marker_fd is None:
+                marker_fd = descriptor
+            return descriptor
+
+        def fail_marker_close(descriptor):
+            nonlocal close_attempts
+            if descriptor == marker_fd:
+                close_attempts += 1
+                self.assertEqual(reimbursements.os.listdir(descriptor), [])
+                raise OSError("forced persistent resumed marker close failure")
+            return real_close(descriptor)
+
+        try:
+            with mock.patch.object(
+                ReimbursementService,
+                "_open_directory",
+                side_effect=capture_marker,
+            ), mock.patch(
+                "reimbursements.os.close",
+                side_effect=fail_marker_close,
+            ):
+                service.purge_one(self.user_id, self.record_id)
+        finally:
+            if marker_fd is not None:
+                real_close(marker_fd)
+
+        self.assertEqual(close_attempts, 1)
+        self.assertFalse(marker.exists())
+        self.assertIsNone(self._row(self.record_id))
+
+    def test_same_record_purge_workers_are_serialized_across_services(self):
+        first = ReimbursementService(
+            self.database,
+            self.config,
+            app_secret=b"a" * 32,
+        )
+        second = ReimbursementService(
+            self.database,
+            self.config,
+            app_secret=b"a" * 32,
+        )
+        self._record_directory_with_files()
+        first.trash(self.user_id, self.record_id)
+        removal_started = threading.Event()
+        allow_removal = threading.Event()
+        second_attempting = threading.Event()
+        second_entered = threading.Event()
+        results = []
+
+        def block_removal(_name, **_kwargs):
+            removal_started.set()
+            if not allow_removal.wait(timeout=2):
+                raise TimeoutError("test did not release purge")
+
+        first._remove_tree = block_removal
+        real_second = second._purge_one_serialized
+
+        def observe_second(*args, **kwargs):
+            second_entered.set()
+            return real_second(*args, **kwargs)
+
+        second._purge_one_serialized = observe_second
+
+        def purge(service, label):
+            try:
+                service.purge_one(self.user_id, self.record_id)
+            except ReimbursementNotFound:
+                results.append((label, "not-found"))
+            else:
+                results.append((label, "purged"))
+
+        first_thread = threading.Thread(target=purge, args=(first, "first"))
+
+        def purge_second():
+            second_attempting.set()
+            purge(second, "second")
+
+        second_thread = threading.Thread(target=purge_second)
+        first_thread.start()
+        self.assertTrue(removal_started.wait(timeout=1))
+        second_thread.start()
+        self.assertTrue(second_attempting.wait(timeout=1))
+        try:
+            self.assertFalse(second_entered.wait(timeout=0.1))
+        finally:
+            allow_removal.set()
+            first_thread.join(timeout=2)
+            second_thread.join(timeout=2)
+
+        self.assertFalse(first_thread.is_alive())
+        self.assertFalse(second_thread.is_alive())
+        self.assertEqual(
+            sorted(results),
+            [("first", "purged"), ("second", "not-found")],
+        )
+
+    def test_post_commit_marker_is_not_adopted_by_reused_record_id(self):
+        service = ReimbursementService(
+            self.database,
+            self.config,
+            app_secret=b"a" * 32,
+        )
+        self._record_directory_with_files()
+        service.trash(self.user_id, self.record_id)
+
+        with mock.patch(
+            "reimbursements.secrets.token_hex",
+            side_effect=("1" * 64, "2" * 64),
+        ):
+            with mock.patch.object(
+                service,
+                "_remove_purge_completion_marker",
+            ):
+                service.purge_one(self.user_id, self.record_id)
+            owner_dir = self.data_dir / "users" / str(self.user_id)
+            old_markers = list(
+                owner_dir.glob(f".reimbursement-purge-{self.record_id}-*")
+            )
+            self.assertEqual(len(old_markers), 1)
+            self.assertIn("1" * 64, old_markers[0].name)
+
+            self._insert_record(
+                self.user_id,
+                self.record_id,
+                created_at="2026-09-08T01:00:00+00:00",
+                deleted_at="2026-09-08T02:00:00+00:00",
+                create_files=True,
+            )
+            service.purge_one(self.user_id, self.record_id)
+
+        self.assertTrue(old_markers[0].exists())
+        self.assertIsNone(self._row(self.record_id))
+        self.assertEqual(
+            list(owner_dir.glob(f".reimbursement-purge-{self.record_id}-*")),
+            old_markers,
+        )
+
     def test_purge_retry_with_different_secret_retains_quarantine_and_row(self):
         first_service = ReimbursementService(
             self.database,
@@ -732,7 +1150,7 @@ class ReimbursementCleanupTest(unittest.TestCase):
             self.config,
             app_secret=b"b" * 32,
         )
-        with self.assertRaises(ReimbursementNotFound):
+        with self.assertRaises(reimbursements.ReimbursementStorageError):
             restarted_service.purge_one(self.user_id, self.record_id)
 
         self.assertEqual(
@@ -750,7 +1168,7 @@ class ReimbursementCleanupTest(unittest.TestCase):
             quarantine = self._create_partial_purge(first_service)
             restarted_service = ReimbursementService(self.database, self.config)
 
-        with self.assertRaises(ReimbursementNotFound):
+        with self.assertRaises(reimbursements.ReimbursementStorageError):
             restarted_service.purge_one(self.user_id, self.record_id)
 
         self.assertEqual(
@@ -770,22 +1188,25 @@ class ReimbursementCleanupTest(unittest.TestCase):
             app_secret=b"a" * 32,
         )
         identity = (0xABCDEF, 0x123ABC)
-        name = service._purge_quarantine_name(self.record_id, identity)
+        claim = "c" * 64
+        name = service._purge_quarantine_name(self.record_id, claim, identity)
         prefix = f".reimbursement-purge-{self.record_id}-"
         components = name[len(prefix):].split("-")
 
-        self.assertEqual(len(components), 3)
-        device, inode, mac = components
+        self.assertEqual(len(components), 4)
+        encoded_claim, device, inode, mac = components
+        self.assertEqual(encoded_claim, claim)
         self.assertEqual(
-            service._purge_quarantine_identity(name, self.record_id),
+            service._purge_quarantine_identity(name, self.record_id, claim),
             identity,
         )
         invalid_names = (
-            f"{prefix}0{device}-{inode}-{mac}",
-            f"{prefix}{device.upper()}-{inode}-{mac}",
-            f"{prefix}{device}-0{inode}-{mac}",
-            f"{prefix}{device}-{inode}-A{mac[1:]}",
-            f"{prefix}{device}-{inode}-{'0' if mac[0] != '0' else '1'}{mac[1:]}",
+            f"{prefix}{'d' * 64}-{device}-{inode}-{mac}",
+            f"{prefix}{claim}-0{device}-{inode}-{mac}",
+            f"{prefix}{claim}-{device.upper()}-{inode}-{mac}",
+            f"{prefix}{claim}-{device}-0{inode}-{mac}",
+            f"{prefix}{claim}-{device}-{inode}-A{mac[1:]}",
+            f"{prefix}{claim}-{device}-{inode}-{'0' if mac[0] != '0' else '1'}{mac[1:]}",
             f"{name}-extra",
         )
         for invalid_name in invalid_names:
@@ -794,6 +1215,7 @@ class ReimbursementCleanupTest(unittest.TestCase):
                     service._purge_quarantine_identity(
                         invalid_name,
                         self.record_id,
+                        claim,
                     )
                 )
 
@@ -804,14 +1226,19 @@ class ReimbursementCleanupTest(unittest.TestCase):
             app_secret=b"a" * 32,
         )
         identity = (1, 2)
-        name = service._purge_quarantine_name(self.record_id, identity)
+        claim = "c" * 64
+        name = service._purge_quarantine_name(self.record_id, claim, identity)
         real_compare_digest = hmac.compare_digest
 
         with mock.patch(
             "hmac.compare_digest",
             wraps=real_compare_digest,
         ) as compare_digest:
-            parsed = service._purge_quarantine_identity(name, self.record_id)
+            parsed = service._purge_quarantine_identity(
+                name,
+                self.record_id,
+                claim,
+            )
 
         self.assertEqual(parsed, identity)
         compare_digest.assert_called_once()
@@ -833,7 +1260,7 @@ class ReimbursementCleanupTest(unittest.TestCase):
             remove_tree=fail_after_isolation,
         )
         with self.assertLogs("reimbursements", level="ERROR"):
-            with self.assertRaises(ReimbursementNotFound):
+            with self.assertRaises(reimbursements.ReimbursementStorageError):
                 failing_service.purge_one(self.user_id, self.record_id)
 
         with self.assertRaises(ReimbursementNotFound):
@@ -842,6 +1269,7 @@ class ReimbursementCleanupTest(unittest.TestCase):
         row = self._row(self.record_id)
         self.assertIsNotNone(row)
         self.assertIsNotNone(row["deleted_at"])
+        self.assertRegex(row["purge_claim"], "^[0-9a-f]{64}$")
         self.assertEqual(self.service.list_active(self.user_id), [])
         self.assertEqual(
             [record.id for record in self.service.list_trash(self.user_id)],
@@ -876,7 +1304,7 @@ class ReimbursementCleanupTest(unittest.TestCase):
             )
 
         with self.assertLogs("reimbursements", level="ERROR"):
-            with self.assertRaises(ReimbursementNotFound):
+            with self.assertRaises(reimbursements.ReimbursementStorageError):
                 self.service.purge_one(self.user_id, self.record_id)
 
         self.assertEqual(own_file.read_bytes(), b"own")
@@ -1004,7 +1432,48 @@ class ReimbursementCleanupTest(unittest.TestCase):
         row = self._row(self.record_id)
         self.assertIsNotNone(row)
         self.assertEqual(row["deleted_at"], now.isoformat())
+        self.assertIsNone(row["purge_claim"])
         self.assertTrue(record_dir.exists())
+
+    def test_expired_purge_stops_between_candidates(self):
+        self.assertIn(
+            "stop_event",
+            inspect.signature(self.service.purge_expired).parameters,
+        )
+        now = datetime(2026, 9, 8, tzinfo=timezone.utc)
+        expired_at = (now - timedelta(days=31)).isoformat()
+        for suffix in (11, 12, 13):
+            self._insert_record(
+                self.user_id,
+                f"20000000-0000-4000-8000-{suffix:012d}",
+                created_at=expired_at,
+                deleted_at=expired_at,
+            )
+        stop_event = threading.Event()
+        calls = []
+
+        def stop_after_first(user_id, record_id, **kwargs):
+            calls.append((user_id, record_id, kwargs))
+            stop_event.set()
+            return True
+
+        with mock.patch.object(
+            self.service,
+            "_purge_one",
+            side_effect=stop_after_first,
+        ):
+            purged = self.service.purge_expired(now=now, stop_event=stop_event)
+
+        self.assertEqual(purged, 1)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(
+            calls[0][2],
+            {
+                "deleted_at_or_before": (
+                    now - timedelta(days=30)
+                ).isoformat()
+            },
+        )
 
     def test_server_runs_both_purges_once_before_starting_cleanup_runner(self):
         runner_calls = []
@@ -1053,6 +1522,53 @@ class ReimbursementCleanupTest(unittest.TestCase):
         self.assertTrue(stopped.is_set())
         self.assertFalse(server.cleanup_thread.is_alive())
 
+    def test_server_close_has_bounded_join_during_active_cleanup(self):
+        cleanup_started = threading.Event()
+        release_cleanup = threading.Event()
+        purge_calls = 0
+
+        def stall_background_purge(_service, *args, **kwargs):
+            nonlocal purge_calls
+            purge_calls += 1
+            if purge_calls == 2:
+                cleanup_started.set()
+                release_cleanup.wait(timeout=0.5)
+            return 0
+
+        def run_cleanup_once(_stop_event, cleanup):
+            cleanup()
+
+        with mock.patch.object(
+            app.ReimbursementService,
+            "purge_expired",
+            autospec=True,
+            side_effect=stall_background_purge,
+        ):
+            server = app.create_server(
+                self.config_path,
+                cleanup_runner=run_cleanup_once,
+            )
+            try:
+                self.assertTrue(cleanup_started.wait(timeout=1))
+                started = time.monotonic()
+                with mock.patch.object(
+                    app,
+                    "_CLEANUP_JOIN_TIMEOUT_SECONDS",
+                    0.05,
+                    create=True,
+                ):
+                    server.server_close()
+                elapsed = time.monotonic() - started
+
+                self.assertTrue(server.cleanup_stop_event.is_set())
+                self.assertLess(elapsed, 0.2)
+                self.assertTrue(server.cleanup_thread.is_alive())
+            finally:
+                release_cleanup.set()
+                server.cleanup_thread.join(timeout=1)
+                if server.fileno() != -1:
+                    server.server_close()
+
     def test_default_cleanup_loop_uses_one_day_event_wait_without_sleeping(self):
         class DeterministicEvent:
             def __init__(self):
@@ -1068,7 +1584,7 @@ class ReimbursementCleanupTest(unittest.TestCase):
         app._cleanup_loop(event, cleanup)
 
         self.assertEqual(event.timeouts, [86400, 86400])
-        cleanup.assert_called_once_with()
+        cleanup.assert_called_once_with(event)
 
 
 if __name__ == "__main__":

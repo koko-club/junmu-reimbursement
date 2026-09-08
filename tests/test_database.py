@@ -58,7 +58,7 @@ class DatabaseTest(unittest.TestCase):
                 "SELECT value FROM app_settings WHERE key = 'setup_complete'"
             ).fetchone()
 
-        self.assertEqual([row["version"] for row in versions], [1, 2])
+        self.assertEqual([row["version"] for row in versions], [1, 2, 3])
         self.assertTrue(versions[0]["applied_at"])
         self.assertEqual(setting["value"], "false")
 
@@ -91,7 +91,93 @@ class DatabaseTest(unittest.TestCase):
             )]
         self.assertEqual(columns["status_version"]["dflt_value"], "0")
         self.assertEqual(columns["password_version"]["dflt_value"], "0")
-        self.assertEqual(versions, [1, 2])
+        self.assertEqual(versions, [1, 2, 3])
+
+    def test_migrate_upgrades_existing_v2_database_with_nullable_purge_claim(self):
+        connection = self.db.connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                "CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)"
+            )
+            for statement in database._SCHEMA_V1:
+                connection.execute(statement)
+            connection.execute(
+                "ALTER TABLE users ADD COLUMN status_version INTEGER NOT NULL DEFAULT 0"
+            )
+            connection.execute(
+                "ALTER TABLE users ADD COLUMN password_version INTEGER NOT NULL DEFAULT 0"
+            )
+            connection.executemany(
+                "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
+                (
+                    (1, "2026-09-07T00:00:00+00:00"),
+                    (2, "2026-09-08T00:00:00+00:00"),
+                ),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        self.db.migrate()
+        self.db.migrate()
+
+        with self.db.transaction() as connection:
+            columns = {
+                row["name"]: row
+                for row in connection.execute("PRAGMA table_info(reimbursements)")
+            }
+            versions = [
+                row["version"]
+                for row in connection.execute(
+                    "SELECT version FROM schema_migrations ORDER BY version"
+                )
+            ]
+
+        self.assertIn("purge_claim", columns)
+        self.assertEqual(columns["purge_claim"]["type"], "TEXT")
+        self.assertIsNone(columns["purge_claim"]["dflt_value"])
+        self.assertEqual(versions, [1, 2, 3])
+
+    def test_purge_claim_accepts_only_null_or_canonical_64_hex(self):
+        self.db.migrate()
+        with self.db.transaction(immediate=True) as connection:
+            connection.execute(
+                """INSERT INTO users(
+                    username, username_key, password_hash, password_salt,
+                    password_params, real_name, department, role, status,
+                    must_change_password, created_at, approved_at, updated_at
+                ) VALUES ('alice', 'alice', X'00', X'00', '{}', 'Alice', 'IT',
+                    'user', 'active', 0, 'created', 'approved', 'updated')"""
+            )
+            user_id = connection.execute(
+                "SELECT id FROM users WHERE username_key = 'alice'"
+            ).fetchone()["id"]
+            connection.execute(
+                """INSERT INTO reimbursements(
+                    id, user_id, display_name, xlsx_path, pdf_path, created_at
+                ) VALUES ('10000000-0000-4000-8000-000000000001', ?,
+                    'claim.xlsx', 'claim.xlsx', 'claim.pdf', 'created')""",
+                (user_id,),
+            )
+
+        for invalid in ("", "a" * 63, "A" * 64, "g" * 64):
+            with self.subTest(invalid=invalid), self.assertRaises(sqlite3.IntegrityError):
+                with self.db.transaction(immediate=True) as connection:
+                    connection.execute(
+                        "UPDATE reimbursements SET purge_claim = ?",
+                        (invalid,),
+                    )
+
+        with self.db.transaction(immediate=True) as connection:
+            connection.execute(
+                "UPDATE reimbursements SET purge_claim = ?",
+                ("a" * 64,),
+            )
+            claim = connection.execute(
+                "SELECT purge_claim FROM reimbursements"
+            ).fetchone()["purge_claim"]
+        self.assertEqual(claim, "a" * 64)
 
     def test_v1_schema_matches_storage_contract(self):
         self.db.migrate()
@@ -149,6 +235,21 @@ class DatabaseTest(unittest.TestCase):
                 "SELECT value FROM app_settings WHERE key = 'temporary'"
             ).fetchone()
         self.assertIsNone(row)
+
+    def test_transaction_rolls_back_when_commit_raises(self):
+        connection = mock.Mock()
+        commit_error = sqlite3.OperationalError("commit failed")
+        connection.commit.side_effect = commit_error
+
+        with mock.patch.object(self.db, "connect", return_value=connection):
+            with self.assertRaises(sqlite3.OperationalError) as caught:
+                with self.db.transaction(immediate=True):
+                    pass
+
+        self.assertIs(caught.exception, commit_error)
+        connection.execute.assert_called_once_with("BEGIN IMMEDIATE")
+        connection.rollback.assert_called_once_with()
+        connection.close.assert_called_once_with()
 
     def test_foreign_keys_cascade_sessions_and_restrict_reimbursements(self):
         self.db.migrate()

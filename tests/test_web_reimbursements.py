@@ -5,12 +5,19 @@ from email.message import Message
 import io
 import json
 from pathlib import Path
+import socket
+import threading
 from types import SimpleNamespace
 import unittest
 from unittest import mock
 from urllib.parse import quote
 
-from reimbursements import OwnedReimbursementFile, ReimbursementRecord
+from reimbursements import (
+    OwnedReimbursementFile,
+    ReimbursementGenerationError,
+    ReimbursementRecord,
+    ReimbursementStorageError,
+)
 from tests.http_helpers import RunningApp
 
 
@@ -43,6 +50,25 @@ class TrackingStream(io.BytesIO):
     def read(self, size=-1):
         self.read_sizes.append(size)
         return super().read(size)
+
+
+class PartialReadFailureStream(TrackingStream):
+    def read(self, size=-1):
+        if self.tell() >= 65536:
+            self.read_sizes.append(size)
+            raise OSError("private read failure")
+        return super().read(size)
+
+
+class CloseFailureStream(TrackingStream):
+    def __init__(self, value: bytes):
+        super().__init__(value)
+        self.close_attempts = 0
+
+    def close(self):
+        self.close_attempts += 1
+        super().close()
+        raise OSError("private close failure")
 
 
 class WebReimbursementTest(unittest.TestCase):
@@ -273,6 +299,112 @@ class WebReimbursementTest(unittest.TestCase):
         self.assertTrue(stream.closed)
         self.assertTrue(handler.close_connection)
 
+    def test_partial_download_read_failure_commits_only_one_real_response(self):
+        record_id = "30000000-0000-4000-8000-000000000004"
+        record = ReimbursementRecord(
+            record_id,
+            self.alice_id,
+            None,
+            "claim.xlsx",
+            "poison",
+            "poison",
+            "2026-09-08T00:00:00+00:00",
+            None,
+        )
+        stream = PartialReadFailureStream(b"a" * 65537)
+        owned = OwnedReimbursementFile(record, "xlsx", "claim.xlsx", 65537, stream)
+        service = mock.Mock()
+        service.owned_file.return_value = owned
+        cookie = "; ".join(
+            f"{item.name}={item.value}"
+            for item in self.alice.cookies
+            if not item.secure
+        )
+        request = (
+            f"GET /api/reimbursements/{record_id}/xlsx HTTP/1.1\r\n"
+            f"Host: 127.0.0.1\r\nCookie: {cookie}\r\n\r\n"
+        ).encode("ascii")
+        connection = socket.create_connection(
+            self.running.server.server_address,
+            timeout=2,
+        )
+        try:
+            with mock.patch.object(
+                self.running.server.application,
+                "reimbursement_service",
+                service,
+            ), self.assertNoLogs("web", level="ERROR"):
+                connection.sendall(request)
+                chunks = []
+                while True:
+                    chunk = connection.recv(65536)
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+        finally:
+            connection.close()
+
+        response = b"".join(chunks)
+        head, body = response.split(b"\r\n\r\n", 1)
+        self.assertIn(b" 200 ", head.split(b"\r\n", 1)[0])
+        self.assertNotIn(b"\r\nHTTP/", body)
+        self.assertEqual(body, b"a" * 65536)
+        self.assertEqual(stream.read_sizes, [65536, 65536])
+        self.assertTrue(stream.closed)
+
+    def test_download_close_failure_after_body_does_not_emit_second_response(self):
+        record_id = "30000000-0000-4000-8000-000000000005"
+        record = ReimbursementRecord(
+            record_id,
+            self.alice_id,
+            None,
+            "claim.xlsx",
+            "poison",
+            "poison",
+            "2026-09-08T00:00:00+00:00",
+            None,
+        )
+        stream = CloseFailureStream(b"body")
+        owned = OwnedReimbursementFile(record, "xlsx", "claim.xlsx", 4, stream)
+        application = self.running.server.application
+        headers = Message()
+        headers["Cookie"] = "reimbursement_session=fake"
+        handler = SimpleNamespace(
+            path=f"/api/reimbursements/{record_id}/xlsx",
+            command="GET",
+            headers=headers,
+            client_address=("127.0.0.1", 1),
+            send_response=mock.Mock(),
+            send_header=mock.Mock(),
+            end_headers=mock.Mock(),
+            wfile=mock.Mock(),
+            close_connection=False,
+        )
+        service = mock.Mock()
+        service.owned_file.return_value = owned
+        user = SimpleNamespace(
+            user_id=self.alice_id,
+            role="user",
+            must_change_password=False,
+        )
+
+        with mock.patch.object(
+            application.session_service,
+            "resolve",
+            return_value=user,
+        ), mock.patch.object(
+            application,
+            "reimbursement_service",
+            service,
+        ), self.assertNoLogs("web", level="ERROR"):
+            application.handle_get(handler)
+
+        self.assertEqual(handler.send_response.call_args_list, [mock.call(200)])
+        handler.wfile.write.assert_called_once_with(b"body")
+        self.assertEqual(stream.close_attempts, 1)
+        self.assertTrue(stream.closed)
+        self.assertTrue(handler.close_connection)
+
     def test_active_and_trash_lists_are_isolated_and_do_not_expose_paths(self):
         active = self._insert_record(
             self.alice_id, "40000000-0000-4000-8000-000000000001"
@@ -338,6 +470,25 @@ class WebReimbursementTest(unittest.TestCase):
             ).fetchone()
         self.assertIsNone(row)
 
+    def test_purge_storage_failure_returns_stable_retryable_error(self):
+        record_id = "50000000-0000-4000-8000-000000000002"
+        path = f"/api/reimbursements/{record_id}/purge"
+        service = self.running.server.application.reimbursement_service
+
+        with mock.patch.object(
+            service,
+            "purge_one",
+            side_effect=ReimbursementStorageError("private storage detail"),
+        ):
+            response = self.alice.post_json(path, {"confirm": True})
+
+        self.assertEqual(response.status, 503)
+        self.assertEqual(
+            response.json(),
+            {"error": "报销记录暂时无法删除，请稍后重试"},
+        )
+        self.assertNotIn("private", response.text)
+
     def test_invalid_record_kinds_uuids_and_path_shapes_are_stable_404(self):
         valid = "60000000-0000-4000-8000-000000000001"
         paths = (
@@ -353,6 +504,30 @@ class WebReimbursementTest(unittest.TestCase):
                 response = self.alice.get(path)
                 self.assertEqual(response.status, 404)
                 self.assertEqual(set(response.json()), {"error"})
+
+    def test_unsupported_methods_only_advertise_canonical_reimbursement_routes(self):
+        valid = "60000000-0000-4000-8000-000000000001"
+        invalid_paths = (
+            f"/api/reimbursements/{valid}/zip",
+            "/api/reimbursements/not-a-uuid/pdf",
+            f"/api/reimbursements/{valid}/pdf/extra",
+        )
+        for method in ("HEAD", "PUT"):
+            for path in invalid_paths:
+                with self.subTest(method=method, path=path):
+                    response = self.alice.raw_request(method, path)
+                    self.assertEqual(response.status, 404)
+                    self.assertIsNone(response.headers.get("Allow"))
+
+        valid_cases = (
+            ("HEAD", f"/api/reimbursements/{valid}/pdf", "GET"),
+            ("PUT", f"/api/reimbursements/{valid}/purge", "POST"),
+        )
+        for method, path, allow in valid_cases:
+            with self.subTest(method=method, path=path):
+                response = self.alice.raw_request(method, path)
+                self.assertEqual(response.status, 405)
+                self.assertEqual(response.headers["Allow"], allow)
 
     def test_replaced_session_is_denied_before_history_service(self):
         old_alice = self.alice
@@ -491,6 +666,122 @@ class WebReimbursementTest(unittest.TestCase):
         self.assertEqual(response.status, 413)
         self.assertEqual(response.headers["Cache-Control"], "no-store")
         service.generate.assert_not_called()
+
+    def test_upload_admission_bounds_body_buffering_to_generation_capacity(self):
+        application = self.running.server.application
+        capacity = application.config.max_concurrent_generations
+        request_count = capacity + 2
+        start = threading.Barrier(request_count + 1)
+        admitted = threading.Event()
+        overflow = threading.Event()
+        release = threading.Event()
+        count_lock = threading.Lock()
+        active = 0
+        peak = 0
+        user = SimpleNamespace(user_id=self.alice_id, role="user")
+
+        def block_body_buffering(_handler):
+            nonlocal active, peak
+            with count_lock:
+                active += 1
+                peak = max(peak, active)
+                if active >= capacity:
+                    admitted.set()
+                if active > capacity:
+                    overflow.set()
+            try:
+                if not release.wait(timeout=2):
+                    raise TimeoutError("test did not release body buffering")
+                return None
+            finally:
+                with count_lock:
+                    active -= 1
+
+        def upload():
+            start.wait(timeout=1)
+            application._reimbursement_generate(SimpleNamespace(), user, None)
+
+        threads = [threading.Thread(target=upload) for _ in range(request_count)]
+        with mock.patch.object(
+            application,
+            "_multipart_body",
+            side_effect=block_body_buffering,
+        ):
+            for thread in threads:
+                thread.start()
+            start.wait(timeout=1)
+            self.assertTrue(admitted.wait(timeout=1))
+            try:
+                self.assertFalse(
+                    overflow.wait(timeout=0.1),
+                    "too many uploads reached request-body buffering",
+                )
+            finally:
+                release.set()
+                for thread in threads:
+                    thread.join(timeout=2)
+
+        self.assertTrue(all(not thread.is_alive() for thread in threads))
+        self.assertEqual(peak, capacity)
+
+    def test_upload_admission_releases_slots_after_parse_and_generation_failures(self):
+        application = self.running.server.application
+        slots = getattr(application, "_upload_slots", None)
+        self.assertIsNotNone(slots)
+        user = SimpleNamespace(
+            user_id=self.alice_id,
+            role="user",
+            real_name="张三",
+            department="技术部",
+        )
+
+        def handler_for(content_type):
+            headers = Message()
+            headers["Content-Type"] = content_type
+            return SimpleNamespace(
+                headers=headers,
+                command="POST",
+                send_response=mock.Mock(),
+                send_header=mock.Mock(),
+                end_headers=mock.Mock(),
+                wfile=mock.Mock(),
+            )
+
+        invalid_handler = handler_for("multipart/form-data; boundary=invalid")
+        with mock.patch.object(
+            application,
+            "_multipart_body",
+            return_value=b"not multipart",
+        ):
+            application._reimbursement_generate(invalid_handler, user, None)
+        self.assertTrue(slots.acquire(blocking=False))
+        slots.release()
+
+        payload = {
+            "date": "2026-09-08",
+            "department": "ignored",
+            "traveler": "ignored",
+            "reason": "客户拜访",
+            "days": 1,
+            "allowance": 50,
+            "rows": [],
+        }
+        body, content_type = multipart(
+            [("payload", json.dumps(payload), None, "application/json")]
+        )
+        failing_handler = handler_for(content_type)
+        service = mock.Mock()
+        service.generate.side_effect = ReimbursementGenerationError(
+            "生成报销文件失败，请稍后重试"
+        )
+        with mock.patch.object(
+            application,
+            "_multipart_body",
+            return_value=body,
+        ), mock.patch.object(application, "reimbursement_service", service):
+            application._reimbursement_generate(failing_handler, user, None)
+        self.assertTrue(slots.acquire(blocking=False))
+        slots.release()
 
 
 if __name__ == "__main__":

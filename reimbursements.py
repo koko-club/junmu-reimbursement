@@ -10,6 +10,7 @@ import hmac
 import logging
 import os
 from pathlib import Path
+import secrets
 import stat
 import threading
 from typing import BinaryIO, Callable
@@ -25,11 +26,13 @@ from validation import safe_output_stem, validate_image_filename, validate_paylo
 
 _LOGGER = logging.getLogger(__name__)
 _PUBLIC_GENERATION_ERROR = "生成报销文件失败，请稍后重试"
+_PUBLIC_STORAGE_ERROR = "报销记录暂时无法删除，请稍后重试"
 _MAX_DISPLAY_NAME_UTF8_BYTES = 180
 _TRASH_RETENTION = timedelta(days=30)
 _CLEANUP_ENTRY_NAME = "entry"
 _PURGE_QUARANTINE_PREFIX = ".reimbursement-purge-"
-_PURGE_QUARANTINE_AUTH_PURPOSE = b"reimbursement-purge-quarantine:v1"
+_PURGE_QUARANTINE_AUTH_PURPOSE = b"reimbursement-purge-quarantine:v2"
+_PURGE_SERIALIZER = threading.Lock()
 _DIRECTORY_OPEN_FLAGS = (
     os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
 )
@@ -47,6 +50,10 @@ class ReimbursementGenerationError(RuntimeError):
 
 class ReimbursementNotFound(FileNotFoundError):
     """A history lookup failure that does not disclose storage details."""
+
+
+class ReimbursementStorageError(RuntimeError):
+    """A stable owner-visible failure while permanently deleting storage."""
 
 
 class _InsertError(Exception):
@@ -353,49 +360,71 @@ class ReimbursementService:
     def restore(self, user_id: int, record_id: str) -> ReimbursementRecord:
         self._require_owner_id(user_id)
         self._require_record_id(record_id)
-        with self._database.transaction(immediate=True) as connection:
+        with closing(self._database.connect()) as connection:
             row = connection.execute(
                 """SELECT * FROM reimbursements
                 WHERE id = ? AND user_id = ? AND deleted_at IS NOT NULL""",
                 (record_id, user_id),
             ).fetchone()
-            if row is None:
-                raise ReimbursementNotFound("报销记录不存在")
-            record = self._record_from_row(row)
-            if self._purge_quarantine_present(record):
-                raise ReimbursementNotFound("报销记录不存在")
-            with self.owned_file(
-                user_id,
-                record_id,
-                "xlsx",
-                include_deleted=True,
-            ), self.owned_file(
-                user_id,
-                record_id,
-                "pdf",
-                include_deleted=True,
-            ):
+        if row is None or row["purge_claim"] is not None:
+            raise ReimbursementNotFound("报销记录不存在")
+        record = self._record_from_row(row)
+        if self._purge_quarantine_present(record):
+            raise ReimbursementNotFound("报销记录不存在")
+        with self.owned_file(
+            user_id,
+            record_id,
+            "xlsx",
+            include_deleted=True,
+        ), self.owned_file(
+            user_id,
+            record_id,
+            "pdf",
+            include_deleted=True,
+        ):
+            with self._database.transaction(immediate=True) as connection:
                 updated = connection.execute(
                     """UPDATE reimbursements SET deleted_at = NULL
-                    WHERE id = ? AND user_id = ? AND deleted_at IS NOT NULL""",
+                    WHERE id = ? AND user_id = ? AND deleted_at IS NOT NULL
+                    AND purge_claim IS NULL""",
                     (record_id, user_id),
                 )
-            if updated.rowcount != 1:
-                raise ReimbursementNotFound("报销记录不存在")
-            row = connection.execute(
-                "SELECT * FROM reimbursements WHERE id = ? AND user_id = ?",
-                (record_id, user_id),
-            ).fetchone()
+                if updated.rowcount != 1:
+                    raise ReimbursementNotFound("报销记录不存在")
+                row = connection.execute(
+                    "SELECT * FROM reimbursements WHERE id = ? AND user_id = ?",
+                    (record_id, user_id),
+                ).fetchone()
         assert row is not None
         return self._record_from_row(row)
 
     def purge_one(self, user_id: int, record_id: str) -> None:
         self._require_owner_id(user_id)
         self._require_record_id(record_id)
-        if not self._purge_one(user_id, record_id):
+        try:
+            purged = self._purge_one(user_id, record_id)
+        except ReimbursementStorageError:
+            raise
+        except Exception:
+            raise ReimbursementStorageError(_PUBLIC_STORAGE_ERROR) from None
+        if not purged:
             raise ReimbursementNotFound("报销记录不存在")
 
     def _purge_one(
+        self,
+        user_id: int,
+        record_id: str,
+        *,
+        deleted_at_or_before: str | None = None,
+    ) -> bool:
+        with _PURGE_SERIALIZER:
+            return self._purge_one_serialized(
+                user_id,
+                record_id,
+                deleted_at_or_before=deleted_at_or_before,
+            )
+
+    def _purge_one_serialized(
         self,
         user_id: int,
         record_id: str,
@@ -416,18 +445,44 @@ class ReimbursementService:
             if row is None:
                 return False
             record = self._record_from_row(row)
-            if not self._purge_record_files(record):
-                raise ReimbursementNotFound("报销记录不存在")
+            purge_claim = row["purge_claim"]
+            if purge_claim is None:
+                purge_claim = secrets.token_hex(32)
+                claimed = connection.execute(
+                    """UPDATE reimbursements SET purge_claim = ?
+                    WHERE id = ? AND user_id = ? AND """
+                    + eligibility
+                    + " AND purge_claim IS NULL",
+                    (purge_claim,) + parameters,
+                )
+                if claimed.rowcount != 1:
+                    raise ReimbursementStorageError(_PUBLIC_STORAGE_ERROR)
+            elif not self._valid_purge_claim(purge_claim):
+                raise ReimbursementStorageError(_PUBLIC_STORAGE_ERROR)
+
+        quarantine_name = self._purge_record_files(record, purge_claim)
+        if quarantine_name is None:
+            raise ReimbursementStorageError(_PUBLIC_STORAGE_ERROR)
+
+        with self._database.transaction(immediate=True) as connection:
             deleted = connection.execute(
                 """DELETE FROM reimbursements
-                WHERE id = ? AND user_id = ? AND """ + eligibility,
-                parameters,
+                WHERE id = ? AND user_id = ? AND """
+                + eligibility
+                + " AND purge_claim = ?",
+                parameters + (purge_claim,),
             )
             if deleted.rowcount != 1:
-                raise ReimbursementNotFound("报销记录不存在")
+                raise ReimbursementStorageError(_PUBLIC_STORAGE_ERROR)
+        self._remove_purge_completion_marker(record, purge_claim, quarantine_name)
         return True
 
-    def purge_expired(self, now: datetime | None = None) -> int:
+    def purge_expired(
+        self,
+        now: datetime | None = None,
+        *,
+        stop_event: threading.Event | None = None,
+    ) -> int:
         cutoff = (self._utc_time(now) - _TRASH_RETENTION).isoformat()
         with closing(self._database.connect()) as connection:
             candidates = connection.execute(
@@ -438,6 +493,8 @@ class ReimbursementService:
             ).fetchall()
         purged = 0
         for candidate in candidates:
+            if stop_event is not None and stop_event.is_set():
+                break
             record_id = candidate["id"]
             try:
                 deleted = self._purge_one(
@@ -575,9 +632,23 @@ class ReimbursementService:
             raise ReimbursementNotFound("报销记录不存在")
         return record_id
 
-    def _purge_record_files(self, record: ReimbursementRecord) -> bool:
+    @staticmethod
+    def _valid_purge_claim(purge_claim: object) -> bool:
+        return (
+            isinstance(purge_claim, str)
+            and len(purge_claim) == 64
+            and all(character in "0123456789abcdef" for character in purge_claim)
+        )
+
+    def _purge_record_files(
+        self,
+        record: ReimbursementRecord,
+        purge_claim: str,
+    ) -> str | None:
         descriptors: list[int] = []
         try:
+            if not self._valid_purge_claim(purge_claim):
+                raise ValueError("invalid reimbursement purge claim")
             expected_prefix = ("users", str(record.user_id), record.id)
             for kind, stored_value in (
                 ("xlsx", record.xlsx_path),
@@ -605,38 +676,116 @@ class ReimbursementService:
                 (name, identity)
                 for name in os.listdir(owner_fd)
                 if (
-                    identity := self._purge_quarantine_identity(name, record.id)
+                    identity := self._purge_quarantine_identity(
+                        name,
+                        record.id,
+                        purge_claim,
+                    )
                 ) is not None
             ]
             if len(quarantines) > 1:
                 raise ValueError("ambiguous reimbursement purge quarantine")
             if quarantines:
                 quarantine_name, identity = quarantines[0]
-                return self._resume_purge_at(
+                completed = self._resume_purge_at(
                     owner_fd,
                     quarantine_name,
                     identity,
                     record.id,
                 )
+                return quarantine_name if completed else None
             record_fd = self._open_directory(owner_fd, record.id)
             descriptors.append(record_fd)
             identity = self._directory_identity(os.fstat(record_fd))
-            quarantine_name = self._purge_quarantine_name(record.id, identity)
-            return self._cleanup_at(
+            quarantine_name = self._purge_quarantine_name(
+                record.id,
+                purge_claim,
+                identity,
+            )
+            completed = self._cleanup_at(
                 owner_fd,
                 record.id,
                 {identity},
                 record.id,
                 quarantine_name=quarantine_name,
+                retain_quarantine=True,
             )
+            return quarantine_name if completed else None
         except Exception as error:
             _LOGGER.error(
                 "reimbursement purge filesystem check failed record_id=%s exception=%s",
                 record.id,
                 type(error).__name__,
             )
-            return False
+            return None
         finally:
+            for descriptor in reversed(descriptors):
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+
+    def _remove_purge_completion_marker(
+        self,
+        record: ReimbursementRecord,
+        purge_claim: str,
+        quarantine_name: str,
+    ) -> None:
+        descriptors: list[int] = []
+        quarantine_fd: int | None = None
+        try:
+            if (
+                self._purge_quarantine_identity(
+                    quarantine_name,
+                    record.id,
+                    purge_claim,
+                )
+                is None
+            ):
+                return
+            data_fd = os.open(
+                Path(self._config.data_dir).resolve(),
+                _DIRECTORY_OPEN_FLAGS,
+            )
+            descriptors.append(data_fd)
+            users_fd = self._open_directory(data_fd, "users")
+            descriptors.append(users_fd)
+            owner_fd = self._open_directory(users_fd, str(record.user_id))
+            descriptors.append(owner_fd)
+            quarantine_metadata = os.stat(
+                quarantine_name,
+                dir_fd=owner_fd,
+                follow_symlinks=False,
+            )
+            quarantine_fd = self._open_directory(owner_fd, quarantine_name)
+            if (
+                not os.path.samestat(
+                    quarantine_metadata,
+                    os.fstat(quarantine_fd),
+                )
+                or os.listdir(quarantine_fd)
+            ):
+                return
+            self._complete_empty_purge_at(
+                owner_fd,
+                quarantine_name,
+                quarantine_metadata,
+                quarantine_fd,
+            )
+        except Exception as cleanup_error:
+            _LOGGER.error(
+                "reimbursement purge marker cleanup failed record_id=%s exception=%s",
+                record.id,
+                type(cleanup_error).__name__,
+            )
+        finally:
+            if quarantine_fd is not None:
+                descriptor = quarantine_fd
+                quarantine_fd = None
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
             for descriptor in reversed(descriptors):
                 try:
                     os.close(descriptor)
@@ -666,29 +815,41 @@ class ReimbursementService:
     def _purge_quarantine_name(
         self,
         record_id: str,
+        purge_claim: str,
         identity: tuple[int, int],
     ) -> str:
+        if not self._valid_purge_claim(purge_claim):
+            raise ValueError("invalid reimbursement purge claim")
         device, inode = identity
         device_hex = f"{device:x}"
         inode_hex = f"{inode:x}"
-        mac = self._purge_quarantine_mac(record_id, device_hex, inode_hex)
+        mac = self._purge_quarantine_mac(
+            record_id,
+            purge_claim,
+            device_hex,
+            inode_hex,
+        )
         return (
-            f"{_PURGE_QUARANTINE_PREFIX}{record_id}-{device_hex}-{inode_hex}-{mac}"
+            f"{_PURGE_QUARANTINE_PREFIX}{record_id}-{purge_claim}-"
+            f"{device_hex}-{inode_hex}-{mac}"
         )
 
     def _purge_quarantine_identity(
         self,
         name: str,
         record_id: str,
+        purge_claim: str,
     ) -> tuple[int, int] | None:
+        if not self._valid_purge_claim(purge_claim):
+            return None
         prefix = f"{_PURGE_QUARANTINE_PREFIX}{record_id}-"
         if not isinstance(name, str) or not name.startswith(prefix):
             return None
         components = name[len(prefix):].split("-")
-        if len(components) != 3:
+        if len(components) != 4 or components[0] != purge_claim:
             return None
         values = []
-        for component in components[:2]:
+        for component in components[1:3]:
             if (
                 not component
                 or any(character not in "0123456789abcdef" for character in component)
@@ -698,7 +859,7 @@ class ReimbursementService:
             if f"{value:x}" != component:
                 return None
             values.append(value)
-        supplied_mac = components[2]
+        supplied_mac = components[3]
         if (
             len(supplied_mac) != hashlib.sha256().digest_size * 2
             or any(
@@ -708,8 +869,9 @@ class ReimbursementService:
             return None
         expected_mac = self._purge_quarantine_mac(
             record_id,
-            components[0],
+            purge_claim,
             components[1],
+            components[2],
         )
         if not hmac.compare_digest(supplied_mac, expected_mac):
             return None
@@ -718,6 +880,7 @@ class ReimbursementService:
     def _purge_quarantine_mac(
         self,
         record_id: str,
+        purge_claim: str,
         device_hex: str,
         inode_hex: str,
     ) -> str:
@@ -725,6 +888,7 @@ class ReimbursementService:
             (
                 _PURGE_QUARANTINE_AUTH_PURPOSE,
                 record_id.encode("ascii"),
+                purge_claim.encode("ascii"),
                 device_hex.encode("ascii"),
                 inode_hex.encode("ascii"),
             )
@@ -744,6 +908,7 @@ class ReimbursementService:
     ) -> bool:
         quarantine_fd: int | None = None
         record_fd: int | None = None
+        filesystem_complete = False
         try:
             quarantine_metadata = os.stat(
                 quarantine_name,
@@ -755,12 +920,8 @@ class ReimbursementService:
                 return False
             quarantine_entries = os.listdir(quarantine_fd)
             if not quarantine_entries:
-                return self._complete_empty_purge_at(
-                    owner_fd,
-                    quarantine_name,
-                    quarantine_metadata,
-                    quarantine_fd,
-                )
+                filesystem_complete = True
+                return True
             if quarantine_entries != [_CLEANUP_ENTRY_NAME]:
                 return False
             record_metadata = os.stat(
@@ -790,18 +951,7 @@ class ReimbursementService:
             if not os.path.samestat(opened_metadata, final_metadata):
                 return False
             os.rmdir(_CLEANUP_ENTRY_NAME, dir_fd=quarantine_fd)
-            os.close(record_fd)
-            record_fd = None
-            os.close(quarantine_fd)
-            quarantine_fd = None
-            current_quarantine = os.stat(
-                quarantine_name,
-                dir_fd=owner_fd,
-                follow_symlinks=False,
-            )
-            if not os.path.samestat(quarantine_metadata, current_quarantine):
-                return False
-            os.rmdir(quarantine_name, dir_fd=owner_fd)
+            filesystem_complete = True
             return True
         except Exception as cleanup_error:
             _LOGGER.error(
@@ -812,9 +962,25 @@ class ReimbursementService:
             return False
         finally:
             if record_fd is not None:
-                os.close(record_fd)
+                descriptor = record_fd
+                record_fd = None
+                if filesystem_complete:
+                    try:
+                        os.close(descriptor)
+                    except OSError:
+                        pass
+                else:
+                    os.close(descriptor)
             if quarantine_fd is not None:
-                os.close(quarantine_fd)
+                descriptor = quarantine_fd
+                quarantine_fd = None
+                if filesystem_complete:
+                    try:
+                        os.close(descriptor)
+                    except OSError:
+                        pass
+                else:
+                    os.close(descriptor)
 
     def _complete_empty_purge_at(
         self,
@@ -1203,9 +1369,11 @@ class ReimbursementService:
         record_id: str,
         *,
         quarantine_name: str | None = None,
+        retain_quarantine: bool = False,
     ) -> bool:
         root_fd: int | None = None
         quarantine_fd: int | None = None
+        filesystem_complete = False
         try:
             root_fd = self._open_directory(parent_fd, name)
             root_metadata = os.fstat(root_fd)
@@ -1227,9 +1395,18 @@ class ReimbursementService:
                 )
             self._remove_directory_contents(root_fd)
             os.rmdir(_CLEANUP_ENTRY_NAME, dir_fd=quarantine_fd)
-            os.close(quarantine_fd)
-            quarantine_fd = None
-            os.rmdir(quarantine_name, dir_fd=parent_fd)
+            filesystem_complete = True
+            if not retain_quarantine:
+                descriptor = quarantine_fd
+                quarantine_fd = None
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    return True
+                try:
+                    os.rmdir(quarantine_name, dir_fd=parent_fd)
+                except OSError:
+                    pass
             return True
         except FileNotFoundError:
             return False
@@ -1242,9 +1419,25 @@ class ReimbursementService:
             return False
         finally:
             if quarantine_fd is not None:
-                os.close(quarantine_fd)
+                descriptor = quarantine_fd
+                quarantine_fd = None
+                if filesystem_complete:
+                    try:
+                        os.close(descriptor)
+                    except OSError:
+                        pass
+                else:
+                    os.close(descriptor)
             if root_fd is not None:
-                os.close(root_fd)
+                descriptor = root_fd
+                root_fd = None
+                if filesystem_complete:
+                    try:
+                        os.close(descriptor)
+                    except OSError:
+                        pass
+                else:
+                    os.close(descriptor)
 
     @classmethod
     def _remove_directory_contents(cls, directory_fd: int) -> None:

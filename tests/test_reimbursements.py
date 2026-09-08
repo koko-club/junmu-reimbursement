@@ -2150,7 +2150,7 @@ class ReimbursementServiceTest(unittest.TestCase):
                 "SELECT * FROM reimbursements WHERE id = ?", (str(record_uuid),)
             ).fetchone()
         self.assertIsNotNone(row)
-        self.assertEqual(tuple(row), prior_values)
+        self.assertEqual(tuple(row), (*prior_values, None))
         self.assertFalse(final_dir.exists())
 
 

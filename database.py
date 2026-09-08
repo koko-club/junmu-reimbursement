@@ -82,7 +82,14 @@ class Database:
             connection.rollback()
             raise
         else:
-            connection.commit()
+            try:
+                connection.commit()
+            except Exception:
+                try:
+                    connection.rollback()
+                except Exception:
+                    pass
+                raise
         finally:
             connection.close()
 
@@ -127,6 +134,28 @@ class Database:
                 connection.execute(
                     "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
                     (2, datetime.now(timezone.utc).isoformat()),
+                )
+            version = connection.execute(
+                "SELECT 1 FROM schema_migrations WHERE version = 3"
+            ).fetchone()
+            if version is None:
+                columns = {
+                    row["name"]
+                    for row in connection.execute("PRAGMA table_info(reimbursements)")
+                }
+                if "purge_claim" not in columns:
+                    connection.execute(
+                        """ALTER TABLE reimbursements ADD COLUMN purge_claim TEXT
+                        CHECK (
+                            purge_claim IS NULL OR (
+                                length(purge_claim) = 64
+                                AND purge_claim NOT GLOB '*[^0-9a-f]*'
+                            )
+                        )"""
+                    )
+                connection.execute(
+                    "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
+                    (3, datetime.now(timezone.utc).isoformat()),
                 )
             connection.commit()
         except Exception:

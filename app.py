@@ -24,27 +24,33 @@ from web import WebApplication
 DEFAULT_REQUEST_IDLE_TIMEOUT_SECONDS = 15.0
 DEFAULT_MAX_CONCURRENT_REQUESTS = 32
 _CLEANUP_INTERVAL_SECONDS = 86400
+_CLEANUP_JOIN_TIMEOUT_SECONDS = 1.0
 _LOGGER = logging.getLogger(__name__)
 
 
 def _cleanup_loop(
     stop_event: threading.Event,
-    cleanup: Callable[[], None],
+    cleanup: Callable[[threading.Event], None],
 ) -> None:
     while not stop_event.wait(_CLEANUP_INTERVAL_SECONDS):
-        cleanup()
+        cleanup(stop_event)
 
 
 def _purge_expired(
     session_service: SessionService,
     reimbursement_service: ReimbursementService,
+    stop_event: threading.Event | None = None,
 ) -> None:
-    for label, purge in (
-        ("sessions", session_service.purge_expired),
-        ("reimbursements", reimbursement_service.purge_expired),
-    ):
+    for label in ("sessions", "reimbursements"):
+        if stop_event is not None and stop_event.is_set():
+            break
         try:
-            purge()
+            if label == "sessions":
+                session_service.purge_expired()
+            elif stop_event is None:
+                reimbursement_service.purge_expired()
+            else:
+                reimbursement_service.purge_expired(stop_event=stop_event)
         except Exception as error:
             _LOGGER.error(
                 "scheduled cleanup failed target=%s exception=%s",
@@ -117,8 +123,10 @@ class BoundedThreadingHTTPServer(ThreadingHTTPServer):
 
     def start_cleanup(
         self,
-        cleanup: Callable[[], None],
-        runner: Callable[[threading.Event, Callable[[], None]], None],
+        cleanup: Callable[[threading.Event | None], None],
+        runner: Callable[
+            [threading.Event, Callable[[threading.Event | None], None]], None
+        ],
     ) -> None:
         if self.cleanup_thread is not None:
             raise RuntimeError("cleanup loop already started")
@@ -146,7 +154,7 @@ class BoundedThreadingHTTPServer(ThreadingHTTPServer):
                 and cleanup_thread.ident is not None
                 and cleanup_thread is not threading.current_thread()
             ):
-                cleanup_thread.join()
+                cleanup_thread.join(timeout=_CLEANUP_JOIN_TIMEOUT_SECONDS)
 
     @property
     def active_request_count(self) -> int:
@@ -226,7 +234,7 @@ def create_server(
     config_path: Path,
     *,
     cleanup_runner: Callable[
-        [threading.Event, Callable[[], None]], None
+        [threading.Event, Callable[[threading.Event | None], None]], None
     ] = _cleanup_loop,
 ) -> ThreadingHTTPServer:
     """Create the configured server without starting its serving loop."""
@@ -392,7 +400,11 @@ def create_server(
     server.application = application
     server.database = database
     server.reimbursement_service = reimbursement_service
-    cleanup = lambda: _purge_expired(session_service, reimbursement_service)
+    cleanup = lambda stop_event=None: _purge_expired(
+        session_service,
+        reimbursement_service,
+        stop_event,
+    )
     cleanup()
     try:
         server.start_cleanup(cleanup, cleanup_runner)
