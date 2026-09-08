@@ -753,7 +753,15 @@ class ReimbursementService:
             quarantine_fd = self._open_directory(owner_fd, quarantine_name)
             if not os.path.samestat(quarantine_metadata, os.fstat(quarantine_fd)):
                 return False
-            if os.listdir(quarantine_fd) != [_CLEANUP_ENTRY_NAME]:
+            quarantine_entries = os.listdir(quarantine_fd)
+            if not quarantine_entries:
+                return self._complete_empty_purge_at(
+                    owner_fd,
+                    quarantine_name,
+                    quarantine_metadata,
+                    quarantine_fd,
+                )
+            if quarantine_entries != [_CLEANUP_ENTRY_NAME]:
                 return False
             record_metadata = os.stat(
                 _CLEANUP_ENTRY_NAME,
@@ -807,6 +815,69 @@ class ReimbursementService:
                 os.close(record_fd)
             if quarantine_fd is not None:
                 os.close(quarantine_fd)
+
+    def _complete_empty_purge_at(
+        self,
+        owner_fd: int,
+        quarantine_name: str,
+        expected_metadata: os.stat_result,
+        quarantine_fd: int,
+    ) -> bool:
+        completion_name: str | None = None
+        completion_fd: int | None = None
+        try:
+            current_metadata = os.stat(
+                quarantine_name,
+                dir_fd=owner_fd,
+                follow_symlinks=False,
+            )
+            if (
+                not os.path.samestat(expected_metadata, current_metadata)
+                or not os.path.samestat(current_metadata, os.fstat(quarantine_fd))
+                or os.listdir(quarantine_fd)
+            ):
+                return False
+            completion_name, completion_fd, matches = self._isolate_entry(
+                owner_fd,
+                quarantine_name,
+                current_metadata,
+            )
+            if not matches:
+                return False
+            isolated_metadata = os.stat(
+                _CLEANUP_ENTRY_NAME,
+                dir_fd=completion_fd,
+                follow_symlinks=False,
+            )
+            if (
+                not os.path.samestat(current_metadata, isolated_metadata)
+                or not os.path.samestat(isolated_metadata, os.fstat(quarantine_fd))
+                or os.listdir(quarantine_fd)
+            ):
+                return False
+            os.rmdir(_CLEANUP_ENTRY_NAME, dir_fd=completion_fd)
+
+            # The authenticated empty directory is gone; wrapper cleanup is ancillary.
+            try:
+                wrapper_metadata = os.fstat(completion_fd)
+                current_wrapper = os.stat(
+                    completion_name,
+                    dir_fd=owner_fd,
+                    follow_symlinks=False,
+                )
+                if (
+                    not os.listdir(completion_fd)
+                    and os.path.samestat(wrapper_metadata, current_wrapper)
+                ):
+                    os.close(completion_fd)
+                    completion_fd = None
+                    os.rmdir(completion_name, dir_fd=owner_fd)
+            except OSError:
+                pass
+            return True
+        finally:
+            if completion_fd is not None:
+                os.close(completion_fd)
 
     @staticmethod
     def _record_from_row(row) -> ReimbursementRecord:

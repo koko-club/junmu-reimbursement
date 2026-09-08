@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 import hmac
 import json
+import os
 import tempfile
 from pathlib import Path
 import threading
@@ -132,6 +133,46 @@ class ReimbursementCleanupTest(unittest.TestCase):
             owner_dir.glob(f".reimbursement-purge-{self.record_id}-*")
         )
         self.assertEqual(len(quarantines), 1)
+        return quarantines[0]
+
+    def _create_empty_purge_quarantine(
+        self,
+        service: ReimbursementService,
+    ) -> Path:
+        owner_dir = self.data_dir / "users" / str(self.user_id)
+        record_dir = owner_dir / self.record_id
+        record_dir.mkdir(parents=True)
+        (record_dir / "claim.xlsx").write_bytes(b"xlsx")
+        (record_dir / "claim.pdf").write_bytes(b"pdf")
+        service.trash(self.user_id, self.record_id)
+        real_rmdir = reimbursements.os.rmdir
+        failed_outer_rmdir = False
+
+        def fail_outer_quarantine_once(path, *args, **kwargs):
+            nonlocal failed_outer_rmdir
+            if (
+                not failed_outer_rmdir
+                and isinstance(path, str)
+                and path.startswith(f".reimbursement-purge-{self.record_id}-")
+            ):
+                failed_outer_rmdir = True
+                raise OSError("forced final quarantine rmdir failure")
+            return real_rmdir(path, *args, **kwargs)
+
+        with mock.patch(
+            "reimbursements.os.rmdir",
+            side_effect=fail_outer_quarantine_once,
+        ), self.assertLogs("reimbursements", level="ERROR"):
+            with self.assertRaises(ReimbursementNotFound):
+                service.purge_one(self.user_id, self.record_id)
+
+        quarantines = list(
+            owner_dir.glob(f".reimbursement-purge-{self.record_id}-*")
+        )
+        self.assertTrue(failed_outer_rmdir)
+        self.assertEqual(len(quarantines), 1)
+        self.assertEqual(list(quarantines[0].iterdir()), [])
+        self.assertIsNotNone(self._row(self.record_id))
         return quarantines[0]
 
     def test_owner_can_trash_active_record_at_supplied_time(self):
@@ -429,6 +470,192 @@ class ReimbursementCleanupTest(unittest.TestCase):
 
         self.assertFalse(quarantine.exists())
         self.assertIsNone(self._row(self.record_id))
+
+    def test_fresh_purge_retry_completes_empty_authenticated_quarantine(self):
+        app_secret = b"a" * 32
+        service = ReimbursementService(
+            self.database,
+            self.config,
+            app_secret=app_secret,
+        )
+        quarantine = self._create_empty_purge_quarantine(service)
+
+        restarted_service = ReimbursementService(
+            self.database,
+            self.config,
+            app_secret=app_secret,
+        )
+        try:
+            restarted_service.purge_one(self.user_id, self.record_id)
+        except ReimbursementNotFound:
+            self.fail("same-secret retry must complete the empty quarantine")
+
+        self.assertFalse(quarantine.exists())
+        self.assertIsNone(self._row(self.record_id))
+
+    def test_resumed_purge_retry_completes_empty_authenticated_quarantine(self):
+        app_secret = b"a" * 32
+        first_service = ReimbursementService(
+            self.database,
+            self.config,
+            app_secret=app_secret,
+        )
+        quarantine = self._create_partial_purge(first_service)
+        resumed_service = ReimbursementService(
+            self.database,
+            self.config,
+            app_secret=app_secret,
+        )
+        real_rmdir = reimbursements.os.rmdir
+        failed_outer_rmdir = False
+
+        def fail_outer_quarantine_once(path, *args, **kwargs):
+            nonlocal failed_outer_rmdir
+            if path == quarantine.name and not failed_outer_rmdir:
+                failed_outer_rmdir = True
+                raise OSError("forced resumed quarantine rmdir failure")
+            return real_rmdir(path, *args, **kwargs)
+
+        with mock.patch(
+            "reimbursements.os.rmdir",
+            side_effect=fail_outer_quarantine_once,
+        ), self.assertLogs("reimbursements", level="ERROR"):
+            with self.assertRaises(ReimbursementNotFound):
+                resumed_service.purge_one(self.user_id, self.record_id)
+
+        self.assertTrue(failed_outer_rmdir)
+        self.assertEqual(list(quarantine.iterdir()), [])
+        self.assertIsNotNone(self._row(self.record_id))
+
+        restarted_service = ReimbursementService(
+            self.database,
+            self.config,
+            app_secret=app_secret,
+        )
+        try:
+            restarted_service.purge_one(self.user_id, self.record_id)
+        except ReimbursementNotFound:
+            self.fail("same-secret retry must complete the empty quarantine")
+
+        self.assertFalse(quarantine.exists())
+        self.assertIsNone(self._row(self.record_id))
+
+    def test_empty_quarantine_with_different_secret_is_retained(self):
+        first_service = ReimbursementService(
+            self.database,
+            self.config,
+            app_secret=b"a" * 32,
+        )
+        quarantine = self._create_empty_purge_quarantine(first_service)
+        different_service = ReimbursementService(
+            self.database,
+            self.config,
+            app_secret=b"b" * 32,
+        )
+
+        with self.assertRaises(ReimbursementNotFound):
+            different_service.purge_one(self.user_id, self.record_id)
+
+        self.assertEqual(list(quarantine.iterdir()), [])
+        self.assertIsNotNone(self._row(self.record_id))
+
+    def test_empty_quarantine_with_fresh_default_key_is_retained(self):
+        with mock.patch(
+            "reimbursements.os.urandom",
+            side_effect=(b"a" * 32, b"b" * 32),
+        ):
+            first_service = ReimbursementService(self.database, self.config)
+            restarted_service = ReimbursementService(self.database, self.config)
+        quarantine = self._create_empty_purge_quarantine(first_service)
+
+        with self.assertRaises(ReimbursementNotFound):
+            restarted_service.purge_one(self.user_id, self.record_id)
+
+        self.assertEqual(list(quarantine.iterdir()), [])
+        self.assertIsNotNone(self._row(self.record_id))
+
+    def test_empty_quarantine_with_forged_signed_field_is_retained(self):
+        service = ReimbursementService(
+            self.database,
+            self.config,
+            app_secret=b"a" * 32,
+        )
+        service.trash(self.user_id, self.record_id)
+        owner_dir = self.data_dir / "users" / str(self.user_id)
+        owner_dir.mkdir(parents=True)
+        valid_name = service._purge_quarantine_name(self.record_id, (1, 2))
+        prefix = f".reimbursement-purge-{self.record_id}-"
+        device, inode, mac = valid_name[len(prefix):].split("-")
+        forged = owner_dir / f"{prefix}{int(device, 16) + 1:x}-{inode}-{mac}"
+        forged.mkdir()
+
+        with self.assertRaises(ReimbursementNotFound):
+            service.purge_one(self.user_id, self.record_id)
+
+        self.assertEqual(list(forged.iterdir()), [])
+        self.assertIsNotNone(self._row(self.record_id))
+
+    def test_authenticated_empty_quarantine_with_unknown_content_is_retained(self):
+        service = ReimbursementService(
+            self.database,
+            self.config,
+            app_secret=b"a" * 32,
+        )
+        quarantine = self._create_empty_purge_quarantine(service)
+        unknown = quarantine / "unknown"
+        unknown.write_bytes(b"keep")
+
+        with self.assertRaises(ReimbursementNotFound):
+            service.purge_one(self.user_id, self.record_id)
+
+        self.assertEqual(unknown.read_bytes(), b"keep")
+        self.assertIsNotNone(self._row(self.record_id))
+
+    def test_empty_quarantine_identity_race_retains_replacement(self):
+        service = ReimbursementService(
+            self.database,
+            self.config,
+            app_secret=b"a" * 32,
+        )
+        quarantine = self._create_empty_purge_quarantine(service)
+        original_metadata = quarantine.stat()
+        detached = self.root / "detached-empty-quarantine"
+        replacement = self.root / "replacement-empty-quarantine"
+        replacement.mkdir()
+        replacement_metadata = replacement.stat()
+        real_stat = reimbursements.os.stat
+        quarantine_stats = 0
+
+        def replace_after_final_identity_check(path, *args, **kwargs):
+            nonlocal quarantine_stats
+            metadata = real_stat(path, *args, **kwargs)
+            if path == quarantine.name:
+                quarantine_stats += 1
+                if quarantine_stats == 2:
+                    quarantine.rename(detached)
+                    replacement.rename(quarantine)
+            return metadata
+
+        with mock.patch(
+            "reimbursements.os.stat",
+            side_effect=replace_after_final_identity_check,
+        ):
+            with self.assertRaises(ReimbursementNotFound):
+                service.purge_one(self.user_id, self.record_id)
+
+        self.assertEqual(quarantine_stats, 2)
+        self.assertTrue(os.path.samestat(original_metadata, detached.stat()))
+        retained_metadata = [
+            candidate.lstat()
+            for candidate in (self.data_dir / "users").rglob("*")
+        ]
+        self.assertTrue(
+            any(
+                os.path.samestat(replacement_metadata, metadata)
+                for metadata in retained_metadata
+            )
+        )
+        self.assertIsNotNone(self._row(self.record_id))
 
     def test_purge_retry_with_different_secret_retains_quarantine_and_row(self):
         first_service = ReimbursementService(
