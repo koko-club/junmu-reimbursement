@@ -1,5 +1,11 @@
 # Progress
 
+## 2026-09-09
+- Resumed at clean `d621b40`. Task 8 is specification-approved; final quality review found two remaining post-success failure-reporting bugs. A fresh implementer is reproducing and fixing them with TDD.
+- Task 8 implementation sequence: `4855233`, `094491e`, `e504618`, `df9080c`, `e2db5ad`, `32d0e09`, `a8ba8b7`, `47fbd69`, `d621b40`. Includes owner-scoped APIs, safe streaming, durable purge recovery, bounded upload/cleanup, and private final database deletion.
+- Root independently verified `d621b40`: 182/182 focused tests and 338/338 full tests passed with fatal ResourceWarning. Specification review approved; quality review confirmed all original seven findings fixed before reporting post-commit outcome and upload cleanup bugs.
+- Remaining delivery work: administration/logging (9), account pages (10), protected form/sidebar (11), history/admin pages (12), backups/Synology Docker package (13), end-to-end/browser/container/restore verification (14).
+
 ## 2026-09-08
 - Task 7 complete: atomic per-user generation, private metadata, and descriptor-bound owned-file reads passed formal specification and independent code-quality review. Final evidence is 115/115 focused tests, 1/1 real LibreOffice E2E, 259/259 full-suite tests, clean compilation/diff checks, and clean worktree at `979deef`. Task 8 is now active.
 - Safety-first final verification: 115/115 Task 7 focused tests, 1/1 real LibreOffice E2E, and 259/259 complete tests pass with resource warnings promoted to errors; `py_compile` and `git diff --check` pass. Final review found no Critical, Important, or Minor issues. The follow-up changes tests and contract documentation only because the secure implementation is the original stat-first helper at `b1ae45f`. Task 7 remains in progress; Task 8, FIFO ordering, and automatic orphan cleanup remain untouched.

@@ -1,5 +1,11 @@
 # Findings
 
+## Current Implementation Boundaries
+- Delivery environment checked 2026-09-09: bundled Python/Pillow/openpyxl/LibreOffice wrapper and Playwright are available. `/usr/local/bin/docker` is a broken link to a missing `/Applications/Docker.app`; no working Docker engine has yet been found. Container build verification remains pending environment setup.
+- Task 8 purge uses claim-bound HMAC pending/completion markers and a private database connection for final bounded validation plus exact deletion. SQLite and POSIX cannot atomically coordinate arbitrary external writes to the data directory; direct OS-level data writers remain outside the application's access-control boundary.
+- Successful purge can retain two private data-free `.reimbursement-cleanup-*` directory wrappers. They are outside the recovery-marker namespace, cannot be downloaded, and do not block UUID reuse. Backup should copy only database-owned reimbursement directories, excluding these wrappers and unowned generation orphans.
+- The latest quality findings concern outcomes after durable success: commit/close exceptions must be reconciled before reporting purge failure, and upload temporary-directory cleanup must not hide an already-persisted generation result.
+
 ## Project Context
 - Task 7 started from clean `feature/auth-user-history` HEAD `9f86f6a`; the approved design and implementation plan already define this subtask, so no new design artifact is required.
 - Task 7 scope is limited to trusted validation overrides, atomic generation/history reads, safe owned-file resolution, and application construction wiring. Task 8 HTTP routes and trash/restore/purge writes remain untouched.
