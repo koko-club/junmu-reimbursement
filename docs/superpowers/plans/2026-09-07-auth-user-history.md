@@ -584,7 +584,7 @@ Expected: all focused tests pass, including formulas, blank dates, PDF uppercase
 
 Download handlers consume `OwnedReimbursementFile` only inside its context manager, set metadata from that object, and stream `owned.stream` in 64 KiB chunks. They never resolve or reopen a filesystem path after authorization.
 
-- [ ] **Step 1: Write the failing permission matrix**
+- [x] **Step 1: Write the failing permission matrix**
 
 ```python
 def test_file_routes_allow_only_owner(self):
@@ -607,7 +607,7 @@ def test_delete_restore_and_permanent_delete(self):
 
 Also test list scopes, Excel attachment, PDF inline, invalid kind/UUID, missing CSRF, purge without confirmation, expired purge, partial deletion, and stale-session denial.
 
-- [ ] **Step 2: Verify failure**
+- [x] **Step 2: Verify failure**
 
 ```bash
 python3 -m unittest tests.test_web_reimbursements tests.test_cleanup -v
@@ -615,11 +615,11 @@ python3 -m unittest tests.test_web_reimbursements tests.test_cleanup -v
 
 Expected: lifecycle routes are absent.
 
-- [ ] **Step 3: Implement lifecycle methods**
+- [x] **Step 3: Implement lifecycle methods**
 
 Add `trash(user_id,record_id,now=None)`, `restore(user_id,record_id)`, `purge_one(user_id,record_id)`, and `purge_expired(now=None)`. Every query contains both record ID and owner ID. Active downloads require `deleted_at IS NULL`. Permanent deletion only accepts trashed records; validate that resolved paths stay below `/data/users/<user_id>/<record_id>`. If filesystem removal fails, retain the database row for retry. Expired purge selects records older than 30 days and continues after individual errors.
 
-- [ ] **Step 4: Add exact routes**
+- [x] **Step 4: Add exact routes**
 
 ```text
 GET  /api/reimbursements?scope=active
@@ -634,7 +634,7 @@ POST /api/reimbursements/generate
 
 Another owner's record and a missing record return the same 404. Set `X-Content-Type-Options: nosniff`; Excel uses attachment disposition, PDF uses inline, and the RFC 5987 display filename never chooses a path.
 
-- [ ] **Step 5: Add cleanup lifecycle and commit**
+- [x] **Step 5: Add cleanup lifecycle and commit**
 
 At startup purge expired sessions and reimbursements once. Start one daemon loop using `threading.Event.wait(86400)`; stop and join it during `server_close()`. Tests inject a no-wait cleanup runner instead of sleeping.
 
@@ -703,6 +703,8 @@ POST /api/logout
 
 Every admin write requires active admin role and CSRF. User-management routes reject `role='admin'` targets. Password reset returns plaintext once under `Cache-Control: no-store`; no database or log field contains it.
 
+The shared self-service password-change page/API also permits the signed-in administrator to change their own password. Administrator-target rejection applies to user-management routes, not this self-service operation.
+
 - [ ] **Step 4: Add request IDs and safe JSON logs**
 
 Create `secrets.token_hex(8)` request ID per request. Log timestamp, request ID, remote IP, known user ID, method, named route, status, duration, and exception class. Never log headers, Cookie, body, passwords, temporary passwords, tokens, form data, or full file paths.
@@ -732,6 +734,7 @@ Expected: account and request-hardening tests pass.
 - Create: `static/auth.js`
 - Modify: `static/styles.css`
 - Create: `tests/test_frontend.py`
+- Modify: `web.py` and `tests/http_helpers.py` to serve the real account templates and use representative template fixtures
 
 - [ ] **Step 1: Write failing frontend contracts**
 
@@ -764,6 +767,8 @@ Expected: new templates and scripts are absent.
 - [ ] **Step 3: Implement account forms and submission**
 
 Each page loads shared CSS/common/auth scripts, uses `<form novalidate>`, and pairs every control with a `<label for>`. Setup and registration compare passwords in the browser and still rely on server checks. The GET route embeds an action-bound anonymous CSRF token in `data-csrf`.
+
+Replace the current placeholder account markup in `web.py` with the templates, escaping the injected token. Keep test fixtures representative of the actual pages so HTTP tests exercise the same rendering path.
 
 Use this request shape:
 
@@ -866,6 +871,7 @@ Expected: frontend, server, validation, and generator tests pass.
 - Create: `templates/admin.html`
 - Create: `static/history.js`
 - Create: `static/admin.js`
+- Modify: `web.py` to serve authenticated `/history` and `/trash` pages and the administrator template
 - Modify: `static/styles.css`
 - Modify: `tests/test_frontend.py`
 

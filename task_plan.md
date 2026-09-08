@@ -4,7 +4,7 @@
 在现有差旅报销网页工具基础上增加管理员、普通用户登录、普通用户单会话限制，以及按用户隔离的 Excel/PDF 生成历史。
 
 ## Current Phase
-Task 8 has specification approval at `d621b40` and is addressing two final quality findings: purge commit/close outcome reporting and upload cleanup after successful generation. Tasks 9-14 remain pending; user confirmed continuous execution.
+Task 9 administration APIs and safe request logging are in progress. Tasks 1-8 are complete after specification and independent quality approval; Tasks 10-14 remain pending. User confirmed continuous execution.
 
 ## Task 8 Review Follow-up
 - [x] Implement private history, descriptor-streamed downloads, recycle bin, and daily purge
@@ -13,9 +13,9 @@ Task 8 has specification approval at `d621b40` and is addressing two final quali
 - [x] Keep final purge validation/deletion on a private database connection
 - [x] Independent verification at `d621b40`: 182 focused and 338 complete tests passed
 - [x] Final specification review approved `d621b40`
-- [ ] Preserve successful results across post-commit database close/commit and upload cleanup errors
-- [ ] Specification regression and independent quality approval
-- [ ] Mark Task 8 complete and continue Tasks 9-14
+- [x] Preserve successful results across post-commit database close/commit and upload cleanup errors
+- [x] Specification regression and independent quality approval
+- [x] Mark Task 8 complete and continue Tasks 9-14
 
 ## Task 7 Review Follow-up
 - [x] RED: prove an exporter cannot replace, delete, or change the workbook into a non-regular file after its first validation

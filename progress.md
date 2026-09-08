@@ -1,6 +1,9 @@
 # Progress
 
 ## 2026-09-09
+- Task 8 complete at `5d5440b`: specification review approved after 11 targeted scenarios; independent quality review approved after 9 focused tests. Full implementation suite passed 345 tests with fatal ResourceWarning. Task 9 is now active.
+- `5d5440b` fixes post-commit delete outcomes and upload cleanup masking. Implementer verified 345/345 full tests; root independently passed the four critical database regressions and diff checks. Focused specification review is running before independent quality review.
+- Plan integration clarification: Tasks 10/12 must wire real templates through `web.py` (the current routes return placeholder markup); common self-service password change must also work for administrators.
 - Resumed at clean `d621b40`. Task 8 is specification-approved; final quality review found two remaining post-success failure-reporting bugs. A fresh implementer is reproducing and fixing them with TDD.
 - Task 8 implementation sequence: `4855233`, `094491e`, `e504618`, `df9080c`, `e2db5ad`, `32d0e09`, `a8ba8b7`, `47fbd69`, `d621b40`. Includes owner-scoped APIs, safe streaming, durable purge recovery, bounded upload/cleanup, and private final database deletion.
 - Root independently verified `d621b40`: 182/182 focused tests and 338/338 full tests passed with fatal ResourceWarning. Specification review approved; quality review confirmed all original seven findings fixed before reporting post-commit outcome and upload cleanup bugs.
