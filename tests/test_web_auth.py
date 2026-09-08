@@ -847,7 +847,8 @@ class WebAuthenticationTest(unittest.TestCase):
             "web._LOGGER.exception"
         ) as log_exception:
             application._dispatch(handler, "GET")
-        log_exception.assert_called_once()
+        log_exception.assert_not_called()
+        self.assertEqual(handler._request_state.exception, "RuntimeError")
         render_json.assert_called_once_with(
             handler, 500, {"error": "服务暂时不可用，请稍后重试"}
         )
@@ -857,6 +858,256 @@ class WebAuthenticationTest(unittest.TestCase):
         anonymous = self.running.new_client()
         self.assertEqual(anonymous.request("POST", "/generate", body=b"").status, 404)
         self.assertEqual(anonymous.get("/download/report.pdf").status, 404)
+
+
+class AdminApiTest(unittest.TestCase):
+    def setUp(self):
+        self.running = RunningApp().__enter__()
+        self.admin = self.running.users.setup_admin(
+            "admin", ADMIN_PASSWORD, "管理员", "财务部"
+        )
+        self.client = self.running.client
+        self.client.post_json(
+            "/api/login", {"username": "admin", "password": ADMIN_PASSWORD}
+        )
+
+    def tearDown(self):
+        self.running.__exit__(None, None, None)
+
+    def pending(self, username="alice"):
+        return self.running.users.register(username, USER_PASSWORD, "张三", "技术部")
+
+    def approved(self):
+        return self.running.users.approve(self.admin.id, self.pending().id)
+
+    def login_user(self, password=USER_PASSWORD):
+        client = self.running.new_client()
+        response = client.post_json(
+            "/api/login", {"username": "alice", "password": password}
+        )
+        self.assertEqual(response.status, 200)
+        return client
+
+    def assert_public_user(self, payload):
+        self.assertEqual(set(payload), {
+            "id", "username", "real_name", "department", "role", "status",
+            "must_change_password", "created_at", "approved_at", "updated_at",
+        })
+        self.assertIs(type(payload["must_change_password"]), bool)
+
+    def test_register_approve_profile_disable_enable_reset_and_change_flow(self):
+        applicant = self.running.new_client()
+        registered = applicant.post_json("/api/register", {
+            "username": "alice", "password": USER_PASSWORD,
+            "real_name": "张三", "department": "技术部",
+        })
+        self.assertEqual(registered.status, 201)
+        pending = self.client.get("/api/admin/registrations")
+        self.assertEqual(pending.status, 200)
+        user = pending.json()["users"][0]
+        self.assert_public_user(user)
+        self.assertEqual(user["status"], "pending")
+        user_id = user["id"]
+        response = self.client.post_json(f"/api/admin/registrations/{user_id}/approve", {})
+        self.assertEqual(response.status, 200)
+        self.assert_public_user(response.json()["user"])
+        self.assertEqual(response.json()["user"]["status"], "active")
+        self.assertEqual(self.client.get("/api/admin/registrations").json(), {"users": []})
+        member = self.login_user()
+        changed = self.client.post_json(f"/api/admin/users/{user_id}/profile", {
+            "real_name": " 李四 ", "department": " 人事部 ",
+        })
+        self.assertEqual(changed.status, 200)
+        self.assert_public_user(changed.json()["user"])
+        self.assertEqual(changed.json()["user"]["real_name"], "李四")
+        self.assertEqual(member.get("/api/session").json()["user"]["department"], "人事部")
+        disabled = self.client.post_json(f"/api/admin/users/{user_id}/status", {"enabled": False})
+        self.assertEqual(disabled.status, 200)
+        self.assertEqual(disabled.json()["user"]["status"], "disabled")
+        self.assertEqual(member.get("/api/session").status, 401)
+        listed = self.client.get("/api/admin/users")
+        self.assertEqual(listed.status, 200)
+        self.assertEqual(len(listed.json()["users"]), 1)
+        self.assert_public_user(listed.json()["users"][0])
+        self.assertEqual(listed.json()["users"][0]["status"], "disabled")
+        self.assertEqual(self.client.post_json(
+            f"/api/admin/users/{user_id}/status", {"enabled": True}
+        ).status, 200)
+        member = self.login_user()
+        reset = self.client.post_json(f"/api/admin/users/{user_id}/reset-password", {})
+        self.assertEqual(reset.status, 200)
+        self.assertEqual(reset.headers["Cache-Control"], "no-store")
+        self.assertEqual(set(reset.json()), {"temporary_password"})
+        self.assertEqual(member.get("/api/session").status, 401)
+        temporary = reset.json()["temporary_password"]
+        member = self.login_user(temporary)
+        self.assertEqual(member.get("/api/reimbursements?scope=active").status, 403)
+        self.assertEqual(member.get("/api/admin/users").status, 403)
+        changed = member.post_json("/api/password/change", {
+            "current_password": temporary, "new_password": "a new secure password",
+        })
+        self.assertEqual(changed.status, 200)
+        self.assertIn("Max-Age=0", changed.headers["Set-Cookie"])
+        self.assertEqual(member.get("/api/session").status, 401)
+        member = self.login_user("a new secure password")
+        self.assertEqual(member.get("/api/reimbursements?scope=active").status, 200)
+        self.assertFalse(member.get("/api/session").json()["user"]["must_change_password"])
+
+    def test_reject_releases_username_for_registration(self):
+        pending = self.pending()
+        rejected = self.client.post_json(f"/api/admin/registrations/{pending.id}/reject", {})
+        self.assertEqual(rejected.status, 200)
+        self.assertEqual(set(rejected.json()), {"message"})
+        self.assertEqual(self.client.get("/api/admin/registrations").json(), {"users": []})
+        applicant = self.running.new_client()
+        self.assertEqual(applicant.post_json("/api/register", {
+            "username": "alice", "password": USER_PASSWORD,
+            "real_name": "张三", "department": "技术部",
+        }).status, 201)
+
+    def test_every_admin_route_requires_active_admin(self):
+        user = self.approved()
+        member = self.login_user()
+        routes = [
+            ("GET", "/api/admin/registrations"), ("GET", "/api/admin/users"),
+            ("POST", f"/api/admin/registrations/{user.id}/approve"),
+            ("POST", f"/api/admin/registrations/{user.id}/reject"),
+            ("POST", f"/api/admin/users/{user.id}/profile"),
+            ("POST", f"/api/admin/users/{user.id}/status"),
+            ("POST", f"/api/admin/users/{user.id}/reset-password"),
+        ]
+        anonymous = self.running.new_client()
+        for client, expected in ((anonymous, 401), (member, 403)):
+            for method, path in routes:
+                with self.subTest(expected=expected, path=path):
+                    response = client.request(method, path, body=b"{}")
+                    self.assertEqual(response.status, expected)
+        with self.running.server.database.transaction(immediate=True) as connection:
+            connection.execute("UPDATE users SET status = 'disabled' WHERE id = ?", (self.admin.id,))
+        for method, path in routes:
+            with self.subTest(disabled_admin=path):
+                self.assertEqual(self.client.request(method, path, body=b"{}").status, 401)
+
+    def test_all_admin_writes_check_csrf_before_parsing_or_business_work(self):
+        pending = self.pending()
+        cases = [
+            (f"/api/admin/registrations/{pending.id}/approve", "approve"),
+            (f"/api/admin/registrations/{pending.id}/reject", "reject"),
+            (f"/api/admin/users/{pending.id}/profile", "update_profile"),
+            (f"/api/admin/users/{pending.id}/status", "set_enabled"),
+            (f"/api/admin/users/{pending.id}/reset-password", "reset_password"),
+        ]
+        for path, operation in cases:
+            with self.subTest(path=path), mock.patch.object(self.running.users, operation) as action:
+                for csrf in (None, "wrong-token"):
+                    headers = {} if csrf is None else {"X-CSRF-Token": csrf}
+                    response = self.client.request("POST", path, body=b"not-json", headers=headers)
+                    self.assertEqual(response.status, 403)
+                    self.assertIn("安全校验", response.json()["error"])
+                action.assert_not_called()
+        self.assertEqual(self.running.users.get(pending.id).status, "pending")
+
+    def test_management_rejects_admin_target_for_every_mutation(self):
+        cases = [
+            ("registrations", "approve", {}), ("registrations", "reject", {}),
+            ("users", "profile", {"real_name": "攻击", "department": "攻击"}),
+            ("users", "status", {"enabled": False}), ("users", "reset-password", {}),
+        ]
+        before = self.running.users.get(self.admin.id)
+        for section, action, payload in cases:
+            with self.subTest(action=action):
+                response = self.client.post_json(
+                    f"/api/admin/{section}/{self.admin.id}/{action}", payload
+                )
+                self.assertEqual(response.status, 403)
+                self.assertIn("管理员", response.json()["error"])
+        self.assertEqual(self.running.users.get(self.admin.id), before)
+
+    def test_admin_paths_require_bounded_canonical_ids_and_exact_actions(self):
+        for value in ("0", "-1", "+1", "01", "1.0", "1e0", "１", "9223372036854775808", "9" * 80):
+            for section, action in (("users", "reset-password"), ("registrations", "approve")):
+                with self.subTest(value=value, action=action):
+                    from urllib.parse import quote
+                    response = self.client.post_json(
+                        f"/api/admin/{section}/{quote(value)}/{action}", {}, csrf=False
+                    )
+                    self.assertEqual(response.status, 404)
+        for path in ("/api/admin/users/1/approve", "/api/admin/registrations/1/status",
+                     "/api/admin/users/1/reset-password/extra", "/api/admin/users/1/reset-password/",
+                     "/api/admin/users//status", "/api/admin/users/1/delete"):
+            with self.subTest(path=path):
+                self.assertEqual(self.client.post_json(path, {}, csrf=False).status, 404)
+        response = self.client.post_json("/api/admin/users/9223372036854775807/reset-password", {})
+        self.assertEqual(response.status, 404)
+
+    def test_admin_payload_validation_and_state_errors_are_safe(self):
+        user = self.approved()
+        for action, payload in (
+            ("profile", {}), ("profile", {"real_name": [], "department": "部门"}),
+            ("profile", {"real_name": "=FORMULA", "department": "部门"}),
+            ("profile", {"real_name": "姓名", "department": ""}),
+            ("profile", {"real_name": "姓名", "department": "部门", "role": "admin"}),
+            ("status", {}), ("status", {"enabled": "false"}), ("status", {"enabled": 0}),
+            ("status", {"enabled": None}), ("status", {"enabled": False, "role": "admin"}),
+            ("reset-password", {"password": "chosen-password"}),
+        ):
+            with self.subTest(action=action, payload=payload):
+                response = self.client.post_json(f"/api/admin/users/{user.id}/{action}", payload)
+                self.assertEqual(response.status, 400)
+                self.assertEqual(set(response.json()), {"error"})
+                self.assertTrue(any("\u4e00" <= char <= "\u9fff" for char in response.json()["error"]))
+        pending = self.pending("another")
+        for action in ("approve", "reject"):
+            self.assertEqual(self.client.post_json(
+                f"/api/admin/registrations/{pending.id}/{action}", {"unexpected": True}
+            ).status, 400)
+        self.assertEqual(self.running.users.get(user.id).status, "active")
+        self.assertEqual(self.client.post_json(
+            f"/api/admin/users/{user.id}/status", {"enabled": True}
+        ).status, 409)
+        self.assertEqual(self.client.post_json(
+            f"/api/admin/registrations/{user.id}/approve", {}
+        ).status, 409)
+
+    def test_admin_can_change_own_password_and_revokes_old_session(self):
+        self.assertEqual(self.client.get("/change-password", follow_redirects=False).status, 200)
+        token = self.client.csrf_for("/api/password/change")
+        self.assertEqual(self.client.post_json("/api/password/change", {
+            "current_password": ADMIN_PASSWORD, "new_password": "new administrator password",
+        }, csrf=False).status, 403)
+        self.assertEqual(self.client.post_json("/api/password/change", {
+            "current_password": "wrong password", "new_password": "new administrator password",
+        }, csrf=token).status, 400)
+        response = self.client.post_json("/api/password/change", {
+            "current_password": ADMIN_PASSWORD, "new_password": "new administrator password",
+        }, csrf=token)
+        self.assertEqual(response.status, 200)
+        self.assertIn("Max-Age=0", response.headers["Set-Cookie"])
+        self.assertEqual(self.client.get("/api/session").status, 401)
+        self.assertEqual(self.client.post_json("/api/login", {
+            "username": "admin", "password": ADMIN_PASSWORD,
+        }).status, 401)
+        self.assertEqual(self.client.post_json("/api/login", {
+            "username": "admin", "password": "new administrator password",
+        }).status, 200)
+        self.assertEqual(self.client.get("/api/admin/users").status, 200)
+
+    def test_unencodable_profile_text_has_safe_validation_error(self):
+        user = self.approved()
+        csrf = self.client.csrf_for(f"/api/admin/users/{user.id}/profile")
+        for field in ("real_name", "department"):
+            body = (
+                b'{"real_name":"Name","department":"Department"}'
+                .replace(b'"' + field.encode() + b'":"', b'"' + field.encode() + b'":"\\ud800')
+            )
+            with self.subTest(field=field):
+                response = self.client.request(
+                    "POST", f"/api/admin/users/{user.id}/profile", body=body,
+                    headers={"Content-Type": "application/json", "X-CSRF-Token": csrf},
+                )
+                self.assertEqual(response.status, 400)
+                self.assertEqual(set(response.json()), {"error"})
+        self.assertEqual(self.running.users.get(user.id).real_name, "张三")
 
 
 if __name__ == "__main__":

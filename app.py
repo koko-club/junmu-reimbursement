@@ -18,7 +18,7 @@ from reimbursements import ReimbursementService
 from security import AnonymousCsrfSigner, PasswordHasher, load_or_create_secret
 from sessions import SessionService
 from users import UserService
-from web import WebApplication
+from web import RequestState, WebApplication
 
 
 DEFAULT_REQUEST_IDLE_TIMEOUT_SECONDS = 15.0
@@ -205,11 +205,18 @@ class BoundedThreadingHTTPServer(ThreadingHTTPServer):
             self._request_slots.release()
 
     def _reject_saturated(self, request) -> None:
+        state = RequestState(route="rejected")
+        try:
+            peer = request.getpeername()
+        except OSError:
+            peer = ()
+        remote_ip = str(peer[0]) if isinstance(peer, tuple) and peer else "unknown"
         body = '{"error":"\u670d\u52a1\u5668\u5fd9\uff0c\u8bf7\u7a0d\u540e\u91cd\u8bd5"}'.encode("utf-8")
         response_head = (
             b"HTTP/1.1 503 Service Unavailable\r\n"
             b"Content-Type: application/json; charset=utf-8\r\n"
             + f"Content-Length: {len(body)}\r\n".encode("ascii")
+            + f"X-Request-ID: {state.request_id}\r\n".encode("ascii")
             + b"Cache-Control: no-store\r\n"
             b"X-Content-Type-Options: nosniff\r\n"
             b"Connection: close\r\n\r\n"
@@ -223,11 +230,15 @@ class BoundedThreadingHTTPServer(ThreadingHTTPServer):
                 pass
             request.settimeout(min(self.request_idle_timeout, 1.0))
             confirmed_head = request_prefix.startswith(b"HEAD ")
+            state.status = 503
             request.sendall(response_head if confirmed_head else response_head + body)
-        except OSError:
-            pass
+        except OSError as error:
+            state.exception = type(error).__name__
         finally:
-            self.shutdown_request(request)
+            try:
+                self.shutdown_request(request)
+            finally:
+                state.log(remote_ip, request_prefix)
 
 
 def create_server(
@@ -276,6 +287,28 @@ def create_server(
             self.rfile = io.BufferedReader(self._deadline_reader)
 
         def handle_one_request(self) -> None:
+            application.begin_request(self)
+            self.raw_requestline = b""
+            self.requestline = ""
+            self.command = ""
+            self.request_version = "HTTP/1.0"
+            try:
+                application._safely(self, self._handle_one_request)
+            finally:
+                application.finish_request(self)
+
+        def send_response(self, code: int, message: str | None = None) -> None:
+            self._request_state.pending_status = int(code)
+            super().send_response(code, message)
+
+        def end_headers(self) -> None:
+            state = self._request_state
+            self.send_header("X-Request-ID", state.request_id)
+            state.response_committed = True
+            state.status = state.pending_status
+            super().end_headers()
+
+        def _handle_one_request(self) -> None:
             deadline_token = self._deadline_reader.begin_deadline()
             read_timed_out = False
             read_failed = False
@@ -285,7 +318,8 @@ def create_server(
                     self.raw_requestline = self._read_request_line(65537)
                 except TimeoutError:
                     read_timed_out = True
-                except OSError:
+                except OSError as error:
+                    self._request_state.exception = type(error).__name__
                     read_failed = True
                 if not read_timed_out and not read_failed and self.raw_requestline:
                     if len(self.raw_requestline) <= 65536:
@@ -293,7 +327,8 @@ def create_server(
                             parsed = self.parse_request()
                         except TimeoutError:
                             read_timed_out = True
-                        except OSError:
+                        except OSError as error:
+                            self._request_state.exception = type(error).__name__
                             read_failed = True
             finally:
                 self._deadline_reader.finish_deadline(deadline_token)
@@ -325,7 +360,8 @@ def create_server(
             getattr(self, method_name)()
             try:
                 self.wfile.flush()
-            except TimeoutError:
+            except TimeoutError as error:
+                self._request_state.exception = type(error).__name__
                 self.close_connection = True
 
         def read_request_body(self, length: int) -> bytes:
@@ -352,6 +388,7 @@ def create_server(
             return bytes(consumed)
 
         def _request_timed_out(self) -> None:
+            self._request_state.exception = "TimeoutError"
             self.close_connection = True
             if not hasattr(self, "raw_requestline"):
                 self.raw_requestline = b""
@@ -386,7 +423,7 @@ def create_server(
             if code == 501:
                 application.handle_unsupported(self)
                 return
-            if code in {400, 408, 414, 431}:
+            if code in {400, 408, 414, 431, 505}:
                 application.handle_parser_error(self, code)
                 return
             super().send_error(code, message, explain)
@@ -415,6 +452,7 @@ def create_server(
 
 
 def main() -> None:
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
     config_path = Path(__file__).resolve().with_name("config.json")
     server = create_server(config_path)
     host, port = server.server_address[:2]

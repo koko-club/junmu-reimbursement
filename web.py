@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from email import policy
 from email.parser import BytesParser
@@ -15,6 +15,7 @@ import logging
 import math
 import mimetypes
 from pathlib import Path, PurePosixPath
+import secrets
 import tempfile
 import threading
 import time
@@ -34,8 +35,12 @@ from security import AnonymousCsrfSigner
 from sessions import AuthenticatedUser, SessionService
 from users import (
     AuthenticationFailed,
+    InvalidState,
+    PermissionDenied,
     SetupClosed,
     UserError,
+    UserNotFound,
+    UserOperationBusy,
     UserService,
     UsernameTaken,
     ValidationError,
@@ -58,6 +63,7 @@ LOGIN_IP_RATE_LIMIT_ATTEMPTS = 10
 LOGIN_GLOBAL_RATE_LIMIT_ATTEMPTS = 100
 _INVALID_LOGIN_USERNAME_KEY = ("invalid", "<invalid>")
 _REIMBURSEMENT_PREFIX = "/api/reimbursements/"
+_ADMIN_PREFIX = "/api/admin/"
 _XLSX_CONTENT_TYPE = (
     "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 )
@@ -75,6 +81,42 @@ class Route:
     roles: tuple[str, ...] = ()
     allow_forced_password_change: bool = False
     csrf: str | None = None
+
+
+@dataclass
+class RequestState:
+    request_id: str = field(default_factory=lambda: secrets.token_hex(8))
+    started_at: float = field(default_factory=time.monotonic)
+    route: str = "unknown_route"
+    user_id: int | None = None
+    status: int | None = None
+    pending_status: int | None = None
+    response_committed: bool = False
+    exception: str | None = None
+
+    def log(self, remote_ip: str, raw_requestline: bytes) -> None:
+        methods = {"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS", "CONNECT", "TRACE"}
+        raw_method = raw_requestline.split(maxsplit=1)[:1]
+        method = next(
+            (name for name in methods if raw_method == [name.encode("ascii")]),
+            "OTHER" if b" " in raw_requestline else "UNKNOWN",
+        )
+        payload = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "request_id": self.request_id,
+            "remote_ip": remote_ip,
+            "user_id": self.user_id,
+            "method": method,
+            "route": self.route,
+            "status": self.status,
+            "duration_ms": round((time.monotonic() - self.started_at) * 1000, 3),
+            "exception": self.exception,
+        }
+        io_exception = self.exception in {"OSError", "BrokenPipeError", "ConnectionError", "TimeoutError"}
+        _LOGGER.log(
+            logging.INFO if io_exception else (logging.ERROR if self.exception else logging.INFO),
+            json.dumps(payload, ensure_ascii=True, separators=(",", ":")),
+        )
 
 
 class AttemptRateLimiter:
@@ -190,21 +232,22 @@ class WebApplication:
                 "_reimbursement_list", authentication=True, roles=("user",)
             ),
             "/change-password": Route(
-                "_change_password_page", authentication=True, roles=("user",),
+                "_change_password_page", authentication=True,
                 allow_forced_password_change=True,
             ),
             "/": Route("_root", authentication=True, roles=("user",)),
             "/admin": Route("_admin_page", authentication=True, roles=("admin",)),
-            # Task 7 replaces this placeholder; keeping the namespace guarded prevents
-            # forced-change sessions from probing an upcoming administrator endpoint.
-            "/api/admin/users": Route("_not_found", authentication=True, roles=("admin",)),
+            "/api/admin/users": Route("_admin_users", authentication=True, roles=("admin",)),
+            "/api/admin/registrations": Route(
+                "_admin_registrations", authentication=True, roles=("admin",)
+            ),
         }
         self.post_routes = {
             "/api/setup": Route("_setup", setup="incomplete", csrf="anonymous"),
             "/api/login": Route("_login", csrf="anonymous"),
             "/api/register": Route("_register", csrf="anonymous"),
             "/api/password/change": Route(
-                "_change_password", authentication=True, roles=("user",),
+                "_change_password", authentication=True,
                 allow_forced_password_change=True, csrf="session",
             ),
             "/api/logout": Route(
@@ -227,11 +270,13 @@ class WebApplication:
         self._safely(handler, lambda: self._unsupported(handler))
 
     def handle_parser_error(self, handler: BaseHTTPRequestHandler, status: int) -> None:
+        self._request_state(handler).route = "parser_error"
         messages = {
             400: "请求格式错误",
             408: "请求读取超时",
             414: "请求路径过长",
             431: "请求头过大",
+            505: "不支持此 HTTP 版本，请使用 HTTP/1.1",
         }
         handler.close_connection = True
         if getattr(handler, "request_version", "HTTP/0.9") in {"", "HTTP/0.9"}:
@@ -246,7 +291,8 @@ class WebApplication:
                 {"error": messages.get(status, "请求格式错误")},
                 headers={"Connection": "close"},
             )
-        except OSError:
+        except OSError as error:
+            self._request_state(handler).exception = type(error).__name__
             return
 
     def _unsupported(self, handler: BaseHTTPRequestHandler) -> None:
@@ -255,23 +301,57 @@ class WebApplication:
             self._json(handler, 404, {"error": "请求路径不存在"})
             return
         allowed = []
+        if path.startswith("/static/"):
+            self._request_state(handler).route = "static"
         if self._route_for("GET", path) is not None or path.startswith("/static/"):
             allowed.append("GET")
         if self._route_for("POST", path) is not None:
             allowed.append("POST")
+        route = self._route_for("GET", path) or self._route_for("POST", path)
+        if route is not None:
+            self._request_state(handler).route = self._route_name(route, path)
         if not allowed:
             self._json(handler, 404, {"error": "请求路径不存在"})
             return
         self._method_not_allowed(handler, ", ".join(allowed))
 
     def _safely(self, handler: BaseHTTPRequestHandler, action: Callable[[], None]) -> None:
+        state = self._request_state(handler)
         try:
             action()
-        except (ConnectionError, TimeoutError):
+        except (ConnectionError, TimeoutError) as error:
+            state.exception = type(error).__name__
+            handler.close_connection = True
             return
-        except Exception:
-            _LOGGER.exception("unhandled web request failure for %s", handler.command)
-            self._json(handler, 500, {"error": "服务暂时不可用，请稍后重试"})
+        except Exception as error:
+            state.exception = type(error).__name__
+            handler.close_connection = True
+            if state.response_committed:
+                return
+            try:
+                self._json(handler, 500, {"error": "服务暂时不可用，请稍后重试"})
+            except (ConnectionError, TimeoutError):
+                return
+
+    @staticmethod
+    def begin_request(handler: BaseHTTPRequestHandler) -> None:
+        handler._request_state = RequestState()
+
+    def _request_state(self, handler: BaseHTTPRequestHandler) -> RequestState:
+        if not isinstance(getattr(handler, "_request_state", None), RequestState):
+            self.begin_request(handler)
+        return handler._request_state
+
+    def finish_request(self, handler: BaseHTTPRequestHandler) -> None:
+        state = self._request_state(handler)
+        if not getattr(handler, "raw_requestline", b"") and state.status is None:
+            return
+        state.log(str(handler.client_address[0]), handler.raw_requestline)
+
+    def _route_name(self, route: Route, path: str) -> str:
+        if route.callback == "_admin_mutation":
+            return "admin_" + self._admin_parts(path)[1].replace("-", "_")
+        return route.callback.lstrip("_")
 
     def _dispatch(self, handler: BaseHTTPRequestHandler, method: str) -> None:
         path = self._decoded_path(handler.path)
@@ -279,9 +359,11 @@ class WebApplication:
             self._json(handler, 404, {"error": "请求路径不存在"})
             return
         if method == "GET" and path.startswith("/static/"):
+            self._request_state(handler).route = "static"
             self._static(handler, path)
             return
         if method != "GET" and path.startswith("/static/"):
+            self._request_state(handler).route = "static"
             self._method_not_allowed(handler, "GET")
             return
 
@@ -289,17 +371,23 @@ class WebApplication:
         if route is None:
             other_method = "POST" if method == "GET" else "GET"
             if self._route_for(other_method, path) is not None:
+                self._request_state(handler).route = self._route_name(
+                    self._route_for(other_method, path), path
+                )
                 self._method_not_allowed(handler, "POST" if method == "GET" else "GET")
             else:
                 self._json(handler, 404, {"error": "请求路径不存在"})
             return
 
+        self._request_state(handler).route = self._route_name(route, path)
         setup_complete = self.user_service.setup_complete()
         if not self._guard_setup(handler, path, route, setup_complete):
             return
 
         token = self._session_token(handler)
         current_user = self.session_service.resolve(token) if token else None
+        if current_user is not None:
+            self._request_state(handler).user_id = current_user.user_id
         if route.authentication and current_user is None:
             self._unauthenticated(handler, path, token is not None)
             return
@@ -328,18 +416,15 @@ class WebApplication:
 
         callback: Callable[[BaseHTTPRequestHandler, AuthenticatedUser | None, str | None], None]
         callback = getattr(self, route.callback)
-        try:
-            callback(handler, current_user, token)
-        except (ConnectionError, TimeoutError):
-            handler.close_connection = True
-            return
-        except Exception:
-            _LOGGER.exception("unhandled web request failure for %s %s", method, path)
-            self._json(handler, 500, {"error": "服务暂时不可用，请稍后重试"})
+        self._safely(handler, lambda: callback(handler, current_user, token))
 
     def _route_for(self, method: str, path: str) -> Route | None:
         routes = self.get_routes if method == "GET" else self.post_routes
         route = routes.get(path)
+        if route is None and method == "POST" and self._admin_parts(path) is not None:
+            return Route(
+                "_admin_mutation", authentication=True, roles=("admin",), csrf="session"
+            )
         if route is not None or not path.startswith(_REIMBURSEMENT_PREFIX):
             return route
         parts = path[len(_REIMBURSEMENT_PREFIX):].split("/")
@@ -359,6 +444,30 @@ class WebApplication:
                 csrf="session",
             )
         return None
+
+    @staticmethod
+    def _admin_parts(path: str) -> tuple[int, str] | None:
+        if not path.startswith(_ADMIN_PREFIX):
+            return None
+        parts = path[len(_ADMIN_PREFIX):].split("/")
+        if len(parts) != 3:
+            return None
+        section, identifier, action = parts
+        actions = {
+            "registrations": {"approve", "reject"},
+            "users": {"profile", "status", "reset-password"},
+        }
+        if action not in actions.get(section, ()):
+            return None
+        if (
+            not identifier.isascii() or not identifier.isdecimal()
+            or len(identifier) > 19 or identifier.startswith("0")
+        ):
+            return None
+        user_id = int(identifier)
+        if user_id > 2**63 - 1:
+            return None
+        return user_id, action
 
     def _guard_setup(
         self,
@@ -414,6 +523,94 @@ class WebApplication:
     def _admin_page(self, handler, _user, _token) -> None:
         self._html(handler, 200, self._page_markup("系统管理"))
 
+    def _admin_registrations(self, handler, user, _token) -> None:
+        self._admin_list(handler, user, self.user_service.list_pending)
+
+    def _admin_users(self, handler, user, _token) -> None:
+        self._admin_list(handler, user, self.user_service.list_approved_users)
+
+    def _admin_list(self, handler, user, list_users) -> None:
+        assert user is not None
+        try:
+            users = list_users(user.user_id)
+        except UserError as error:
+            self._admin_error(handler, error)
+            return
+        self._json(handler, 200, {"users": [self._user_payload(item) for item in users]})
+
+    def _admin_mutation(self, handler, user, _token) -> None:
+        assert user is not None
+        user_id, action = self._admin_parts(self._decoded_path(handler.path))
+        payload = self._json_body(handler)
+        if payload is None:
+            return
+        expected_fields = {
+            "profile": {"real_name", "department"}, "status": {"enabled"},
+        }.get(action, set())
+        if set(payload) != expected_fields:
+            self._json(handler, 400, {"error": "请求字段不符合要求，请检查提交内容"})
+            return
+        if action == "profile" and self._required_strings(payload, "real_name", "department") is None:
+            self._json(handler, 400, {"error": "请填写姓名和部门"})
+            return
+        if action == "status" and type(payload["enabled"]) is not bool:
+            self._json(handler, 400, {"error": "启用状态必须为布尔值"})
+            return
+        if action == "profile":
+            try:
+                for value in payload.values():
+                    value.encode("utf-8")
+            except UnicodeEncodeError:
+                self._json(handler, 400, {"error": "姓名和部门包含无效字符，请重新填写"})
+                return
+        try:
+            target = self.user_service.get(user_id)
+            if target.role == "admin":
+                self._json(handler, 403, {"error": "不能通过用户管理修改管理员账户"})
+                return
+            if action == "approve":
+                result = self.user_service.approve(user.user_id, user_id)
+            elif action == "reject":
+                self.user_service.reject(user.user_id, user_id)
+                self._json(handler, 200, {"message": "注册申请已拒绝，用户名可重新注册"})
+                return
+            elif action == "profile":
+                result = self.user_service.update_profile(
+                    user.user_id, user_id, payload["real_name"], payload["department"]
+                )
+            elif action == "status":
+                result = self.user_service.set_enabled(user.user_id, user_id, payload["enabled"])
+            else:
+                temporary_password = self.user_service.reset_password(user.user_id, user_id)
+                self._json(handler, 200, {"temporary_password": temporary_password})
+                return
+        except UserError as error:
+            self._admin_error(handler, error)
+            return
+        self._json(handler, 200, {"user": self._user_payload(result)})
+
+    def _admin_error(self, handler, error: UserError) -> None:
+        if isinstance(error, PermissionDenied):
+            status, message = 403, "没有权限执行此操作，请重新登录"
+        elif isinstance(error, UserNotFound):
+            status, message = 404, "用户不存在，请刷新列表"
+        elif isinstance(error, InvalidState):
+            status, message = 409, "用户当前状态不支持此操作，请刷新列表"
+        elif isinstance(error, UserOperationBusy):
+            status, message = 409, "该用户正在进行其他操作，请稍后重试"
+        else:
+            status, message = 400, "用户信息不符合要求，请检查姓名和部门"
+        self._json(handler, status, {"error": message})
+
+    @staticmethod
+    def _user_payload(user) -> dict:
+        return {
+            "id": user.id, "username": user.username, "real_name": user.real_name,
+            "department": user.department, "role": user.role, "status": user.status,
+            "must_change_password": user.must_change_password, "created_at": user.created_at,
+            "approved_at": user.approved_at, "updated_at": user.updated_at,
+        }
+
     def _setup(self, handler, _user, _token) -> None:
         payload = self._json_body(handler)
         if payload is None:
@@ -458,6 +655,7 @@ class WebApplication:
             return
         try:
             authenticated_user = self.user_service.authenticate(username, password)
+            self._request_state(handler).user_id = authenticated_user.id
             issued = self.session_service.issue(authenticated_user)
         except (AuthenticationFailed, ValueError):
             self._login_failed(handler)
@@ -599,8 +797,9 @@ class WebApplication:
                     if not chunk:
                         break
                     handler.wfile.write(chunk)
-        except Exception:
+        except Exception as error:
             if response_started:
+                self._request_state(handler).exception = type(error).__name__
                 handler.close_connection = True
                 return
             raise

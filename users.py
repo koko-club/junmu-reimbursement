@@ -340,7 +340,7 @@ class UserService:
         changed_at = _utc_now()
         with self._database.transaction(immediate=True) as connection:
             user = self._user_row(connection, user_id)
-            if user is None or user["role"] != "user" or user["status"] not in ("active", "disabled"):
+            if user is None or user["role"] not in ("user", "admin") or user["status"] not in ("active", "disabled"):
                 raise AuthenticationFailed("invalid username or password")
             old_material = PasswordMaterial(
                 digest=bytes(user["password_hash"]),
@@ -368,8 +368,11 @@ class UserService:
     def _revoke(self, user_id: int) -> None:
         try:
             self._revoke_sessions(user_id)
-        except Exception:
-            _LOGGER.exception("session revocation failed for user_id=%s", user_id)
+        except Exception as error:
+            _LOGGER.error(
+                "session revocation failed for user_id=%s exception=%s", user_id,
+                type(error).__name__,
+            )
             raise
 
     @contextmanager
