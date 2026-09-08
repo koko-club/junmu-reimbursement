@@ -464,22 +464,19 @@ class ReimbursementService:
         if quarantine_name is None:
             raise ReimbursementStorageError(_PUBLIC_STORAGE_ERROR)
 
-        with self._database.transaction(immediate=True) as connection:
-            if not self._purge_completion_ready_for_delete(
+        deleted = self._database.delete_claimed_reimbursement_if(
+            record_id=record.id,
+            user_id=record.user_id,
+            purge_claim=purge_claim,
+            deleted_at_or_before=deleted_at_or_before,
+            checker=lambda: self._purge_completion_ready_for_delete(
                 record,
                 purge_claim,
                 quarantine_name,
-            ):
-                raise ReimbursementStorageError(_PUBLIC_STORAGE_ERROR)
-            deleted = connection.execute(
-                """DELETE FROM reimbursements
-                WHERE id = ? AND user_id = ? AND """
-                + eligibility
-                + " AND purge_claim = ?",
-                parameters + (purge_claim,),
-            )
-            if deleted.rowcount != 1:
-                raise ReimbursementStorageError(_PUBLIC_STORAGE_ERROR)
+            ),
+        )
+        if not deleted:
+            raise ReimbursementStorageError(_PUBLIC_STORAGE_ERROR)
         self._remove_purge_completion_marker(record, purge_claim, quarantine_name)
         return True
 

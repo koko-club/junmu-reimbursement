@@ -21,6 +21,31 @@ from database import Database
 from reimbursements import ReimbursementNotFound, ReimbursementService
 
 
+class ReimbursementDeleteProxy:
+    def __init__(self, connection, before_delete):
+        self._connection = connection
+        self._before_delete = before_delete
+
+    def execute(self, statement, *args, **kwargs):
+        if statement.lstrip().startswith("DELETE FROM reimbursements"):
+            self._before_delete()
+        return self._connection.execute(statement, *args, **kwargs)
+
+    def __getattr__(self, name):
+        return getattr(self._connection, name)
+
+
+class CommitFailureConnection:
+    def __init__(self, connection):
+        self._connection = connection
+
+    def commit(self):
+        raise sqlite3.OperationalError("forced delete commit failure")
+
+    def __getattr__(self, name):
+        return getattr(self._connection, name)
+
+
 class ReimbursementCleanupTest(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
@@ -196,6 +221,51 @@ class ReimbursementCleanupTest(unittest.TestCase):
         self.assertEqual(list(quarantines[0].iterdir()), [])
         return row, quarantines[0]
 
+    def _purge_with_delete_connection_proxy(self, service, before_delete) -> bool:
+        real_transaction = self.database.transaction
+        delete_intercepted = False
+
+        @contextmanager
+        def wrap_transactions(*, immediate=False):
+            nonlocal delete_intercepted
+            with real_transaction(immediate=immediate) as connection:
+                def intercept_delete():
+                    nonlocal delete_intercepted
+                    delete_intercepted = True
+                    before_delete()
+
+                yield ReimbursementDeleteProxy(connection, intercept_delete)
+
+        with mock.patch.object(
+            self.database,
+            "transaction",
+            new=wrap_transactions,
+        ):
+            service.purge_one(self.user_id, self.record_id)
+        return delete_intercepted
+
+    @contextmanager
+    def _inject_before_final_delete_check(self, callback):
+        real_delete = self.database.delete_claimed_reimbursement_if
+
+        def inject_into_checker(**kwargs):
+            forwarded = dict(kwargs)
+            checker = forwarded["checker"]
+
+            def injected_checker():
+                callback()
+                return checker()
+
+            forwarded["checker"] = injected_checker
+            return real_delete(**forwarded)
+
+        with mock.patch.object(
+            self.database,
+            "delete_claimed_reimbursement_if",
+            side_effect=inject_into_checker,
+        ):
+            yield
+
     def test_owner_can_trash_active_record_at_supplied_time(self):
         deleted_at = datetime(2026, 9, 8, 12, tzinfo=timezone.utc)
         trash = getattr(self.service, "trash", None)
@@ -263,22 +333,11 @@ class ReimbursementCleanupTest(unittest.TestCase):
         )
         record_dir = self._record_directory_with_files()
         service.trash(self.user_id, self.record_id)
-        real_transaction = self.database.transaction
-        transaction_count = 0
-
-        @contextmanager
-        def crash_before_second_transaction(*, immediate=False):
-            nonlocal transaction_count
-            transaction_count += 1
-            if transaction_count == 2:
-                raise SystemExit("simulated process crash")
-            with real_transaction(immediate=immediate) as connection:
-                yield connection
 
         with mock.patch.object(
             self.database,
-            "transaction",
-            new=crash_before_second_transaction,
+            "delete_claimed_reimbursement_if",
+            side_effect=SystemExit("simulated process crash"),
         ), self.assertRaisesRegex(SystemExit, "simulated process crash"):
             service.purge_one(self.user_id, self.record_id)
 
@@ -308,39 +367,27 @@ class ReimbursementCleanupTest(unittest.TestCase):
         owner_dir = record_dir.parent
         replacement_sentinel = record_dir / "replacement-sentinel"
         service.trash(self.user_id, self.record_id)
-        real_transaction = self.database.transaction
-        transaction_count = 0
         marker_metadata = None
 
-        @contextmanager
-        def recreate_canonical_in_second_transaction(*, immediate=False):
-            nonlocal transaction_count, marker_metadata
-            transaction_count += 1
-            with real_transaction(immediate=immediate) as connection:
-                if transaction_count == 2:
-                    markers = list(
-                        owner_dir.glob(
-                            f".reimbursement-purge-{self.record_id}-*"
-                        )
-                    )
-                    self.assertEqual(len(markers), 1)
-                    self.assertEqual(list(markers[0].iterdir()), [])
-                    marker_metadata = markers[0].stat()
-                    record_dir.mkdir()
-                    replacement_sentinel.write_bytes(b"replacement")
-                yield connection
+        def recreate_canonical():
+            nonlocal marker_metadata
+            markers = list(
+                owner_dir.glob(f".reimbursement-purge-{self.record_id}-*")
+            )
+            self.assertEqual(len(markers), 1)
+            self.assertEqual(list(markers[0].iterdir()), [])
+            marker_metadata = markers[0].stat()
+            record_dir.mkdir()
+            replacement_sentinel.write_bytes(b"replacement")
 
-        with mock.patch.object(
-            self.database,
-            "transaction",
-            new=recreate_canonical_in_second_transaction,
+        with self._inject_before_final_delete_check(
+            recreate_canonical,
         ), self.assertRaisesRegex(
             reimbursements.ReimbursementStorageError,
             "^报销记录暂时无法删除，请稍后重试$",
         ):
             service.purge_one(self.user_id, self.record_id)
 
-        self.assertEqual(transaction_count, 2)
         self.assertIsNotNone(marker_metadata)
         _row, marker = self._assert_claimed_empty_marker(self.record_id)
         self.assertTrue(os.path.samestat(marker_metadata, marker.stat()))
@@ -372,40 +419,28 @@ class ReimbursementCleanupTest(unittest.TestCase):
         replacement_marker.mkdir()
         replacement_metadata = replacement_marker.stat()
         service.trash(self.user_id, self.record_id)
-        real_transaction = self.database.transaction
-        transaction_count = 0
         authenticated_metadata = None
         marker_path = None
 
-        @contextmanager
-        def replace_completion_in_second_transaction(*, immediate=False):
-            nonlocal transaction_count, authenticated_metadata, marker_path
-            transaction_count += 1
-            with real_transaction(immediate=immediate) as connection:
-                if transaction_count == 2:
-                    markers = list(
-                        owner_dir.glob(
-                            f".reimbursement-purge-{self.record_id}-*"
-                        )
-                    )
-                    self.assertEqual(len(markers), 1)
-                    marker_path = markers[0]
-                    authenticated_metadata = marker_path.stat()
-                    marker_path.rename(detached_marker)
-                    replacement_marker.rename(marker_path)
-                yield connection
+        def replace_completion():
+            nonlocal authenticated_metadata, marker_path
+            markers = list(
+                owner_dir.glob(f".reimbursement-purge-{self.record_id}-*")
+            )
+            self.assertEqual(len(markers), 1)
+            marker_path = markers[0]
+            authenticated_metadata = marker_path.stat()
+            marker_path.rename(detached_marker)
+            replacement_marker.rename(marker_path)
 
-        with mock.patch.object(
-            self.database,
-            "transaction",
-            new=replace_completion_in_second_transaction,
+        with self._inject_before_final_delete_check(
+            replace_completion,
         ), self.assertRaisesRegex(
             reimbursements.ReimbursementStorageError,
             "^报销记录暂时无法删除，请稍后重试$",
         ):
             service.purge_one(self.user_id, self.record_id)
 
-        self.assertEqual(transaction_count, 2)
         self.assertIsNotNone(authenticated_metadata)
         self.assertIsNotNone(marker_path)
         row = self._row(self.record_id)
@@ -426,43 +461,31 @@ class ReimbursementCleanupTest(unittest.TestCase):
         record_dir = self._record_directory_with_files()
         owner_dir = record_dir.parent
         service.trash(self.user_id, self.record_id)
-        real_transaction = self.database.transaction
-        transaction_count = 0
         marker_path = None
         marker_metadata = None
         replacement_sentinel = None
 
-        @contextmanager
-        def add_marker_content_in_second_transaction(*, immediate=False):
-            nonlocal transaction_count, marker_path, marker_metadata
+        def add_marker_content():
+            nonlocal marker_path, marker_metadata
             nonlocal replacement_sentinel
-            transaction_count += 1
-            with real_transaction(immediate=immediate) as connection:
-                if transaction_count == 2:
-                    markers = list(
-                        owner_dir.glob(
-                            f".reimbursement-purge-{self.record_id}-*"
-                        )
-                    )
-                    self.assertEqual(len(markers), 1)
-                    marker_path = markers[0]
-                    self.assertEqual(list(marker_path.iterdir()), [])
-                    marker_metadata = marker_path.stat()
-                    replacement_sentinel = marker_path / "replacement-sentinel"
-                    replacement_sentinel.write_bytes(b"replacement")
-                yield connection
+            markers = list(
+                owner_dir.glob(f".reimbursement-purge-{self.record_id}-*")
+            )
+            self.assertEqual(len(markers), 1)
+            marker_path = markers[0]
+            self.assertEqual(list(marker_path.iterdir()), [])
+            marker_metadata = marker_path.stat()
+            replacement_sentinel = marker_path / "replacement-sentinel"
+            replacement_sentinel.write_bytes(b"replacement")
 
-        with mock.patch.object(
-            self.database,
-            "transaction",
-            new=add_marker_content_in_second_transaction,
+        with self._inject_before_final_delete_check(
+            add_marker_content,
         ), self.assertRaisesRegex(
             reimbursements.ReimbursementStorageError,
             "^报销记录暂时无法删除，请稍后重试$",
         ):
             service.purge_one(self.user_id, self.record_id)
 
-        self.assertEqual(transaction_count, 2)
         self.assertIsNotNone(marker_path)
         self.assertIsNotNone(marker_metadata)
         self.assertIsNotNone(replacement_sentinel)
@@ -481,6 +504,102 @@ class ReimbursementCleanupTest(unittest.TestCase):
         self.assertIsNotNone(self._row(self.record_id))
         self.assertTrue(os.path.samestat(marker_metadata, marker_path.stat()))
         self.assertEqual(replacement_sentinel.read_bytes(), b"replacement")
+
+    def test_delete_connection_cannot_recreate_canonical_after_final_check(self):
+        service = ReimbursementService(
+            self.database,
+            self.config,
+            app_secret=b"a" * 32,
+        )
+        record_dir = self._record_directory_with_files()
+        replacement_sentinel = record_dir / "replacement-sentinel"
+        service.trash(self.user_id, self.record_id)
+
+        def recreate_canonical():
+            record_dir.mkdir()
+            replacement_sentinel.write_bytes(b"replacement")
+
+        intercepted = self._purge_with_delete_connection_proxy(
+            service,
+            recreate_canonical,
+        )
+
+        self.assertFalse(
+            intercepted,
+            "final reimbursement DELETE escaped the protected database primitive",
+        )
+        self.assertIsNone(self._row(self.record_id))
+        self.assertFalse(record_dir.exists())
+
+    def test_delete_connection_cannot_replace_marker_after_final_check(self):
+        service = ReimbursementService(
+            self.database,
+            self.config,
+            app_secret=b"a" * 32,
+        )
+        record_dir = self._record_directory_with_files()
+        owner_dir = record_dir.parent
+        detached_marker = self.root / "detached-execute-boundary-marker"
+        replacement_marker = self.root / "replacement-execute-boundary-marker"
+        replacement_marker.mkdir()
+        service.trash(self.user_id, self.record_id)
+
+        def replace_marker():
+            markers = list(
+                owner_dir.glob(f".reimbursement-purge-{self.record_id}-*")
+            )
+            self.assertEqual(len(markers), 1)
+            markers[0].rename(detached_marker)
+            replacement_marker.rename(markers[0])
+
+        intercepted = self._purge_with_delete_connection_proxy(
+            service,
+            replace_marker,
+        )
+
+        self.assertFalse(
+            intercepted,
+            "final reimbursement DELETE escaped the protected database primitive",
+        )
+        self.assertIsNone(self._row(self.record_id))
+        self.assertFalse(record_dir.exists())
+        self.assertEqual(
+            list(owner_dir.glob(f".reimbursement-purge-{self.record_id}-*")),
+            [],
+        )
+
+    def test_delete_connection_cannot_add_marker_content_after_final_check(self):
+        service = ReimbursementService(
+            self.database,
+            self.config,
+            app_secret=b"a" * 32,
+        )
+        record_dir = self._record_directory_with_files()
+        owner_dir = record_dir.parent
+        service.trash(self.user_id, self.record_id)
+
+        def add_marker_content():
+            markers = list(
+                owner_dir.glob(f".reimbursement-purge-{self.record_id}-*")
+            )
+            self.assertEqual(len(markers), 1)
+            (markers[0] / "replacement-sentinel").write_bytes(b"replacement")
+
+        intercepted = self._purge_with_delete_connection_proxy(
+            service,
+            add_marker_content,
+        )
+
+        self.assertFalse(
+            intercepted,
+            "final reimbursement DELETE escaped the protected database primitive",
+        )
+        self.assertIsNone(self._row(self.record_id))
+        self.assertFalse(record_dir.exists())
+        self.assertEqual(
+            list(owner_dir.glob(f".reimbursement-purge-{self.record_id}-*")),
+            [],
+        )
 
     def test_retry_does_not_treat_pre_isolation_empty_marker_as_complete(self):
         app_secret = b"a" * 32
@@ -691,34 +810,25 @@ class ReimbursementCleanupTest(unittest.TestCase):
         )
         record_dir = self._record_directory_with_files()
         service.trash(self.user_id, self.record_id)
-        transaction_count = 0
+        real_connect = self.database.connect
+        connection_count = 0
 
-        @contextmanager
-        def fail_second_commit(*, immediate=False):
-            nonlocal transaction_count
-            transaction_count += 1
-            connection = self.database.connect()
-            try:
-                connection.execute("BEGIN IMMEDIATE" if immediate else "BEGIN")
-                yield connection
-            except Exception:
-                connection.rollback()
-                raise
-            else:
-                if transaction_count == 2:
-                    connection.rollback()
-                    raise sqlite3.OperationalError("forced delete commit failure")
-                connection.commit()
-            finally:
-                connection.close()
+        def fail_second_connection_commit():
+            nonlocal connection_count
+            connection_count += 1
+            connection = real_connect()
+            if connection_count == 2:
+                return CommitFailureConnection(connection)
+            return connection
 
         with mock.patch.object(
             self.database,
-            "transaction",
-            new=fail_second_commit,
+            "connect",
+            side_effect=fail_second_connection_commit,
         ), self.assertRaises(reimbursements.ReimbursementStorageError):
             service.purge_one(self.user_id, self.record_id)
 
+        self.assertEqual(connection_count, 2)
         _row, marker = self._assert_claimed_empty_marker(self.record_id)
         self.assertFalse(record_dir.exists())
 

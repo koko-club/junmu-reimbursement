@@ -6,7 +6,7 @@ from contextlib import ExitStack, contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 import sqlite3
-from typing import Iterator
+from typing import Callable, Iterator
 
 
 _SCHEMA_V1 = (
@@ -90,6 +90,58 @@ class Database:
                 except Exception:
                     pass
                 raise
+        finally:
+            connection.close()
+
+    def delete_claimed_reimbursement_if(
+        self,
+        *,
+        record_id: str,
+        user_id: int,
+        purge_claim: str,
+        checker: Callable[[], bool],
+        deleted_at_or_before: str | None = None,
+    ) -> bool:
+        """Check then delete on an unexposed writer connection.
+
+        This closes application-level callback boundaries, but SQLite cannot
+        serialize a separate process that writes directly to the data directory.
+        """
+        statement = """DELETE FROM reimbursements
+            WHERE id = ? AND user_id = ? AND deleted_at IS NOT NULL
+            AND purge_claim = ?"""
+        parameters: tuple[object, ...] = (record_id, user_id, purge_claim)
+        if deleted_at_or_before is not None:
+            statement += " AND deleted_at <= ?"
+            parameters += (deleted_at_or_before,)
+
+        connection = self.connect()
+        try:
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                if not checker():
+                    connection.rollback()
+                    return False
+                deleted = connection.execute(statement, parameters)
+                if deleted.rowcount != 1:
+                    connection.rollback()
+                    return False
+            except Exception:
+                try:
+                    connection.rollback()
+                except Exception:
+                    pass
+                raise
+            else:
+                try:
+                    connection.commit()
+                except Exception:
+                    try:
+                        connection.rollback()
+                    except Exception:
+                        pass
+                    raise
+                return True
         finally:
             connection.close()
 
