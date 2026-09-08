@@ -8,6 +8,17 @@
   const purgeDialog = document.getElementById('purge-dialog');
   const purgeName = document.getElementById('purge-name');
   let pendingPurge = null;
+  if (scope === 'trash') {
+    document.title = '回收站';
+    const heading = document.querySelector('[data-heading]');
+    if (heading) heading.textContent = '回收站';
+    document.querySelectorAll('[data-nav-active]').forEach(node => {
+      node.toggleAttribute('aria-current', node.dataset.navActive === 'trash');
+    });
+  } else {
+    const active = document.querySelector('[data-nav-active="active"]');
+    if (active) active.setAttribute('aria-current', 'page');
+  }
   const formatter = new Intl.DateTimeFormat('zh-CN', { timeZone: 'Asia/Shanghai', dateStyle: 'medium', timeStyle: 'short' });
   const formatDate = value => { if (!value) return ''; try { return formatter.format(new Date(value)); } catch (_) { return String(value); } };
   const text = (tag, value, className) => { const node = document.createElement(tag); node.textContent = value || ''; if (className) node.className = className; return node; };
