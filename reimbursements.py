@@ -465,6 +465,12 @@ class ReimbursementService:
             raise ReimbursementStorageError(_PUBLIC_STORAGE_ERROR)
 
         with self._database.transaction(immediate=True) as connection:
+            if not self._purge_completion_ready_for_delete(
+                record,
+                purge_claim,
+                quarantine_name,
+            ):
+                raise ReimbursementStorageError(_PUBLIC_STORAGE_ERROR)
             deleted = connection.execute(
                 """DELETE FROM reimbursements
                 WHERE id = ? AND user_id = ? AND """
@@ -733,6 +739,88 @@ class ReimbursementService:
             )
             return None
         finally:
+            for descriptor in reversed(descriptors):
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+
+    def _purge_completion_ready_for_delete(
+        self,
+        record: ReimbursementRecord,
+        purge_claim: str,
+        completion_name: str,
+    ) -> bool:
+        descriptors: list[int] = []
+        completion_fd: int | None = None
+        try:
+            completion = self._purge_completion_identity(
+                completion_name,
+                record.id,
+                purge_claim,
+            )
+            if completion is None:
+                return False
+            _record_identity, expected_marker_identity = completion
+            data_fd = os.open(
+                Path(self._config.data_dir).resolve(),
+                _DIRECTORY_OPEN_FLAGS,
+            )
+            descriptors.append(data_fd)
+            users_fd = self._open_directory(data_fd, "users")
+            descriptors.append(users_fd)
+            owner_fd = self._open_directory(users_fd, str(record.user_id))
+            descriptors.append(owner_fd)
+            completion_metadata = os.stat(
+                completion_name,
+                dir_fd=owner_fd,
+                follow_symlinks=False,
+            )
+            completion_fd = self._open_directory(owner_fd, completion_name)
+            opened_metadata = os.fstat(completion_fd)
+            if (
+                not os.path.samestat(completion_metadata, opened_metadata)
+                or self._directory_identity(opened_metadata)
+                != expected_marker_identity
+            ):
+                return False
+            with os.scandir(completion_fd) as entries:
+                if next(entries, None) is not None:
+                    return False
+            try:
+                os.stat(
+                    record.id,
+                    dir_fd=owner_fd,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                pass
+            else:
+                return False
+            current_completion = os.stat(
+                completion_name,
+                dir_fd=owner_fd,
+                follow_symlinks=False,
+            )
+            return (
+                os.path.samestat(opened_metadata, current_completion)
+                and self._directory_identity(current_completion)
+                == expected_marker_identity
+            )
+        except Exception as check_error:
+            _LOGGER.error(
+                "reimbursement purge final filesystem check failed "
+                "record_id=%s exception=%s",
+                record.id,
+                type(check_error).__name__,
+            )
+            return False
+        finally:
+            if completion_fd is not None:
+                try:
+                    os.close(completion_fd)
+                except OSError:
+                    pass
             for descriptor in reversed(descriptors):
                 try:
                     os.close(descriptor)

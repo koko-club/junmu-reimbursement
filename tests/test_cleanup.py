@@ -297,6 +297,191 @@ class ReimbursementCleanupTest(unittest.TestCase):
         self.assertIsNone(self._row(self.record_id))
         self.assertFalse(marker.exists())
 
+    def test_canonical_recreated_inside_delete_transaction_retains_retry_state(self):
+        app_secret = b"a" * 32
+        service = ReimbursementService(
+            self.database,
+            self.config,
+            app_secret=app_secret,
+        )
+        record_dir = self._record_directory_with_files()
+        owner_dir = record_dir.parent
+        replacement_sentinel = record_dir / "replacement-sentinel"
+        service.trash(self.user_id, self.record_id)
+        real_transaction = self.database.transaction
+        transaction_count = 0
+        marker_metadata = None
+
+        @contextmanager
+        def recreate_canonical_in_second_transaction(*, immediate=False):
+            nonlocal transaction_count, marker_metadata
+            transaction_count += 1
+            with real_transaction(immediate=immediate) as connection:
+                if transaction_count == 2:
+                    markers = list(
+                        owner_dir.glob(
+                            f".reimbursement-purge-{self.record_id}-*"
+                        )
+                    )
+                    self.assertEqual(len(markers), 1)
+                    self.assertEqual(list(markers[0].iterdir()), [])
+                    marker_metadata = markers[0].stat()
+                    record_dir.mkdir()
+                    replacement_sentinel.write_bytes(b"replacement")
+                yield connection
+
+        with mock.patch.object(
+            self.database,
+            "transaction",
+            new=recreate_canonical_in_second_transaction,
+        ), self.assertRaisesRegex(
+            reimbursements.ReimbursementStorageError,
+            "^报销记录暂时无法删除，请稍后重试$",
+        ):
+            service.purge_one(self.user_id, self.record_id)
+
+        self.assertEqual(transaction_count, 2)
+        self.assertIsNotNone(marker_metadata)
+        _row, marker = self._assert_claimed_empty_marker(self.record_id)
+        self.assertTrue(os.path.samestat(marker_metadata, marker.stat()))
+        self.assertEqual(replacement_sentinel.read_bytes(), b"replacement")
+
+        with self.assertRaisesRegex(
+            reimbursements.ReimbursementStorageError,
+            "^报销记录暂时无法删除，请稍后重试$",
+        ):
+            service.purge_one(self.user_id, self.record_id)
+
+        row = self._row(self.record_id)
+        self.assertIsNotNone(row)
+        self.assertRegex(row["purge_claim"], "^[0-9a-f]{64}$")
+        self.assertTrue(os.path.samestat(marker_metadata, marker.stat()))
+        self.assertEqual(replacement_sentinel.read_bytes(), b"replacement")
+
+    def test_completion_replaced_inside_delete_transaction_retains_row(self):
+        app_secret = b"a" * 32
+        service = ReimbursementService(
+            self.database,
+            self.config,
+            app_secret=app_secret,
+        )
+        record_dir = self._record_directory_with_files()
+        owner_dir = record_dir.parent
+        detached_marker = self.root / "detached-delete-transaction-marker"
+        replacement_marker = self.root / "replacement-delete-transaction-marker"
+        replacement_marker.mkdir()
+        replacement_metadata = replacement_marker.stat()
+        service.trash(self.user_id, self.record_id)
+        real_transaction = self.database.transaction
+        transaction_count = 0
+        authenticated_metadata = None
+        marker_path = None
+
+        @contextmanager
+        def replace_completion_in_second_transaction(*, immediate=False):
+            nonlocal transaction_count, authenticated_metadata, marker_path
+            transaction_count += 1
+            with real_transaction(immediate=immediate) as connection:
+                if transaction_count == 2:
+                    markers = list(
+                        owner_dir.glob(
+                            f".reimbursement-purge-{self.record_id}-*"
+                        )
+                    )
+                    self.assertEqual(len(markers), 1)
+                    marker_path = markers[0]
+                    authenticated_metadata = marker_path.stat()
+                    marker_path.rename(detached_marker)
+                    replacement_marker.rename(marker_path)
+                yield connection
+
+        with mock.patch.object(
+            self.database,
+            "transaction",
+            new=replace_completion_in_second_transaction,
+        ), self.assertRaisesRegex(
+            reimbursements.ReimbursementStorageError,
+            "^报销记录暂时无法删除，请稍后重试$",
+        ):
+            service.purge_one(self.user_id, self.record_id)
+
+        self.assertEqual(transaction_count, 2)
+        self.assertIsNotNone(authenticated_metadata)
+        self.assertIsNotNone(marker_path)
+        row = self._row(self.record_id)
+        self.assertIsNotNone(row)
+        self.assertRegex(row["purge_claim"], "^[0-9a-f]{64}$")
+        self.assertTrue(
+            os.path.samestat(authenticated_metadata, detached_marker.stat())
+        )
+        self.assertTrue(os.path.samestat(replacement_metadata, marker_path.stat()))
+
+    def test_completion_content_added_inside_delete_transaction_retains_row(self):
+        app_secret = b"a" * 32
+        service = ReimbursementService(
+            self.database,
+            self.config,
+            app_secret=app_secret,
+        )
+        record_dir = self._record_directory_with_files()
+        owner_dir = record_dir.parent
+        service.trash(self.user_id, self.record_id)
+        real_transaction = self.database.transaction
+        transaction_count = 0
+        marker_path = None
+        marker_metadata = None
+        replacement_sentinel = None
+
+        @contextmanager
+        def add_marker_content_in_second_transaction(*, immediate=False):
+            nonlocal transaction_count, marker_path, marker_metadata
+            nonlocal replacement_sentinel
+            transaction_count += 1
+            with real_transaction(immediate=immediate) as connection:
+                if transaction_count == 2:
+                    markers = list(
+                        owner_dir.glob(
+                            f".reimbursement-purge-{self.record_id}-*"
+                        )
+                    )
+                    self.assertEqual(len(markers), 1)
+                    marker_path = markers[0]
+                    self.assertEqual(list(marker_path.iterdir()), [])
+                    marker_metadata = marker_path.stat()
+                    replacement_sentinel = marker_path / "replacement-sentinel"
+                    replacement_sentinel.write_bytes(b"replacement")
+                yield connection
+
+        with mock.patch.object(
+            self.database,
+            "transaction",
+            new=add_marker_content_in_second_transaction,
+        ), self.assertRaisesRegex(
+            reimbursements.ReimbursementStorageError,
+            "^报销记录暂时无法删除，请稍后重试$",
+        ):
+            service.purge_one(self.user_id, self.record_id)
+
+        self.assertEqual(transaction_count, 2)
+        self.assertIsNotNone(marker_path)
+        self.assertIsNotNone(marker_metadata)
+        self.assertIsNotNone(replacement_sentinel)
+        row = self._row(self.record_id)
+        self.assertIsNotNone(row)
+        self.assertRegex(row["purge_claim"], "^[0-9a-f]{64}$")
+        self.assertTrue(os.path.samestat(marker_metadata, marker_path.stat()))
+        self.assertEqual(replacement_sentinel.read_bytes(), b"replacement")
+
+        with self.assertRaisesRegex(
+            reimbursements.ReimbursementStorageError,
+            "^报销记录暂时无法删除，请稍后重试$",
+        ):
+            service.purge_one(self.user_id, self.record_id)
+
+        self.assertIsNotNone(self._row(self.record_id))
+        self.assertTrue(os.path.samestat(marker_metadata, marker_path.stat()))
+        self.assertEqual(replacement_sentinel.read_bytes(), b"replacement")
+
     def test_retry_does_not_treat_pre_isolation_empty_marker_as_complete(self):
         app_secret = b"a" * 32
         service = ReimbursementService(
@@ -1031,11 +1216,15 @@ class ReimbursementCleanupTest(unittest.TestCase):
         with mock.patch(
             "reimbursements.os.stat",
             side_effect=replace_after_final_identity_check,
+        ), self.assertRaisesRegex(
+            reimbursements.ReimbursementStorageError,
+            "^报销记录暂时无法删除，请稍后重试$",
         ):
             service.purge_one(self.user_id, self.record_id)
 
         self.assertEqual(quarantine_stats, 2)
         self.assertTrue(os.path.samestat(original_metadata, detached.stat()))
+        self.assertTrue(os.path.samestat(replacement_metadata, quarantine.stat()))
         retained_metadata = [
             candidate.lstat()
             for candidate in (self.data_dir / "users").rglob("*")
@@ -1046,7 +1235,9 @@ class ReimbursementCleanupTest(unittest.TestCase):
                 for metadata in retained_metadata
             )
         )
-        self.assertIsNone(self._row(self.record_id))
+        row = self._row(self.record_id)
+        self.assertIsNotNone(row)
+        self.assertRegex(row["purge_claim"], "^[0-9a-f]{64}$")
 
     def test_completion_cleanup_does_not_remove_post_validation_replacement(self):
         service = ReimbursementService(
