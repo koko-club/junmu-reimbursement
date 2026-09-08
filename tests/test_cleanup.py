@@ -657,6 +657,68 @@ class ReimbursementCleanupTest(unittest.TestCase):
         )
         self.assertIsNotNone(self._row(self.record_id))
 
+    def test_wrapper_close_failure_does_not_downgrade_empty_completion(self):
+        service = ReimbursementService(
+            self.database,
+            self.config,
+            app_secret=b"a" * 32,
+        )
+        quarantine = self._create_empty_purge_quarantine(service)
+        real_create = ReimbursementService._create_quarantine_directory
+        real_close = reimbursements.os.close
+        wrapper_fd = None
+        wrapper_close_attempts = 0
+
+        def capture_wrapper(parent_fd):
+            nonlocal wrapper_fd
+            name, descriptor = real_create(parent_fd)
+            wrapper_fd = descriptor
+            return name, descriptor
+
+        def fail_wrapper_close(descriptor):
+            nonlocal wrapper_close_attempts
+            if descriptor == wrapper_fd:
+                wrapper_close_attempts += 1
+                self.assertEqual(reimbursements.os.listdir(descriptor), [])
+                raise OSError("forced persistent wrapper close failure")
+            return real_close(descriptor)
+
+        first_failure = None
+        try:
+            with mock.patch.object(
+                ReimbursementService,
+                "_create_quarantine_directory",
+                side_effect=capture_wrapper,
+            ), mock.patch(
+                "reimbursements.os.close",
+                side_effect=fail_wrapper_close,
+            ):
+                try:
+                    service.purge_one(self.user_id, self.record_id)
+                except ReimbursementNotFound as error:
+                    first_failure = error
+        finally:
+            if wrapper_fd is not None:
+                real_close(wrapper_fd)
+
+        retry_failed = False
+        if first_failure is not None:
+            try:
+                service.purge_one(self.user_id, self.record_id)
+            except ReimbursementNotFound:
+                retry_failed = True
+
+        self.assertEqual(
+            (
+                first_failure is not None,
+                retry_failed,
+                wrapper_close_attempts,
+                self._row(self.record_id) is not None,
+                quarantine.exists(),
+            ),
+            (False, False, 1, False, False),
+        )
+
     def test_purge_retry_with_different_secret_retains_quarantine_and_row(self):
         first_service = ReimbursementService(
             self.database,

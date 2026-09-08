@@ -825,6 +825,7 @@ class ReimbursementService:
     ) -> bool:
         completion_name: str | None = None
         completion_fd: int | None = None
+        authenticated_directory_removed = False
         try:
             current_metadata = os.stat(
                 quarantine_name,
@@ -856,6 +857,7 @@ class ReimbursementService:
             ):
                 return False
             os.rmdir(_CLEANUP_ENTRY_NAME, dir_fd=completion_fd)
+            authenticated_directory_removed = True
 
             # The authenticated empty directory is gone; wrapper cleanup is ancillary.
             try:
@@ -869,15 +871,24 @@ class ReimbursementService:
                     not os.listdir(completion_fd)
                     and os.path.samestat(wrapper_metadata, current_wrapper)
                 ):
-                    os.close(completion_fd)
+                    descriptor = completion_fd
                     completion_fd = None
+                    os.close(descriptor)
                     os.rmdir(completion_name, dir_fd=owner_fd)
             except OSError:
                 pass
             return True
         finally:
             if completion_fd is not None:
-                os.close(completion_fd)
+                descriptor = completion_fd
+                completion_fd = None
+                if authenticated_directory_removed:
+                    try:
+                        os.close(descriptor)
+                    except OSError:
+                        pass
+                else:
+                    os.close(descriptor)
 
     @staticmethod
     def _record_from_row(row) -> ReimbursementRecord:
