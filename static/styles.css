@@ -57,4 +57,13 @@ button.secondary, .remove-file { background: #eef1f4; color: #394452; }
 .form-message.success { color: #17633a; }
 .auth-link { margin: 18px 0 0; text-align: center; font-size: 14px; }
 .auth-link a { color: #1769aa; }
+.app-body { min-width: 0; padding-left: 216px; }
+.app-sidebar { position: fixed; inset: 0 auto 0 0; width: 216px; background: #20252b; color: #fff; padding: 24px 16px; display: flex; flex-direction: column; gap: 24px; z-index: 10; }
+.brand { font-weight: 700; font-size: 17px; }
+.app-sidebar nav { display: grid; gap: 4px; }
+.app-sidebar nav a { color: #dce3ea; text-decoration: none; padding: 10px 12px; border-radius: 4px; }
+.app-sidebar nav a:hover, .app-sidebar nav a[aria-current="page"] { background: #17633a; color: #fff; }
+.app-sidebar button { margin-top: auto; }
+.sidebar-toggle { display: none; }
 @media (max-width: 520px) { .auth-body { padding: 14px; } .auth-panel { padding: 22px 18px; } }
+@media (max-width: 900px) { .app-body { padding-left: 0; } .app-sidebar { transform: translateX(-100%); transition: transform .18s ease; } .app-sidebar.open { transform: translateX(0); } .sidebar-toggle { display: block; position: fixed; top: 12px; left: 12px; z-index: 20; min-height: 36px; padding: 6px 12px; } .app-body .page-shell { padding-top: 64px; } }

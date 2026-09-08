@@ -12,6 +12,13 @@
   const EXPECTED_ROW_COUNT = 11;
   const numericFields = ['public_amount', 'mileage', 'toll', 'lodging', 'receipts'];
 
+  async function loadSession() {
+    const data = await apiFetch('/api/session');
+    document.getElementById('traveler').value = data.user.real_name;
+    document.getElementById('department').value = data.user.department;
+    document.body.dataset.csrf = data.csrf_token;
+  }
+
   function normalizeDateInput(value) {
     return String(value || '').trim().replace(/\//g, '-');
   }
@@ -107,9 +114,7 @@
     const body = new FormData(); body.append('payload', JSON.stringify(payload)); files.forEach(function (file) { body.append('screenshots', file, file.name); });
     submit.disabled = true; submit.dataset.loading = 'true'; submit.textContent = '生成中…';
     try {
-      const response = await fetch('/generate', { method: 'POST', body: body });
-      const data = await response.json();
-      if (!response.ok) throw new Error(data.error || '生成失败');
+      const data = await apiFetch('/api/reimbursements/generate', { method: 'POST', body: body });
       result.className = 'result success';
       const strong = document.createElement('strong'); strong.textContent = '生成成功'; result.appendChild(strong);
       [['xlsx_url', '下载 Excel'], ['pdf_url', '下载 PDF']].forEach(function (entry) {
@@ -126,4 +131,11 @@
     } catch (error) { message(error.message || '生成失败'); }
     finally { submit.disabled = false; delete submit.dataset.loading; submit.textContent = '生成 Excel + PDF'; }
   });
+  const toggle = document.getElementById('sidebar-toggle');
+  const sidebar = document.getElementById('app-sidebar');
+  toggle.addEventListener('click', function () { const open = sidebar.classList.toggle('open'); toggle.setAttribute('aria-expanded', String(open)); });
+  document.getElementById('logout').addEventListener('click', async function () {
+    try { await apiFetch('/api/logout', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' }); window.location.assign('/login'); } catch (_) {}
+  });
+  loadSession().catch(function () {});
 })();
