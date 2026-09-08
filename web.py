@@ -510,8 +510,9 @@ class WebApplication:
             return
         self._auth_page(handler, "注册", "/api/register")
 
-    def _change_password_page(self, handler, _user, _token) -> None:
-        self._html(handler, 200, self._page_markup("修改密码"))
+    def _change_password_page(self, handler, user, _token) -> None:
+        assert user is not None
+        self._template_page(handler, "change-password.html", user.csrf_token)
 
     def _root(self, handler, _user, _token) -> None:
         index_path = self.config.templates_dir / "index.html"
@@ -1013,8 +1014,29 @@ class WebApplication:
 
     def _auth_page(self, handler: BaseHTTPRequestHandler, title: str, post_path: str) -> None:
         csrf_token = self.anonymous_csrf.issue("POST", post_path)
-        markup = self._page_markup(title, csrf_token)
-        self._html(handler, 200, markup)
+        template = {
+            "/api/setup": "setup.html",
+            "/api/login": "login.html",
+            "/api/register": "register.html",
+        }[post_path]
+        self._template_page(handler, template, csrf_token)
+
+    def _template_page(self, handler, name: str, csrf_token: str) -> None:
+        allowed = {"setup.html", "login.html", "register.html", "change-password.html"}
+        if name not in allowed:
+            self._json(handler, 500, {"error": "页面模板不可用"})
+            return
+        path = self.config.templates_dir / name
+        try:
+            markup = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeError):
+            self._json(handler, 500, {"error": "页面模板不可用"})
+            return
+        markup = markup.replace(
+            'data-csrf="__CSRF_TOKEN__"',
+            f'data-csrf="{html.escape(csrf_token, quote=True)}"',
+        )
+        self._html(handler, 200, markup.encode("utf-8"))
 
     @staticmethod
     def _page_markup(title: str, csrf_token: str | None = None) -> bytes:

@@ -153,6 +153,13 @@ class RunningApp:
             (self.templates_dir / "index.html").write_text(
                 "<!doctype html><html><body>reimbursement form</body></html>", encoding="utf-8"
             )
+            project_templates = Path(__file__).resolve().parents[1] / "templates"
+            for template_name in ("setup.html", "login.html", "register.html", "change-password.html"):
+                source = project_templates / template_name
+                if source.is_file():
+                    (self.templates_dir / template_name).write_text(
+                        source.read_text(encoding="utf-8"), encoding="utf-8"
+                    )
             (self.static_dir / "app.js").write_text(
                 "window.appLoaded = true;", encoding="utf-8"
             )
