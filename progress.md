@@ -1,6 +1,7 @@
 # Progress
 
 ## 2026-09-09
+- Task 9 implementation is connecting admin APIs and safe per-request logs. Task 13 proceeds in parallel on disjoint backup/deployment files. A local Colima/Docker toolchain installation was approved for the later amd64 build; downloads are in progress.
 - Task 8 complete at `5d5440b`: specification review approved after 11 targeted scenarios; independent quality review approved after 9 focused tests. Full implementation suite passed 345 tests with fatal ResourceWarning. Task 9 is now active.
 - `5d5440b` fixes post-commit delete outcomes and upload cleanup masking. Implementer verified 345/345 full tests; root independently passed the four critical database regressions and diff checks. Focused specification review is running before independent quality review.
 - Plan integration clarification: Tasks 10/12 must wire real templates through `web.py` (the current routes return placeholder markup); common self-service password change must also work for administrators.

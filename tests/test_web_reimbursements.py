@@ -788,7 +788,7 @@ class WebReimbursementTest(unittest.TestCase):
             mock.patch("web.tempfile.TemporaryDirectory", return_value=temporary), \
             mock.patch.object(
                 temporary, "cleanup", side_effect=OSError("private upload cleanup failure")
-            ) as cleanup, self.assertLogs("web", level="ERROR") as logs:
+            ) as cleanup, self.assertLogs("web", level="INFO") as logs:
             response = self._post_generation()
 
         records = service.list_active(self.alice_id)
@@ -800,10 +800,14 @@ class WebReimbursementTest(unittest.TestCase):
         self.assertEqual(self.alice.get(generated["xlsx_url"]).body, b"xlsx")
         self.assertEqual(self.alice.get(generated["pdf_url"]).body, b"pdf")
         cleanup.assert_called_once_with()
-        self.assertEqual(len(logs.records), 1)
-        self.assertIn("exception=OSError", logs.records[0].getMessage())
+        cleanup_logs = [
+            record for record in logs.records
+            if "reimbursement upload cleanup failed" in record.getMessage()
+        ]
+        self.assertEqual(len(cleanup_logs), 1)
+        self.assertIn("exception=OSError", cleanup_logs[0].getMessage())
         self.assertNotIn("private upload cleanup failure", "\n".join(logs.output))
-        self.assertIsNone(logs.records[0].exc_info)
+        self.assertIsNone(cleanup_logs[0].exc_info)
 
     def test_generation_failure_survives_upload_cleanup_failure(self):
         service = self.running.server.application.reimbursement_service
@@ -815,7 +819,7 @@ class WebReimbursementTest(unittest.TestCase):
         ), mock.patch("web.tempfile.TemporaryDirectory", return_value=temporary), \
             mock.patch.object(
                 temporary, "cleanup", side_effect=OSError("private upload cleanup failure")
-            ) as cleanup, self.assertLogs(level="ERROR") as logs:
+            ) as cleanup, self.assertLogs(level="INFO") as logs:
             response = self._post_generation()
 
         self.assertEqual(response.status, 500)
@@ -855,8 +859,8 @@ class WebReimbursementTest(unittest.TestCase):
         self.assertEqual(service.list_active(self.alice_id), [])
         generate.assert_not_called()
         cleanup.assert_called_once_with()
-        failures = [record.exc_info[1] for record in logs.records if record.exc_info]
-        self.assertEqual(failures, [upload_error])
+        self.assertTrue(all(record.exc_info is None for record in logs.records))
+        self.assertNotIn("private upload write failure", "\n".join(logs.output))
         self.assertIn("exception=RuntimeError", "\n".join(logs.output))
         self.assertNotIn("private upload cleanup failure", "\n".join(logs.output))
 
