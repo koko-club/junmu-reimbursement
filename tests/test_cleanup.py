@@ -123,6 +123,10 @@ class ReimbursementCleanupTest(unittest.TestCase):
         self.assertEqual([item.id for item in self.service.list_trash(self.user_id)], [self.record_id])
 
     def test_restore_is_owner_scoped_and_requires_a_trashed_record(self):
+        record_dir = self.data_dir / "users" / str(self.user_id) / self.record_id
+        record_dir.mkdir(parents=True)
+        (record_dir / "claim.xlsx").write_bytes(b"xlsx")
+        (record_dir / "claim.pdf").write_bytes(b"pdf")
         deleted_at = datetime(2026, 9, 8, 12, tzinfo=timezone.utc)
         self.service.trash(self.user_id, self.record_id, now=deleted_at)
 
@@ -185,9 +189,15 @@ class ReimbursementCleanupTest(unittest.TestCase):
                 service.purge_one(self.user_id, self.record_id)
 
         self.assertIsNotNone(self._row(self.record_id))
-        self.assertTrue(record_dir.exists())
-        self.assertFalse((record_dir / "claim.xlsx").exists())
-        self.assertEqual((record_dir / "claim.pdf").read_bytes(), b"pdf")
+        self.assertFalse(record_dir.exists())
+        owner_dir = self.data_dir / "users" / str(self.user_id)
+        quarantines = list(
+            owner_dir.glob(f".reimbursement-purge-{self.record_id}-*")
+        )
+        self.assertEqual(len(quarantines), 1)
+        isolated = quarantines[0] / "entry"
+        self.assertFalse((isolated / "claim.xlsx").exists())
+        self.assertEqual((isolated / "claim.pdf").read_bytes(), b"pdf")
         self.assertNotIn("private filesystem detail", "\n".join(captured.output))
 
     def test_partial_unlink_failure_keeps_record_reachable_for_retry(self):
@@ -221,6 +231,149 @@ class ReimbursementCleanupTest(unittest.TestCase):
         self.assertIsNone(self._row(self.record_id))
         owner_dir = self.data_dir / "users" / str(self.user_id)
         self.assertEqual(list(owner_dir.iterdir()), [])
+
+    def test_purge_retains_row_when_record_disappears_after_inode_capture(self):
+        record_dir = self.data_dir / "users" / str(self.user_id) / self.record_id
+        record_dir.mkdir(parents=True)
+        sentinel = record_dir / "claim.xlsx"
+        sentinel.write_bytes(b"owned")
+        (record_dir / "claim.pdf").write_bytes(b"pdf")
+        detached = self.root / "detached-record"
+        record_identity = self.service._directory_identity(record_dir.stat())
+        real_identity = self.service._directory_identity
+        identity_checks = 0
+        self.service.trash(self.user_id, self.record_id)
+
+        def detach_after_first_identity(metadata):
+            nonlocal identity_checks
+            identity = real_identity(metadata)
+            if identity == record_identity:
+                identity_checks += 1
+                if identity_checks == 1:
+                    record_dir.rename(detached)
+            return identity
+
+        with mock.patch.object(
+            self.service,
+            "_directory_identity",
+            side_effect=detach_after_first_identity,
+        ):
+            with self.assertRaises(ReimbursementNotFound):
+                self.service.purge_one(self.user_id, self.record_id)
+
+        self.assertEqual(identity_checks, 1)
+        self.assertEqual((detached / sentinel.name).read_bytes(), b"owned")
+        self.assertIsNotNone(self._row(self.record_id))
+
+    def test_purge_isolates_before_deleting_record_replaced_after_reopen(self):
+        owner_dir = self.data_dir / "users" / str(self.user_id)
+        record_dir = owner_dir / self.record_id
+        record_dir.mkdir(parents=True)
+        owned_sentinel = record_dir / "owned-sentinel"
+        owned_sentinel.write_bytes(b"owned")
+        (record_dir / "claim.xlsx").write_bytes(b"xlsx")
+        (record_dir / "claim.pdf").write_bytes(b"pdf")
+        detached = self.root / "detached-owned-record"
+        replacement = self.root / "replacement-record"
+        replacement.mkdir()
+        replacement_sentinel = replacement / "replacement-sentinel"
+        replacement_sentinel.write_bytes(b"replacement")
+        record_identity = self.service._directory_identity(record_dir.stat())
+        real_identity = self.service._directory_identity
+        identity_checks = 0
+        self.service.trash(self.user_id, self.record_id)
+
+        def replace_after_second_identity(metadata):
+            nonlocal identity_checks
+            identity = real_identity(metadata)
+            if identity == record_identity:
+                identity_checks += 1
+                if identity_checks == 2:
+                    record_dir.rename(detached)
+                    replacement.rename(record_dir)
+            return identity
+
+        with mock.patch.object(
+            self.service,
+            "_directory_identity",
+            side_effect=replace_after_second_identity,
+        ):
+            with self.assertRaises(ReimbursementNotFound):
+                self.service.purge_one(self.user_id, self.record_id)
+
+        self.assertEqual(identity_checks, 2)
+        self.assertTrue((detached / owned_sentinel.name).exists())
+        self.assertEqual((detached / owned_sentinel.name).read_bytes(), b"owned")
+        replacement_matches = list(owner_dir.rglob(replacement_sentinel.name))
+        self.assertEqual(len(replacement_matches), 1)
+        self.assertEqual(replacement_matches[0].read_bytes(), b"replacement")
+        self.assertIsNotNone(self._row(self.record_id))
+
+    def test_purge_retry_rejects_replaced_quarantine_entry(self):
+        owner_dir = self.data_dir / "users" / str(self.user_id)
+        record_dir = owner_dir / self.record_id
+        record_dir.mkdir(parents=True)
+        original_sentinel = record_dir / "original-sentinel"
+        original_sentinel.write_bytes(b"original")
+        (record_dir / "claim.xlsx").write_bytes(b"xlsx")
+        (record_dir / "claim.pdf").write_bytes(b"pdf")
+        device, inode = self.service._directory_identity(record_dir.stat())
+        quarantine = owner_dir / (
+            f".reimbursement-purge-{self.record_id}-{device:x}-{inode:x}"
+        )
+        quarantine.mkdir()
+        isolated = quarantine / "entry"
+        record_dir.rename(isolated)
+        detached = self.root / "detached-isolated-record"
+        isolated.rename(detached)
+        isolated.mkdir()
+        replacement_sentinel = isolated / "replacement-sentinel"
+        replacement_sentinel.write_bytes(b"replacement")
+        self.service.trash(self.user_id, self.record_id)
+
+        with self.assertRaises(ReimbursementNotFound):
+            self.service.purge_one(self.user_id, self.record_id)
+
+        self.assertEqual((detached / original_sentinel.name).read_bytes(), b"original")
+        self.assertEqual(replacement_sentinel.read_bytes(), b"replacement")
+        self.assertIsNotNone(self._row(self.record_id))
+
+    def test_restore_rejects_record_retained_after_partial_purge(self):
+        owner_dir = self.data_dir / "users" / str(self.user_id)
+        record_dir = owner_dir / self.record_id
+        record_dir.mkdir(parents=True)
+        (record_dir / "claim.xlsx").write_bytes(b"xlsx")
+        (record_dir / "claim.pdf").write_bytes(b"pdf")
+        self.service.trash(self.user_id, self.record_id)
+
+        def fail_after_isolation(_name, **_kwargs):
+            raise OSError("forced partial purge")
+
+        failing_service = ReimbursementService(
+            self.database,
+            self.config,
+            remove_tree=fail_after_isolation,
+        )
+        with self.assertLogs("reimbursements", level="ERROR"):
+            with self.assertRaises(ReimbursementNotFound):
+                failing_service.purge_one(self.user_id, self.record_id)
+
+        with self.assertRaises(ReimbursementNotFound):
+            self.service.restore(self.user_id, self.record_id)
+
+        row = self._row(self.record_id)
+        self.assertIsNotNone(row)
+        self.assertIsNotNone(row["deleted_at"])
+        self.assertEqual(self.service.list_active(self.user_id), [])
+        self.assertEqual(
+            [record.id for record in self.service.list_trash(self.user_id)],
+            [self.record_id],
+        )
+        self.assertFalse(record_dir.exists())
+        self.assertEqual(
+            len(list(owner_dir.glob(f".reimbursement-purge-{self.record_id}-*"))),
+            1,
+        )
 
     def test_purge_rejects_paths_outside_exact_owner_record_directory(self):
         record_dir = self.data_dir / "users" / str(self.user_id) / self.record_id
@@ -295,10 +448,16 @@ class ReimbursementCleanupTest(unittest.TestCase):
 
         real_cleanup = self.service._cleanup_at
 
-        def fail_one(parent_fd, name, identities, record_id):
+        def fail_one(parent_fd, name, identities, record_id, **kwargs):
             if record_id == failed_id:
                 return False
-            return real_cleanup(parent_fd, name, identities, record_id)
+            return real_cleanup(
+                parent_fd,
+                name,
+                identities,
+                record_id,
+                **kwargs,
+            )
 
         with mock.patch.object(self.service, "_cleanup_at", side_effect=fail_one):
             purged = self.service.purge_expired(now=now)
@@ -312,6 +471,62 @@ class ReimbursementCleanupTest(unittest.TestCase):
         self.assertIsNotNone(self._row(self.record_id))
         self.assertIsNotNone(self._row(recent_id))
         self.assertIsNotNone(self._row(failed_id))
+
+    def test_expired_purge_rechecks_cutoff_after_restore_and_retrash(self):
+        now = datetime(2026, 9, 8, tzinfo=timezone.utc)
+        expired_at = now - timedelta(days=31)
+        record_dir = self.data_dir / "users" / str(self.user_id) / self.record_id
+        record_dir.mkdir(parents=True)
+        (record_dir / "claim.xlsx").write_bytes(b"xlsx")
+        (record_dir / "claim.pdf").write_bytes(b"pdf")
+        self.service.trash(self.user_id, self.record_id, now=expired_at)
+        real_connect = self.database.connect
+        raced = False
+
+        class RacingCursor:
+            def __init__(cursor_self, cursor):
+                cursor_self.cursor = cursor
+
+            def fetchall(cursor_self):
+                nonlocal raced
+                rows = cursor_self.cursor.fetchall()
+                self.service.restore(self.user_id, self.record_id)
+                self.service.trash(self.user_id, self.record_id, now=now)
+                raced = True
+                return rows
+
+        class RacingConnection:
+            def __init__(connection_self, connection):
+                connection_self.connection = connection
+
+            def execute(connection_self, statement, parameters=()):
+                cursor = connection_self.connection.execute(statement, parameters)
+                if "ORDER BY deleted_at, id" in statement:
+                    return RacingCursor(cursor)
+                return cursor
+
+            def close(connection_self):
+                connection_self.connection.close()
+
+        first_connection = True
+
+        def connect_with_race():
+            nonlocal first_connection
+            connection = real_connect()
+            if first_connection:
+                first_connection = False
+                return RacingConnection(connection)
+            return connection
+
+        with mock.patch.object(self.database, "connect", side_effect=connect_with_race):
+            purged = self.service.purge_expired(now=now)
+
+        self.assertTrue(raced)
+        self.assertEqual(purged, 0)
+        row = self._row(self.record_id)
+        self.assertIsNotNone(row)
+        self.assertEqual(row["deleted_at"], now.isoformat())
+        self.assertTrue(record_dir.exists())
 
     def test_server_runs_both_purges_once_before_starting_cleanup_runner(self):
         runner_calls = []
