@@ -6,6 +6,7 @@ import io
 import json
 from pathlib import Path
 import socket
+import tempfile
 import threading
 from types import SimpleNamespace
 import unittest
@@ -145,6 +146,31 @@ class WebReimbursementTest(unittest.TestCase):
         )
         self.assertEqual(response.status, 200)
         return client
+
+    def _post_generation(self):
+        payload = {
+            "date": "2026-09-08",
+            "department": "client department",
+            "traveler": "client traveler",
+            "reason": "客户拜访",
+            "days": 2,
+            "allowance": 50,
+            "rows": [],
+        }
+        body, content_type = multipart([
+            ("payload", json.dumps(payload), None, "application/json"),
+            ("screenshots", b"PNGDATA", "route.png", "image/png"),
+        ])
+        return self.alice.request(
+            "POST",
+            "/api/reimbursements/generate",
+            body=body,
+            headers={
+                "Content-Type": content_type,
+                "Content-Length": str(len(body)),
+                "X-CSRF-Token": self.alice.csrf_for("/api/reimbursements/generate"),
+            },
+        )
 
     def _insert_record(
         self,
@@ -703,6 +729,7 @@ class WebReimbursementTest(unittest.TestCase):
         def generate(user, raw_payload, screenshots):
             captured["user"] = user
             captured["payload"] = raw_payload
+            captured["upload_directory"] = screenshots[0].parent
             captured["screenshots"] = [
                 (path.name, path.read_bytes(), path.is_file()) for path in screenshots
             ]
@@ -736,6 +763,102 @@ class WebReimbursementTest(unittest.TestCase):
         self.assertEqual(captured["user"].user_id, self.alice_id)
         self.assertEqual(captured["payload"]["traveler"], "client traveler")
         self.assertEqual(captured["screenshots"], [("0000-route.png", b"PNGDATA", True)])
+        self.assertFalse(captured["upload_directory"].exists())
+
+    def test_generation_returns_committed_record_when_upload_cleanup_fails(self):
+        service = self.running.server.application.reimbursement_service
+        temporary = tempfile.TemporaryDirectory(dir=self.running.root)
+        self.addCleanup(temporary.cleanup)
+        captured_screenshots = []
+
+        def generate(_template, work_dir, _payload, screenshots):
+            captured_screenshots.extend(path.read_bytes() for path in screenshots)
+            path = work_dir / "生成结果.xlsx"
+            path.write_bytes(b"xlsx")
+            return SimpleNamespace(path=path)
+
+        def export(_xlsx, work_dir, _soffice):
+            path = work_dir / "生成结果.pdf"
+            path.write_bytes(b"pdf")
+            return path
+
+        with mock.patch.object(service, "_generator", side_effect=generate), \
+            mock.patch.object(service, "_pdf_exporter", side_effect=export), \
+            mock.patch.object(service, "_soffice_finder", return_value="/fake/soffice"), \
+            mock.patch("web.tempfile.TemporaryDirectory", return_value=temporary), \
+            mock.patch.object(
+                temporary, "cleanup", side_effect=OSError("private upload cleanup failure")
+            ) as cleanup, self.assertLogs("web", level="ERROR") as logs:
+            response = self._post_generation()
+
+        records = service.list_active(self.alice_id)
+        self.assertEqual(len(records), 1)
+        self.assertEqual(captured_screenshots, [b"PNGDATA"])
+        self.assertEqual(response.status, 200)
+        generated = response.json()
+        self.assertEqual(generated["record"]["id"], records[0].id)
+        self.assertEqual(self.alice.get(generated["xlsx_url"]).body, b"xlsx")
+        self.assertEqual(self.alice.get(generated["pdf_url"]).body, b"pdf")
+        cleanup.assert_called_once_with()
+        self.assertEqual(len(logs.records), 1)
+        self.assertIn("exception=OSError", logs.records[0].getMessage())
+        self.assertNotIn("private upload cleanup failure", "\n".join(logs.output))
+        self.assertIsNone(logs.records[0].exc_info)
+
+    def test_generation_failure_survives_upload_cleanup_failure(self):
+        service = self.running.server.application.reimbursement_service
+        temporary = tempfile.TemporaryDirectory(dir=self.running.root)
+        self.addCleanup(temporary.cleanup)
+
+        with mock.patch.object(
+            service, "_generator", side_effect=ValueError("private generator failure")
+        ), mock.patch("web.tempfile.TemporaryDirectory", return_value=temporary), \
+            mock.patch.object(
+                temporary, "cleanup", side_effect=OSError("private upload cleanup failure")
+            ) as cleanup, self.assertLogs(level="ERROR") as logs:
+            response = self._post_generation()
+
+        self.assertEqual(response.status, 500)
+        self.assertEqual(response.json(), {"error": "生成报销文件失败，请稍后重试"})
+        self.assertEqual(service.list_active(self.alice_id), [])
+        self.assertEqual(list((self.running.data_dir / "tmp").iterdir()), [])
+        cleanup.assert_called_once_with()
+        messages = "\n".join(logs.output)
+        self.assertIn("exception=ValueError", messages)
+        self.assertIn("exception=OSError", messages)
+        self.assertNotIn("private generator failure", messages)
+        self.assertNotIn("private upload cleanup failure", messages)
+        self.assertTrue(all(record.exc_info is None for record in logs.records))
+
+    def test_upload_write_failure_survives_upload_cleanup_failure(self):
+        service = self.running.server.application.reimbursement_service
+        temporary = tempfile.TemporaryDirectory(dir=self.running.root)
+        self.addCleanup(temporary.cleanup)
+        upload_error = OSError("private upload write failure")
+        original_write_bytes = Path.write_bytes
+
+        def write_bytes(path, data):
+            if path.parent == Path(temporary.name):
+                raise upload_error
+            return original_write_bytes(path, data)
+
+        with mock.patch.object(Path, "write_bytes", write_bytes), \
+            mock.patch.object(service, "generate", wraps=service.generate) as generate, \
+            mock.patch("web.tempfile.TemporaryDirectory", return_value=temporary), \
+            mock.patch.object(
+                temporary, "cleanup", side_effect=RuntimeError("private upload cleanup failure")
+            ) as cleanup, self.assertLogs("web", level="ERROR") as logs:
+            response = self._post_generation()
+
+        self.assertEqual(response.status, 500)
+        self.assertEqual(response.json(), {"error": "服务暂时不可用，请稍后重试"})
+        self.assertEqual(service.list_active(self.alice_id), [])
+        generate.assert_not_called()
+        cleanup.assert_called_once_with()
+        failures = [record.exc_info[1] for record in logs.records if record.exc_info]
+        self.assertEqual(failures, [upload_error])
+        self.assertIn("exception=RuntimeError", "\n".join(logs.output))
+        self.assertNotIn("private upload cleanup failure", "\n".join(logs.output))
 
     def test_generation_requires_user_role_current_session_and_csrf_before_parsing(self):
         service = mock.Mock()

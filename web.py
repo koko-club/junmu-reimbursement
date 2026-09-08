@@ -695,15 +695,24 @@ class WebApplication:
             return
 
         try:
-            with tempfile.TemporaryDirectory(prefix="reimbursement-upload-") as temp_name:
+            upload_directory = tempfile.TemporaryDirectory(prefix="reimbursement-upload-")
+            try:
                 image_paths = []
                 for index, (filename, data) in enumerate(screenshots):
-                    image_path = Path(temp_name) / f"{index:04d}-{filename}"
+                    image_path = Path(upload_directory.name) / f"{index:04d}-{filename}"
                     image_path.write_bytes(data)
                     image_paths.append(image_path)
                 record = self.reimbursement_service.generate(
                     user, raw_payload, image_paths
                 )
+            finally:
+                try:
+                    upload_directory.cleanup()
+                except Exception as cleanup_error:
+                    _LOGGER.error(
+                        "reimbursement upload cleanup failed exception=%s",
+                        type(cleanup_error).__name__,
+                    )
         except ReimbursementGenerationError as error:
             self._json(handler, 500, {"error": str(error)})
             return

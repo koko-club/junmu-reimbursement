@@ -4,9 +4,13 @@ from __future__ import annotations
 
 from contextlib import ExitStack, contextmanager
 from datetime import datetime, timezone
+import logging
 from pathlib import Path
 import sqlite3
 from typing import Callable, Iterator
+
+
+_LOGGER = logging.getLogger(__name__)
 
 
 _SCHEMA_V1 = (
@@ -140,10 +144,37 @@ class Database:
                         connection.rollback()
                     except Exception:
                         pass
-                    raise
+                    confirmed = False
+                    confirmation = None
+                    try:
+                        confirmation = self.connect()
+                        confirmed = confirmation.execute(
+                            "SELECT 1 FROM reimbursements WHERE id = ?",
+                            (record_id,),
+                        ).fetchone() is None
+                    except Exception:
+                        pass
+                    finally:
+                        if confirmation is not None:
+                            try:
+                                confirmation.close()
+                            except Exception as cleanup_error:
+                                _LOGGER.error(
+                                    "reimbursement delete confirmation close failed "
+                                    "exception=%s",
+                                    type(cleanup_error).__name__,
+                                )
+                    if not confirmed:
+                        raise
                 return True
         finally:
-            connection.close()
+            try:
+                connection.close()
+            except Exception as cleanup_error:
+                _LOGGER.error(
+                    "reimbursement delete connection close failed exception=%s",
+                    type(cleanup_error).__name__,
+                )
 
     def migrate(self) -> None:
         connection = self.connect()

@@ -46,6 +46,44 @@ class CommitFailureConnection:
         return getattr(self._connection, name)
 
 
+class DeleteOutcomeConnection:
+    def __init__(
+        self,
+        connection,
+        *,
+        commit_error=None,
+        commit_before_error=False,
+        close_error=None,
+        query_error=None,
+    ):
+        self._connection = connection
+        self.commit_error = commit_error
+        self.commit_before_error = commit_before_error
+        self.close_error = close_error
+        self.query_error = query_error
+        self.closed = False
+
+    def commit(self):
+        if self.commit_error is None or self.commit_before_error:
+            self._connection.commit()
+        if self.commit_error is not None:
+            raise self.commit_error
+
+    def execute(self, statement, *args, **kwargs):
+        if self.query_error is not None and statement.lstrip().startswith("SELECT"):
+            raise self.query_error
+        return self._connection.execute(statement, *args, **kwargs)
+
+    def close(self):
+        self._connection.close()
+        self.closed = True
+        if self.close_error is not None:
+            raise self.close_error
+
+    def __getattr__(self, name):
+        return getattr(self._connection, name)
+
+
 class ReimbursementCleanupTest(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
@@ -828,7 +866,7 @@ class ReimbursementCleanupTest(unittest.TestCase):
         ), self.assertRaises(reimbursements.ReimbursementStorageError):
             service.purge_one(self.user_id, self.record_id)
 
-        self.assertEqual(connection_count, 2)
+        self.assertEqual(connection_count, 3)
         _row, marker = self._assert_claimed_empty_marker(self.record_id)
         self.assertFalse(record_dir.exists())
 
@@ -836,6 +874,137 @@ class ReimbursementCleanupTest(unittest.TestCase):
 
         self.assertIsNone(self._row(self.record_id))
         self.assertFalse(marker.exists())
+
+    def test_purge_succeeds_when_delete_commit_completes_then_raises(self):
+        record_dir = self._record_directory_with_files()
+        self.service.trash(self.user_id, self.record_id)
+        real_connect = self.database.connect
+        connections = []
+
+        def connect():
+            options = {}
+            if len(connections) == 1:
+                options = {
+                    "commit_error": sqlite3.OperationalError("private commit detail"),
+                    "commit_before_error": True,
+                }
+            connection = DeleteOutcomeConnection(real_connect(), **options)
+            connections.append(connection)
+            return connection
+
+        with mock.patch.object(self.database, "connect", side_effect=connect):
+            self.service.purge_one(self.user_id, self.record_id)
+
+        self.assertIsNone(self._row(self.record_id))
+        self.assertFalse(record_dir.exists())
+        self.assertEqual(
+            list(record_dir.parent.glob(f".reimbursement-purge-{self.record_id}-*")),
+            [],
+        )
+        self.assertEqual(len(connections), 3)
+        self.assertTrue(all(connection.closed for connection in connections))
+
+    def test_purge_succeeds_when_delete_connection_close_raises_after_commit(self):
+        record_dir = self._record_directory_with_files()
+        self.service.trash(self.user_id, self.record_id)
+        real_connect = self.database.connect
+        connections = []
+
+        def connect():
+            connection = DeleteOutcomeConnection(
+                real_connect(),
+                close_error=(
+                    RuntimeError("private connection detail")
+                    if len(connections) == 1 else None
+                ),
+            )
+            connections.append(connection)
+            return connection
+
+        with mock.patch.object(self.database, "connect", side_effect=connect):
+            with self.assertLogs("database", level="ERROR") as logs:
+                self.service.purge_one(self.user_id, self.record_id)
+
+        self.assertIsNone(self._row(self.record_id))
+        self.assertFalse(record_dir.exists())
+        self.assertEqual(
+            list(record_dir.parent.glob(f".reimbursement-purge-{self.record_id}-*")),
+            [],
+        )
+        self.assertTrue(all(connection.closed for connection in connections))
+        self.assertIn("RuntimeError", " ".join(logs.output))
+        self.assertNotIn("private connection detail", " ".join(logs.output))
+        self.assertTrue(all(record.exc_info is None for record in logs.records))
+
+    def test_commit_confirmation_query_failure_does_not_report_purge_success(self):
+        record_dir = self._record_directory_with_files()
+        self.service.trash(self.user_id, self.record_id)
+        real_connect = self.database.connect
+        connections = []
+
+        def connect():
+            options = {}
+            if len(connections) == 1:
+                options = {
+                    "commit_error": sqlite3.OperationalError("private commit detail"),
+                    "commit_before_error": True,
+                }
+            elif len(connections) == 2:
+                options = {"query_error": sqlite3.OperationalError("query failed")}
+            connection = DeleteOutcomeConnection(real_connect(), **options)
+            connections.append(connection)
+            return connection
+
+        with mock.patch.object(self.database, "connect", side_effect=connect):
+            with self.assertRaises(reimbursements.ReimbursementStorageError):
+                self.service.purge_one(self.user_id, self.record_id)
+
+        self.assertIsNone(self._row(self.record_id))
+        self.assertFalse(record_dir.exists())
+        self.assertEqual(
+            len(list(record_dir.parent.glob(f".reimbursement-purge-{self.record_id}-*"))),
+            1,
+        )
+        self.assertEqual(len(connections), 3)
+        self.assertTrue(all(connection.closed for connection in connections))
+
+    def test_delete_commit_error_survives_connection_close_error(self):
+        self.service.trash(self.user_id, self.record_id)
+        claim = "a" * 64
+        with self.database.transaction(immediate=True) as connection:
+            connection.execute(
+                "UPDATE reimbursements SET purge_claim = ? WHERE id = ?",
+                (claim, self.record_id),
+            )
+        original_error = sqlite3.OperationalError("original commit error")
+        real_connect = self.database.connect
+        connection = DeleteOutcomeConnection(
+            real_connect(),
+            commit_error=original_error,
+            close_error=RuntimeError("private close detail"),
+        )
+        connection_count = 0
+
+        def connect():
+            nonlocal connection_count
+            connection_count += 1
+            return connection if connection_count == 1 else real_connect()
+
+        with mock.patch.object(self.database, "connect", side_effect=connect):
+            with self.assertLogs("database", level="ERROR") as logs:
+                with self.assertRaises(sqlite3.OperationalError) as caught:
+                    self.database.delete_claimed_reimbursement_if(
+                        record_id=self.record_id,
+                        user_id=self.user_id,
+                        purge_claim=claim,
+                        checker=lambda: True,
+                    )
+
+        self.assertIs(caught.exception, original_error)
+        self.assertIsNotNone(self._row(self.record_id))
+        self.assertTrue(connection.closed)
+        self.assertIn("RuntimeError", " ".join(logs.output))
+        self.assertNotIn("private close detail", " ".join(logs.output))
 
     def test_recursive_purge_does_not_hold_sqlite_writer_lock(self):
         service = ReimbursementService(
