@@ -1,49 +1,45 @@
 #!/bin/sh
 set -eu
 
-SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
 cd "$SCRIPT_DIR"
 
 PYTHON_BIN=""
-PORTABLE_PYTHON="$SCRIPT_DIR/runtime/python/bin/python3"
 for candidate in \
-  "$PORTABLE_PYTHON" \
-  "/Users/koko/.cache/codex-runtimes/codex-primary-runtime/dependencies/python/bin/python3" \
-  "/Users/koko/.cache/codex-runtimes/codex-primary-runtime/bin/python3" \
+  "$SCRIPT_DIR/.venv/bin/python" \
+  "$(command -v python3.14 || true)" \
+  "$(command -v python3.13 || true)" \
+  "$(command -v python3.12 || true)" \
   "$(command -v python3 || true)"; do
   [ -n "$candidate" ] || continue
   [ -x "$candidate" ] || continue
-  if [ "$candidate" = "$PORTABLE_PYTHON" ]; then
-    if PYTHONHOME="$SCRIPT_DIR/runtime/python" "$candidate" -c 'import openpyxl, PIL' >/dev/null 2>&1; then
-      PYTHON_BIN="$candidate"
-      export PYTHONHOME="$SCRIPT_DIR/runtime/python"
-      break
-    fi
-  elif "$candidate" -c 'import openpyxl, PIL' >/dev/null 2>&1; then
+  if "$candidate" -c 'import sys; assert sys.version_info >= (3, 12); import openpyxl, PIL' >/dev/null 2>&1; then
     PYTHON_BIN="$candidate"
     break
   fi
 done
 if [ -z "$PYTHON_BIN" ]; then
-  echo "找不到可用的 Python 3（需要 openpyxl 和 Pillow）。请先安装依赖：python3 -m pip install -r requirements.txt" >&2
+  echo "需要 Python 3.12+、openpyxl 和 Pillow。请执行：python3.12 -m venv .venv，然后 .venv/bin/python -m pip install -r requirements.txt" >&2
   exit 1
 fi
 
-if [ -d "$SCRIPT_DIR/vendor" ]; then
-  export PYTHONPATH="$SCRIPT_DIR/vendor${PYTHONPATH:+:$PYTHONPATH}"
-fi
-
 OPEN_BROWSER=0
-if [ "${1:-}" = "--open-browser" ]; then OPEN_BROWSER=1; fi
-
-"$PYTHON_BIN" app.py | while IFS= read -r line; do
-  printf '%s\n' "$line"
-  case "$line" in
-    http://*)
-      if [ "$OPEN_BROWSER" = 1 ] && command -v open >/dev/null 2>&1; then
-        open "$line" >/dev/null 2>&1 || true
-        OPEN_BROWSER=0
-      fi
-      ;;
-  esac
-done
+case "${1:-}" in
+  "") ;;
+  --open-browser) OPEN_BROWSER=1 ;;
+  *) echo "用法: sh start_reimbursement_tool.sh [--open-browser]" >&2; exit 1 ;;
+esac
+export APP_PORT="${APP_PORT:-8800}"
+if [ "$OPEN_BROWSER" = 1 ] && command -v open >/dev/null 2>&1; then
+  "$PYTHON_BIN" -c 'import os, subprocess, time, urllib.request
+url = "http://127.0.0.1:" + os.environ["APP_PORT"]
+for attempt in range(30):
+    try:
+        urllib.request.urlopen(url + "/api/health", timeout=1).close()
+    except OSError:
+        time.sleep(1)
+    else:
+        subprocess.run(["open", url], check=False)
+        break' &
+fi
+exec "$PYTHON_BIN" app.py

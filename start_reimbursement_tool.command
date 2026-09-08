@@ -1,5 +1,5 @@
-#!/bin/zsh
-set -e
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+#!/bin/sh
+set -eu
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
 cd "$SCRIPT_DIR"
-exec "$SCRIPT_DIR/start_reimbursement_tool.sh" --open-browser
+exec sh "$SCRIPT_DIR/start_reimbursement_tool.sh" --open-browser
