@@ -243,7 +243,7 @@ def create_server(
         password_hasher,
         revoke_sessions=session_service.revoke_user,
     )
-    reimbursement_service = ReimbursementService(database, config)
+    reimbursement_service = ReimbursementService(database, config, app_secret=secret)
     application = WebApplication(
         config,
         user_service,

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+import hmac
 import json
 import tempfile
 from pathlib import Path
@@ -109,6 +110,29 @@ class ReimbursementCleanupTest(unittest.TestCase):
             return connection.execute(
                 "SELECT * FROM reimbursements WHERE id = ?", (record_id,)
             ).fetchone()
+
+    def _create_partial_purge(self, service: ReimbursementService) -> Path:
+        owner_dir = self.data_dir / "users" / str(self.user_id)
+        record_dir = owner_dir / self.record_id
+        record_dir.mkdir(parents=True)
+        (record_dir / "original-sentinel").write_bytes(b"original")
+        (record_dir / "claim.xlsx").write_bytes(b"xlsx")
+        (record_dir / "claim.pdf").write_bytes(b"pdf")
+        service.trash(self.user_id, self.record_id)
+
+        with mock.patch.object(
+            service,
+            "_remove_tree",
+            side_effect=OSError("forced partial purge"),
+        ), self.assertLogs("reimbursements", level="ERROR"):
+            with self.assertRaises(ReimbursementNotFound):
+                service.purge_one(self.user_id, self.record_id)
+
+        quarantines = list(
+            owner_dir.glob(f".reimbursement-purge-{self.record_id}-*")
+        )
+        self.assertEqual(len(quarantines), 1)
+        return quarantines[0]
 
     def test_owner_can_trash_active_record_at_supplied_time(self):
         deleted_at = datetime(2026, 9, 8, 12, tzinfo=timezone.utc)
@@ -337,6 +361,171 @@ class ReimbursementCleanupTest(unittest.TestCase):
         self.assertEqual((detached / original_sentinel.name).read_bytes(), b"original")
         self.assertEqual(replacement_sentinel.read_bytes(), b"replacement")
         self.assertIsNotNone(self._row(self.record_id))
+
+    def test_purge_retry_rejects_self_consistent_forged_quarantine(self):
+        owner_dir = self.data_dir / "users" / str(self.user_id)
+        record_dir = owner_dir / self.record_id
+        record_dir.mkdir(parents=True)
+        original_sentinel = record_dir / "original-sentinel"
+        original_sentinel.write_bytes(b"original")
+        (record_dir / "claim.xlsx").write_bytes(b"xlsx")
+        (record_dir / "claim.pdf").write_bytes(b"pdf")
+        self.service.trash(self.user_id, self.record_id)
+
+        with mock.patch.object(
+            self.service,
+            "_remove_tree",
+            side_effect=OSError("forced partial purge"),
+        ), self.assertLogs("reimbursements", level="ERROR"):
+            with self.assertRaises(ReimbursementNotFound):
+                self.service.purge_one(self.user_id, self.record_id)
+
+        legitimate = list(
+            owner_dir.glob(f".reimbursement-purge-{self.record_id}-*")
+        )
+        self.assertEqual(len(legitimate), 1)
+        detached_legitimate = self.root / "detached-legitimate-quarantine"
+        legitimate[0].rename(detached_legitimate)
+
+        forged_staging = owner_dir / "forged-quarantine"
+        replacement = forged_staging / "entry"
+        replacement.mkdir(parents=True)
+        replacement_sentinel = replacement / "replacement-sentinel"
+        replacement_sentinel.write_bytes(b"replacement")
+        device, inode = self.service._directory_identity(replacement.stat())
+        forged = owner_dir / (
+            f".reimbursement-purge-{self.record_id}-{device:x}-{inode:x}"
+        )
+        forged_staging.rename(forged)
+
+        with self.assertRaises(ReimbursementNotFound):
+            self.service.purge_one(self.user_id, self.record_id)
+
+        self.assertEqual(
+            (detached_legitimate / "entry" / original_sentinel.name).read_bytes(),
+            b"original",
+        )
+        self.assertEqual(
+            (forged / "entry" / replacement_sentinel.name).read_bytes(),
+            b"replacement",
+        )
+        self.assertIsNotNone(self._row(self.record_id))
+
+    def test_purge_retry_with_same_secret_resumes_after_service_restart(self):
+        app_secret = b"a" * 32
+        first_service = ReimbursementService(
+            self.database,
+            self.config,
+            app_secret=app_secret,
+        )
+        quarantine = self._create_partial_purge(first_service)
+
+        restarted_service = ReimbursementService(
+            self.database,
+            self.config,
+            app_secret=app_secret,
+        )
+        restarted_service.purge_one(self.user_id, self.record_id)
+
+        self.assertFalse(quarantine.exists())
+        self.assertIsNone(self._row(self.record_id))
+
+    def test_purge_retry_with_different_secret_retains_quarantine_and_row(self):
+        first_service = ReimbursementService(
+            self.database,
+            self.config,
+            app_secret=b"a" * 32,
+        )
+        quarantine = self._create_partial_purge(first_service)
+
+        restarted_service = ReimbursementService(
+            self.database,
+            self.config,
+            app_secret=b"b" * 32,
+        )
+        with self.assertRaises(ReimbursementNotFound):
+            restarted_service.purge_one(self.user_id, self.record_id)
+
+        self.assertEqual(
+            (quarantine / "entry" / "original-sentinel").read_bytes(),
+            b"original",
+        )
+        self.assertIsNotNone(self._row(self.record_id))
+
+    def test_default_service_keys_do_not_authenticate_cross_service_retry(self):
+        with mock.patch(
+            "reimbursements.os.urandom",
+            side_effect=(b"a" * 32, b"b" * 32),
+        ) as random_bytes:
+            first_service = ReimbursementService(self.database, self.config)
+            quarantine = self._create_partial_purge(first_service)
+            restarted_service = ReimbursementService(self.database, self.config)
+
+        with self.assertRaises(ReimbursementNotFound):
+            restarted_service.purge_one(self.user_id, self.record_id)
+
+        self.assertEqual(
+            random_bytes.call_args_list,
+            [mock.call(32), mock.call(32)],
+        )
+        self.assertEqual(
+            (quarantine / "entry" / "original-sentinel").read_bytes(),
+            b"original",
+        )
+        self.assertIsNotNone(self._row(self.record_id))
+
+    def test_purge_quarantine_name_requires_canonical_authenticated_fields(self):
+        service = ReimbursementService(
+            self.database,
+            self.config,
+            app_secret=b"a" * 32,
+        )
+        identity = (0xABCDEF, 0x123ABC)
+        name = service._purge_quarantine_name(self.record_id, identity)
+        prefix = f".reimbursement-purge-{self.record_id}-"
+        components = name[len(prefix):].split("-")
+
+        self.assertEqual(len(components), 3)
+        device, inode, mac = components
+        self.assertEqual(
+            service._purge_quarantine_identity(name, self.record_id),
+            identity,
+        )
+        invalid_names = (
+            f"{prefix}0{device}-{inode}-{mac}",
+            f"{prefix}{device.upper()}-{inode}-{mac}",
+            f"{prefix}{device}-0{inode}-{mac}",
+            f"{prefix}{device}-{inode}-A{mac[1:]}",
+            f"{prefix}{device}-{inode}-{'0' if mac[0] != '0' else '1'}{mac[1:]}",
+            f"{name}-extra",
+        )
+        for invalid_name in invalid_names:
+            with self.subTest(invalid_name=invalid_name):
+                self.assertIsNone(
+                    service._purge_quarantine_identity(
+                        invalid_name,
+                        self.record_id,
+                    )
+                )
+
+    def test_purge_quarantine_mac_uses_constant_time_comparison(self):
+        service = ReimbursementService(
+            self.database,
+            self.config,
+            app_secret=b"a" * 32,
+        )
+        identity = (1, 2)
+        name = service._purge_quarantine_name(self.record_id, identity)
+        real_compare_digest = hmac.compare_digest
+
+        with mock.patch(
+            "hmac.compare_digest",
+            wraps=real_compare_digest,
+        ) as compare_digest:
+            parsed = service._purge_quarantine_identity(name, self.record_id)
+
+        self.assertEqual(parsed, identity)
+        compare_digest.assert_called_once()
 
     def test_restore_rejects_record_retained_after_partial_purge(self):
         owner_dir = self.data_dir / "users" / str(self.user_id)

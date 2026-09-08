@@ -118,6 +118,21 @@ class ReimbursementServiceTest(unittest.TestCase):
     def tearDown(self):
         self.temporary.cleanup()
 
+    def test_quarantine_auth_key_requires_exactly_32_bytes(self):
+        invalid_secrets = (
+            b"",
+            b"s" * 31,
+            b"s" * 33,
+            "s" * 32,
+            bytearray(b"s" * 32),
+        )
+        for invalid_secret in invalid_secrets:
+            with self.subTest(invalid_secret=invalid_secret), self.assertRaisesRegex(
+                ValueError,
+                "quarantine secret must be 32 bytes",
+            ):
+                self._service_with(app_secret=invalid_secret)
+
     def _insert_user(self, user: AuthenticatedUser) -> None:
         now = "2026-09-08T00:00:00+00:00"
         with self.database.transaction(immediate=True) as connection:
@@ -1360,9 +1375,14 @@ class ReimbursementServiceTest(unittest.TestCase):
             def server_close(self):
                 self.closed = True
 
+        app_secret = b"s" * 32
         with mock.patch.object(app, "BoundedThreadingHTTPServer", FakeServer), mock.patch(
             "reimbursements.find_soffice",
             side_effect=AssertionError("soffice discovery must stay lazy"),
+        ), mock.patch.object(
+            app,
+            "load_or_create_secret",
+            return_value=app_secret,
         ):
             server = app.create_server(config_path)
 
@@ -1370,6 +1390,10 @@ class ReimbursementServiceTest(unittest.TestCase):
         self.assertIs(
             server.application.reimbursement_service,
             server.reimbursement_service,
+        )
+        self.assertEqual(
+            getattr(server.reimbursement_service, "_quarantine_auth_key", None),
+            app_secret,
         )
 
     def test_nested_outputs_keep_their_relative_paths_after_directory_move(self):

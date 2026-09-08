@@ -5,6 +5,8 @@ from __future__ import annotations
 from contextlib import closing
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+import hashlib
+import hmac
 import logging
 import os
 from pathlib import Path
@@ -27,6 +29,7 @@ _MAX_DISPLAY_NAME_UTF8_BYTES = 180
 _TRASH_RETENTION = timedelta(days=30)
 _CLEANUP_ENTRY_NAME = "entry"
 _PURGE_QUARANTINE_PREFIX = ".reimbursement-purge-"
+_PURGE_QUARANTINE_AUTH_PURPOSE = b"reimbursement-purge-quarantine:v1"
 _DIRECTORY_OPEN_FLAGS = (
     os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
 )
@@ -98,7 +101,12 @@ class ReimbursementService:
         clock: Callable[[], datetime] | None = None,
         move_directory: Callable | None = None,
         remove_tree: Callable | None = None,
+        app_secret: bytes | None = None,
     ):
+        if app_secret is not None and (
+            not isinstance(app_secret, bytes) or len(app_secret) != 32
+        ):
+            raise ValueError("quarantine secret must be 32 bytes")
         self._database = database
         self._config = config
         self._generator = workbook_generator
@@ -108,6 +116,9 @@ class ReimbursementService:
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self._move_directory = move_directory or self._rename_directory
         self._remove_tree = remove_tree
+        self._quarantine_auth_key = (
+            app_secret if app_secret is not None else os.urandom(32)
+        )
         self._generation_slots = threading.BoundedSemaphore(
             config.max_concurrent_generations
         )
@@ -652,16 +663,21 @@ class ReimbursementService:
                 except OSError:
                     pass
 
-    @staticmethod
     def _purge_quarantine_name(
+        self,
         record_id: str,
         identity: tuple[int, int],
     ) -> str:
         device, inode = identity
-        return f"{_PURGE_QUARANTINE_PREFIX}{record_id}-{device:x}-{inode:x}"
+        device_hex = f"{device:x}"
+        inode_hex = f"{inode:x}"
+        mac = self._purge_quarantine_mac(record_id, device_hex, inode_hex)
+        return (
+            f"{_PURGE_QUARANTINE_PREFIX}{record_id}-{device_hex}-{inode_hex}-{mac}"
+        )
 
-    @staticmethod
     def _purge_quarantine_identity(
+        self,
         name: str,
         record_id: str,
     ) -> tuple[int, int] | None:
@@ -669,10 +685,10 @@ class ReimbursementService:
         if not isinstance(name, str) or not name.startswith(prefix):
             return None
         components = name[len(prefix):].split("-")
-        if len(components) != 2:
+        if len(components) != 3:
             return None
         values = []
-        for component in components:
+        for component in components[:2]:
             if (
                 not component
                 or any(character not in "0123456789abcdef" for character in component)
@@ -682,7 +698,42 @@ class ReimbursementService:
             if f"{value:x}" != component:
                 return None
             values.append(value)
+        supplied_mac = components[2]
+        if (
+            len(supplied_mac) != hashlib.sha256().digest_size * 2
+            or any(
+                character not in "0123456789abcdef" for character in supplied_mac
+            )
+        ):
+            return None
+        expected_mac = self._purge_quarantine_mac(
+            record_id,
+            components[0],
+            components[1],
+        )
+        if not hmac.compare_digest(supplied_mac, expected_mac):
+            return None
         return values[0], values[1]
+
+    def _purge_quarantine_mac(
+        self,
+        record_id: str,
+        device_hex: str,
+        inode_hex: str,
+    ) -> str:
+        message = b"\0".join(
+            (
+                _PURGE_QUARANTINE_AUTH_PURPOSE,
+                record_id.encode("ascii"),
+                device_hex.encode("ascii"),
+                inode_hex.encode("ascii"),
+            )
+        )
+        return hmac.new(
+            self._quarantine_auth_key,
+            message,
+            hashlib.sha256,
+        ).hexdigest()
 
     def _resume_purge_at(
         self,
