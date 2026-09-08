@@ -154,7 +154,7 @@ class RunningApp:
                 "<!doctype html><html><body>reimbursement form</body></html>", encoding="utf-8"
             )
             project_templates = Path(__file__).resolve().parents[1] / "templates"
-            for template_name in ("setup.html", "login.html", "register.html", "change-password.html"):
+            for template_name in ("setup.html", "login.html", "register.html", "change-password.html", "history.html", "admin.html"):
                 source = project_templates / template_name
                 if source.is_file():
                     (self.templates_dir / template_name).write_text(

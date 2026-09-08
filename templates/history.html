@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title data-page-title>历史记录</title>
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body class="app-body" data-csrf="__CSRF_TOKEN__" data-scope="active" data-view="active">
+  <aside id="app-sidebar" class="app-sidebar" aria-label="主导航">
+    <div class="brand">差旅报销系统</div>
+    <nav><a href="/">填写报销</a><a href="/history" data-nav-active="active" data-view="active">历史记录</a><a href="/trash" data-nav-active="trash" data-view="trash">回收站</a></nav>
+    <button id="logout" type="button" class="secondary">退出登录</button>
+  </aside>
+  <button id="sidebar-toggle" class="sidebar-toggle" type="button" aria-controls="app-sidebar" aria-expanded="false">菜单</button>
+  <main class="page-shell history-page">
+    <header class="page-header"><h1 data-heading>历史记录</h1><p>查看你生成的报销文件。</p></header>
+    <section class="form-section" aria-labelledby="records-heading">
+      <div class="section-heading"><h2 id="records-heading">报销文件</h2><span id="record-count" aria-live="polite"></span></div>
+      <div id="history-error" class="result error" role="alert" aria-live="assertive"></div>
+      <div id="history-empty" class="empty-state" hidden>暂无记录</div>
+      <div class="table-wrap">
+        <table class="history-table" aria-describedby="records-heading">
+          <thead><tr><th>文件名称</th><th>报销日期</th><th>生成时间</th><th>状态</th><th>操作</th></tr></thead>
+          <tbody id="history-rows"></tbody>
+        </table>
+      </div>
+    </section>
+    <dialog id="purge-dialog" aria-labelledby="purge-title">
+      <form method="dialog" class="dialog-form" data-purge-form>
+        <h2 id="purge-title">永久删除报销记录</h2>
+        <p>删除后文件将无法恢复。</p>
+        <p id="purge-name" class="dialog-value"></p>
+        <div class="dialog-actions"><button type="submit" value="cancel" class="secondary">取消</button><button type="submit" value="confirm" data-confirm-purge>永久删除</button></div>
+      </form>
+    </dialog>
+  </main>
+  <script src="/static/common.js" defer></script><script src="/static/history.js" defer></script>
+</body>
+</html>

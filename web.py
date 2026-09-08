@@ -231,6 +231,8 @@ class WebApplication:
             "/api/reimbursements": Route(
                 "_reimbursement_list", authentication=True, roles=("user",)
             ),
+            "/history": Route("_history_page", authentication=True, roles=("user",)),
+            "/trash": Route("_trash_page", authentication=True, roles=("user",)),
             "/change-password": Route(
                 "_change_password_page", authentication=True,
                 allow_forced_password_change=True,
@@ -521,8 +523,17 @@ class WebApplication:
             return
         self._file(handler, index_path, "text/html; charset=utf-8", no_store=True)
 
-    def _admin_page(self, handler, _user, _token) -> None:
-        self._html(handler, 200, self._page_markup("系统管理"))
+    def _history_page(self, handler, user, _token) -> None:
+        assert user is not None
+        self._template_page(handler, "history.html", user.csrf_token)
+
+    def _trash_page(self, handler, user, _token) -> None:
+        assert user is not None
+        self._template_page(handler, "history.html", user.csrf_token, scope="trash")
+
+    def _admin_page(self, handler, user, _token) -> None:
+        assert user is not None
+        self._template_page(handler, "admin.html", user.csrf_token)
 
     def _admin_registrations(self, handler, user, _token) -> None:
         self._admin_list(handler, user, self.user_service.list_pending)
@@ -1021,8 +1032,8 @@ class WebApplication:
         }[post_path]
         self._template_page(handler, template, csrf_token)
 
-    def _template_page(self, handler, name: str, csrf_token: str) -> None:
-        allowed = {"setup.html", "login.html", "register.html", "change-password.html"}
+    def _template_page(self, handler, name: str, csrf_token: str, *, scope: str | None = None) -> None:
+        allowed = {"setup.html", "login.html", "register.html", "change-password.html", "history.html", "admin.html"}
         if name not in allowed:
             self._json(handler, 500, {"error": "页面模板不可用"})
             return
@@ -1036,6 +1047,9 @@ class WebApplication:
             'data-csrf="__CSRF_TOKEN__"',
             f'data-csrf="{html.escape(csrf_token, quote=True)}"',
         )
+        if scope is not None:
+            markup = markup.replace('data-scope="active"', f'data-scope="{html.escape(scope, quote=True)}"')
+            markup = markup.replace('data-view="active"', f'data-view="{html.escape(scope, quote=True)}"')
         self._html(handler, 200, markup.encode("utf-8"))
 
     @staticmethod

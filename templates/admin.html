@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>系统管理</title>
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body class="app-body" data-csrf="__CSRF_TOKEN__">
+  <aside id="app-sidebar" class="app-sidebar" aria-label="主导航">
+    <div class="brand">差旅报销系统</div>
+    <nav><a href="/admin" aria-current="page">系统管理</a><a href="/change-password">修改密码</a></nav>
+    <button id="logout" type="button" class="secondary">退出登录</button>
+  </aside>
+  <button id="sidebar-toggle" class="sidebar-toggle" type="button" aria-controls="app-sidebar" aria-expanded="false">菜单</button>
+  <main class="page-shell admin-page">
+    <header class="page-header"><h1>系统管理</h1><p>审批注册申请并维护普通用户账号。</p></header>
+    <section class="form-section" aria-labelledby="pending-heading">
+      <div class="section-heading"><h2 id="pending-heading">待审批 <span id="pending-badge" class="count-badge" aria-label="待审批数量">0</span></h2></div>
+      <div id="pending-error" class="result error" role="alert" aria-live="assertive"></div>
+      <div id="pending-empty" class="empty-state" hidden>暂无待审批申请</div>
+      <div class="table-wrap"><table class="admin-table"><thead><tr><th>账号</th><th>姓名</th><th>部门</th><th>申请时间</th><th>操作</th></tr></thead><tbody id="pending-rows"></tbody></table></div>
+    </section>
+    <section class="form-section" aria-labelledby="users-heading">
+      <div class="section-heading"><h2 id="users-heading">用户管理</h2></div>
+      <div id="users-error" class="result error" role="alert" aria-live="assertive"></div>
+      <div id="users-empty" class="empty-state" hidden>暂无普通用户</div>
+      <div class="table-wrap"><table class="admin-table"><thead><tr><th>账号</th><th>姓名</th><th>部门</th><th>状态</th><th>操作</th></tr></thead><tbody id="users-rows"></tbody></table></div>
+    </section>
+    <dialog id="profile-dialog" aria-labelledby="profile-title"><form method="dialog" class="dialog-form" data-profile-form><h2 id="profile-title">编辑用户资料</h2><input type="hidden" name="user_id"><label for="profile-real-name">姓名<input id="profile-real-name" name="real_name" required></label><label for="profile-department">部门<input id="profile-department" name="department" required></label><p class="form-message" data-dialog-message aria-live="polite"></p><div class="dialog-actions"><button type="submit" value="cancel" class="secondary">取消</button><button type="submit" value="save">保存</button></div></form></dialog>
+    <dialog id="temporary-password-dialog" aria-labelledby="temporary-password-title"><form method="dialog" class="dialog-form" data-password-form><h2 id="temporary-password-title">临时密码</h2><p>请将临时密码交给用户，并提醒其登录后立即修改。</p><output id="temporary-password" class="temporary-password" aria-live="polite"></output><div class="dialog-actions"><button type="button" class="secondary" data-copy-password>复制密码</button><button type="submit" value="close">关闭</button></div></form></dialog>
+  </main>
+  <script src="/static/common.js" defer></script><script src="/static/admin.js" defer></script>
+</body>
+</html>
