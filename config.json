@@ -1,7 +1,7 @@
 {
   "template_path": "resources/差旅报销单模板.xlsx",
   "data_dir": "data",
-  "host": "127.0.0.1",
+  "host": "0.0.0.0",
   "port": 8800,
   "soffice_path": "",
   "max_body_bytes": 10485760,
