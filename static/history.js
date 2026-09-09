@@ -11,7 +11,13 @@
   if (scope === 'trash') {
     document.title = '回收站';
     const heading = document.querySelector('[data-heading]');
-    if (heading) heading.textContent = '回收站';
+    if (heading) {
+      const label = heading.querySelector('[data-heading-label]');
+      if (label) label.textContent = '回收站';
+      else heading.textContent = '回收站';
+      const icon = heading.querySelector('.ui-icon use');
+      if (icon) icon.setAttribute('href', '/static/icons.svg#trash-2');
+    }
     document.querySelectorAll('[data-nav-active]').forEach(node => {
       node.toggleAttribute('aria-current', node.dataset.navActive === 'trash');
     });

@@ -9,18 +9,18 @@
 <body class="app-body">
   <aside id="app-sidebar" class="app-sidebar" aria-label="主导航">
     <div class="brand">君牧在线报销系统</div>
-    <nav><a href="/" aria-current="page">填写报销</a><a href="/history">历史记录</a><a href="/trash">回收站</a></nav>
+    <nav><a href="/" aria-current="page"><svg class="ui-icon" aria-hidden="true"><use href="/static/icons.svg#file-pen"></use></svg><span>填写报销</span></a><a href="/history"><svg class="ui-icon" aria-hidden="true"><use href="/static/icons.svg#history"></use></svg><span>历史记录</span></a><a href="/trash"><svg class="ui-icon" aria-hidden="true"><use href="/static/icons.svg#trash-2"></use></svg><span>回收站</span></a></nav>
     <button id="logout" type="button" class="secondary">退出登录</button>
   </aside>
   <button id="sidebar-toggle" class="sidebar-toggle" type="button" aria-controls="app-sidebar" aria-expanded="false">菜单</button>
   <main class="page-shell">
     <header class="page-header">
-      <h1>差旅报销单</h1>
+      <h1><svg class="ui-icon ui-icon-title" aria-hidden="true"><use href="/static/icons.svg#file-text"></use></svg><span>差旅报销单</span></h1>
       <p>填写报销信息与行程明细，生成可下载的 Excel 和 PDF。</p>
     </header>
     <form id="reimbursement-form" novalidate>
       <section class="form-section" aria-labelledby="basic-heading">
-        <h2 id="basic-heading">基本信息</h2>
+        <h2 id="basic-heading"><svg class="ui-icon" aria-hidden="true"><use href="/static/icons.svg#info"></use></svg><span>基本信息</span></h2>
         <div class="basic-grid">
           <label>报销日期<input id="date" name="date" type="date"></label>
           <label for="department">部门<input id="department" name="department" readonly required></label>
@@ -32,7 +32,7 @@
       </section>
 
       <section class="form-section" aria-labelledby="detail-heading">
-        <div class="section-heading"><h2 id="detail-heading">行程明细</h2><span>最多 11 行，空行可留空</span></div>
+        <div class="section-heading"><h2 id="detail-heading"><svg class="ui-icon" aria-hidden="true"><use href="/static/icons.svg#route"></use></svg><span>行程明细</span></h2><span>最多 11 行，空行可留空</span></div>
         <div class="table-wrap">
           <table class="detail-table">
             <thead><tr><th>序号</th><th>日期</th><th>起点</th><th>终点</th><th>交通工具</th><th>公共交通金额</th><th>自驾里程（KM）</th><th>通行费</th><th>住宿费</th><th>单据数</th></tr></thead>
@@ -54,7 +54,7 @@
       </section>
 
       <section class="form-section upload-section" aria-labelledby="upload-heading">
-        <h2 id="upload-heading">里程截图</h2>
+        <h2 id="upload-heading"><svg class="ui-icon" aria-hidden="true"><use href="/static/icons.svg#image"></use></svg><span>里程截图</span></h2>
         <label for="screenshots" class="file-label">选择里程截图</label>
         <input id="screenshots" name="screenshots" type="file" accept=".jpg,.jpeg,.png,image/jpeg,image/png" multiple>
         <div id="preview-list" class="preview-list" aria-live="polite"></div>

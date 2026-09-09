@@ -9,12 +9,12 @@
 <body class="app-body" data-csrf="__CSRF_TOKEN__" data-scope="active" data-view="active">
   <aside id="app-sidebar" class="app-sidebar" aria-label="主导航">
     <div class="brand">君牧在线报销系统</div>
-    <nav><a href="/">填写报销</a><a href="/history" data-nav-active="active" data-view="active">历史记录</a><a href="/trash" data-nav-active="trash" data-view="trash">回收站</a></nav>
+    <nav><a href="/"><svg class="ui-icon" aria-hidden="true"><use href="/static/icons.svg#file-pen"></use></svg><span>填写报销</span></a><a href="/history" data-nav-active="active" data-view="active"><svg class="ui-icon" aria-hidden="true"><use href="/static/icons.svg#history"></use></svg><span>历史记录</span></a><a href="/trash" data-nav-active="trash" data-view="trash"><svg class="ui-icon" aria-hidden="true"><use href="/static/icons.svg#trash-2"></use></svg><span>回收站</span></a></nav>
     <button id="logout" type="button" class="secondary">退出登录</button>
   </aside>
   <button id="sidebar-toggle" class="sidebar-toggle" type="button" aria-controls="app-sidebar" aria-expanded="false">菜单</button>
   <main class="page-shell history-page">
-    <header class="page-header"><h1 data-heading>历史记录</h1><p>查看你生成的报销文件。</p></header>
+    <header class="page-header"><h1 data-heading><svg class="ui-icon ui-icon-title" aria-hidden="true"><use href="/static/icons.svg#history"></use></svg><span data-heading-label>历史记录</span></h1><p>查看你生成的报销文件。</p></header>
     <section class="form-section" aria-labelledby="records-heading">
       <div class="section-heading"><h2 id="records-heading">报销文件</h2><span id="record-count" aria-live="polite"></span></div>
       <div id="history-error" class="result error" role="alert" aria-live="assertive"></div>
