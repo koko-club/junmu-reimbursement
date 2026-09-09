@@ -22,7 +22,7 @@ LibreOffice 通常位于 `/Applications/LibreOffice.app/Contents/MacOS/soffice`�
 APP_SOFFICE_PATH=/Applications/LibreOffice.app/Contents/MacOS/soffice sh start_reimbursement_tool.sh
 ```
 
-默认仅监听本机。完成初始化后，局域网共享可执行 `APP_HOST=0.0.0.0 sh start_reimbursement_tool.sh`，并在 macOS 防火墙允许 Python 接收连接。访问 `http://电脑局域网IP:8800`。
+默认监听所有本机网络接口（`0.0.0.0`）以便局域网访问。在 macOS 防火墙中允许 Python 接收连接后，可访问 `http://电脑局域网IP:8800`；如需仅本机访问，执行 `APP_HOST=127.0.0.1 sh start_reimbursement_tool.sh`。
 
 ## 构建和离线交付
 

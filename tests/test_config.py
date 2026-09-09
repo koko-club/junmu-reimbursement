@@ -24,7 +24,7 @@ class ConfigContractTest(unittest.TestCase):
 
         self.assertEqual(raw["template_path"], "resources/差旅报销单模板.xlsx")
         self.assertEqual(raw["data_dir"], "data")
-        self.assertEqual(raw["host"], "127.0.0.1")
+        self.assertEqual(raw["host"], "0.0.0.0")
         self.assertEqual(raw["port"], 8800)
         self.assertEqual(raw["soffice_path"], "")
         self.assertEqual(raw["max_body_bytes"], 10485760)
