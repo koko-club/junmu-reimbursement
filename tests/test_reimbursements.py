@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from dataclasses import FrozenInstanceError, replace
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import json
 import os
 from pathlib import Path
@@ -181,6 +181,8 @@ class ReimbursementServiceTest(unittest.TestCase):
         *,
         created_at: str,
         deleted_at: str | None = None,
+        reason: str | None = None,
+        reimbursement_amount: str | None = None,
     ) -> tuple[Path, Path]:
         final_dir = self.data_dir.resolve() / "users" / str(user_id) / record_id
         final_dir.mkdir(parents=True)
@@ -192,8 +194,9 @@ class ReimbursementServiceTest(unittest.TestCase):
             connection.execute(
                 """INSERT INTO reimbursements(
                     id, user_id, reimbursement_date, display_name,
-                    xlsx_path, pdf_path, created_at, deleted_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                    xlsx_path, pdf_path, created_at, deleted_at,
+                    reason, reimbursement_amount
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     record_id,
                     user_id,
@@ -203,9 +206,54 @@ class ReimbursementServiceTest(unittest.TestCase):
                     pdf.relative_to(self.data_dir.resolve()).as_posix(),
                     created_at,
                     deleted_at,
+                    reason,
+                    reimbursement_amount,
                 ),
             )
         return xlsx, pdf
+
+    def test_active_stats_groups_local_generated_dates_and_excludes_trash(self):
+        self._insert_record(
+            self.alice.user_id,
+            "80000000-0000-4000-8000-000000000001",
+            created_at="2026-09-08T16:30:00+00:00",
+            reimbursement_amount="100.00",
+        )
+        self._insert_record(
+            self.alice.user_id,
+            "80000000-0000-4000-8000-000000000002",
+            created_at="2026-08-31T15:30:00+00:00",
+            reimbursement_amount="200.00",
+        )
+        self._insert_record(
+            self.alice.user_id,
+            "80000000-0000-4000-8000-000000000003",
+            created_at="2025-12-31T16:30:00+00:00",
+            reimbursement_amount="300.00",
+        )
+        self._insert_record(
+            self.alice.user_id,
+            "80000000-0000-4000-8000-000000000004",
+            created_at="2026-09-08T12:00:00+00:00",
+            deleted_at="2026-09-08T13:00:00+00:00",
+            reimbursement_amount="400.00",
+        )
+        self._insert_record(
+            self.bob.user_id,
+            "80000000-0000-4000-8000-000000000005",
+            created_at="2026-09-08T16:30:00+00:00",
+            reimbursement_amount="500.00",
+        )
+
+        stats = self.service.active_stats(
+            self.alice.user_id,
+            now=datetime(2026, 9, 9, 1, tzinfo=timezone.utc),
+        )
+
+        self.assertEqual(
+            stats,
+            {"month_count": 1, "year_count": 3, "year_amount": "600.00"},
+        )
 
     def test_generate_uses_trusted_profile_records_owner_and_moves_private_files(self):
         record = self.service.generate(
@@ -236,6 +284,37 @@ class ReimbursementServiceTest(unittest.TestCase):
         self.assertEqual(row["user_id"], self.alice.user_id)
         self.assertEqual(row["xlsx_path"], f"users/{self.alice.user_id}/{record.id}/相同显示名.xlsx")
         self.assertEqual(row["pdf_path"], f"users/{self.alice.user_id}/{record.id}/相同显示名.pdf")
+
+    def test_generate_persists_history_reason_and_template_total(self):
+        record = self.service.generate(
+            self.alice,
+            valid_payload(
+                days="2",
+                allowance="50.5",
+                reason="客户拜访",
+                rows=[
+                    {
+                        "origin": "上海",
+                        "destination": "杭州",
+                        "public_amount": "12.5",
+                        "mileage": "10",
+                        "toll": "20.25",
+                        "lodging": "180",
+                    }
+                ],
+            ),
+            [],
+        )
+
+        self.assertEqual(record.reason, "客户拜访")
+        self.assertEqual(record.reimbursement_amount, "323.75")
+        with self.database.connect() as connection:
+            row = connection.execute(
+                "SELECT reason, reimbursement_amount FROM reimbursements WHERE id = ?",
+                (record.id,),
+            ).fetchone()
+        self.assertEqual(row["reason"], "客户拜访")
+        self.assertEqual(row["reimbursement_amount"], "323.75")
 
     def test_record_is_immutable(self):
         record = self.service.generate(self.alice, valid_payload(), [])
@@ -2150,7 +2229,7 @@ class ReimbursementServiceTest(unittest.TestCase):
                 "SELECT * FROM reimbursements WHERE id = ?", (str(record_uuid),)
             ).fetchone()
         self.assertIsNotNone(row)
-        self.assertEqual(tuple(row), (*prior_values, None))
+        self.assertEqual(tuple(row), (*prior_values, None, None, None))
         self.assertFalse(final_dir.exists())
 
 

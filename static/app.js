@@ -1,22 +1,55 @@
 (function () {
   'use strict';
   const form = document.getElementById('reimbursement-form');
-  const fileInput = document.getElementById('screenshots');
-  const previewList = document.getElementById('preview-list');
   const result = document.getElementById('result');
   const errorBox = document.getElementById('error');
   const submit = document.getElementById('submit');
+  const mileageDialog = document.getElementById('mileage-development-dialog');
+  const mileageTrigger = document.getElementById('mileage-development-trigger');
+  const mileageClose = document.getElementById('mileage-development-close');
+  const monthCount = document.getElementById('month-count');
+  const yearCount = document.getElementById('year-count');
+  const yearAmount = document.getElementById('year-amount');
   let files = [];
-  const MAX_FILE_BYTES = 5 * 1024 * 1024;
-  const MAX_TOTAL_BYTES = 10 * 1024 * 1024;
   const EXPECTED_ROW_COUNT = 11;
   const numericFields = ['public_amount', 'mileage', 'toll', 'lodging', 'receipts'];
+  const detailDateFields = Array.from(document.querySelectorAll('#detail-rows input[data-field="date"]'));
+
+  function syncDetailDateVisibility(field) {
+    field.classList.toggle('has-value', field.value.trim() !== '');
+  }
+
+  detailDateFields.forEach(function (field) {
+    field.value = '';
+    field.setAttribute('autocomplete', 'off');
+    syncDetailDateVisibility(field);
+    field.addEventListener('input', function () { syncDetailDateVisibility(field); });
+    field.addEventListener('change', function () { syncDetailDateVisibility(field); });
+  });
 
   async function loadSession() {
     const data = await apiFetch('/api/session');
     document.getElementById('traveler').value = data.user.real_name;
     document.getElementById('department').value = data.user.department;
     document.body.dataset.csrf = data.csrf_token;
+  }
+
+  const amountFormatter = new Intl.NumberFormat('zh-CN', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  function renderStats(data) {
+    const month = Number.isInteger(data.month_count) && data.month_count >= 0 ? data.month_count : 0;
+    const year = Number.isInteger(data.year_count) && data.year_count >= 0 ? data.year_count : 0;
+    const amount = Number(data.year_amount);
+    monthCount.textContent = month + ' 笔';
+    yearCount.textContent = year + ' 笔';
+    yearAmount.textContent = Number.isFinite(amount) ? '¥' + amountFormatter.format(amount) : '¥0.00';
+  }
+  async function loadStats() {
+    try {
+      renderStats(await apiFetch('/api/reimbursements/stats'));
+    } catch (_) {
+      // Keep the dashboard informative while a transient request is retried.
+      monthCount.textContent = '0 笔'; yearCount.textContent = '0 笔'; yearAmount.textContent = '¥0.00';
+    }
   }
 
   function normalizeDateInput(value) {
@@ -72,6 +105,12 @@
     });
   }
 
+  /* Original mileage screenshot selection is intentionally kept for reactivation.
+  const fileInput = document.getElementById('screenshots');
+  const previewList = document.getElementById('preview-list');
+  const MAX_FILE_BYTES = 5 * 1024 * 1024;
+  const MAX_TOTAL_BYTES = 10 * 1024 * 1024;
+
   function renderPreviews() {
     previewList.querySelectorAll('img[data-object-url]').forEach(function (image) { URL.revokeObjectURL(image.dataset.objectUrl); });
     previewList.textContent = '';
@@ -105,8 +144,22 @@
     }
     syncInput(); renderPreviews();
   });
+  */
 
-  form.addEventListener('reset', function () { files = []; renderPreviews(); result.className = 'result'; result.textContent = ''; errorBox.className = 'result error'; errorBox.textContent = ''; });
+  mileageTrigger.addEventListener('click', function () {
+    mileageDialog.showModal();
+  });
+  mileageClose.addEventListener('click', function () {
+    mileageDialog.close();
+  });
+  mileageDialog.addEventListener('click', function (event) {
+    if (event.target === mileageDialog) mileageDialog.close();
+  });
+
+  form.addEventListener('reset', function () {
+    detailDateFields.forEach(function (field) { field.value = ''; syncDetailDateVisibility(field); });
+    files = []; result.className = 'result'; result.textContent = ''; errorBox.className = 'result error'; errorBox.textContent = '';
+  });
   form.addEventListener('submit', async function (event) {
     event.preventDefault(); result.textContent = ''; result.className = 'result'; errorBox.textContent = ''; errorBox.className = 'result error';
     let payload;
@@ -116,18 +169,30 @@
     try {
       const data = await apiFetch('/api/reimbursements/generate', { method: 'POST', body: body });
       result.className = 'result success';
-      const strong = document.createElement('strong'); strong.textContent = '生成成功'; result.appendChild(strong);
+      const successStatus = document.createElement('span');
+      successStatus.className = 'result-success-status';
+      successStatus.setAttribute('role', 'img');
+      successStatus.setAttribute('aria-label', '生成成功');
+      const successIcon = document.createElement('svg');
+      successIcon.className = 'ui-icon result-success-icon';
+      successIcon.setAttribute('aria-hidden', 'true');
+      const successUse = document.createElement('use');
+      successUse.setAttribute('href', '/static/icons.svg#check');
+      successIcon.appendChild(successUse);
+      successStatus.appendChild(successIcon);
+      result.appendChild(successStatus);
       [['xlsx_url', '下载 Excel'], ['pdf_url', '下载 PDF']].forEach(function (entry) {
         const link = document.createElement('a');
+        link.className = 'table-action-button';
         link.href = data[entry[0]];
         link.textContent = entry[1];
-        link.style.marginLeft = '12px';
         if (entry[0] === 'pdf_url') {
           link.target = '_blank';
           link.rel = 'noopener';
         }
         result.appendChild(link);
       });
+      await loadStats();
     } catch (error) { message(error.message || '生成失败'); }
     finally { submit.disabled = false; delete submit.dataset.loading; submit.textContent = '生成 Excel + PDF'; }
   });
@@ -137,5 +202,8 @@
   document.getElementById('logout').addEventListener('click', async function () {
     try { await apiFetch('/api/logout', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' }); window.location.assign('/login'); } catch (_) {}
   });
+  document.addEventListener('visibilitychange', function () { if (document.visibilityState === 'visible') loadStats(); });
+  window.addEventListener('storage', function (event) { if (event.key === 'reimbursement-history-updated') loadStats(); });
   loadSession().catch(function () {});
+  loadStats();
 })();

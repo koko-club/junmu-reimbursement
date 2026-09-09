@@ -38,4 +38,13 @@
     message.textContent = text || '';
     message.className = 'form-message' + (kind ? ' ' + kind : '');
   };
+
+  const currentUser = document.getElementById('current-user');
+  if (currentUser) {
+    window.apiFetch('/api/session').then(function (data) {
+      const user = data && data.user;
+      const displayName = user && user.username;
+      if (displayName) currentUser.textContent = displayName;
+    }).catch(function () {});
+  }
 }());

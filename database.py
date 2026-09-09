@@ -240,6 +240,26 @@ class Database:
                     "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
                     (3, datetime.now(timezone.utc).isoformat()),
                 )
+            version = connection.execute(
+                "SELECT 1 FROM schema_migrations WHERE version = 4"
+            ).fetchone()
+            if version is None:
+                columns = {
+                    row["name"]
+                    for row in connection.execute("PRAGMA table_info(reimbursements)")
+                }
+                if "reason" not in columns:
+                    connection.execute(
+                        "ALTER TABLE reimbursements ADD COLUMN reason TEXT"
+                    )
+                if "reimbursement_amount" not in columns:
+                    connection.execute(
+                        "ALTER TABLE reimbursements ADD COLUMN reimbursement_amount TEXT"
+                    )
+                connection.execute(
+                    "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
+                    (4, datetime.now(timezone.utc).isoformat()),
+                )
             connection.commit()
         except Exception:
             connection.rollback()

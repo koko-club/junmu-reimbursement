@@ -4,12 +4,13 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>差旅报销单</title>
-  <link rel="stylesheet" href="/static/styles.css">
+  <link rel="stylesheet" href="/static/styles.css?v=20260909-mileage-dialog">
 </head>
 <body class="app-body">
   <aside id="app-sidebar" class="app-sidebar" aria-label="主导航">
-    <div class="brand">君牧在线报销系统</div>
-    <nav><a href="/" aria-current="page"><svg class="ui-icon" aria-hidden="true"><use href="/static/icons.svg#file-pen"></use></svg><span>填写报销</span></a><a href="/history"><svg class="ui-icon" aria-hidden="true"><use href="/static/icons.svg#history"></use></svg><span>历史记录</span></a><a href="/trash"><svg class="ui-icon" aria-hidden="true"><use href="/static/icons.svg#trash-2"></use></svg><span>回收站</span></a></nav>
+    <div class="brand"><img class="brand-logo" src="/static/logo.png" alt="" aria-hidden="true"><span>君牧在线报销系统</span></div>
+    <nav><a href="/" aria-current="page"><svg class="ui-icon" aria-hidden="true"><use href="/static/icons.svg#file-pen"></use></svg><span>填写报销</span></a><a href="/history"><svg class="ui-icon" aria-hidden="true"><use href="/static/icons.svg#history"></use></svg><span>报销记录</span></a><a href="/trash"><svg class="ui-icon" aria-hidden="true"><use href="/static/icons.svg#trash-2"></use></svg><span>回收站</span></a></nav>
+    <div class="sidebar-account" aria-live="polite"><span>当前登录：</span><strong id="current-user">加载中</strong></div>
     <button id="logout" type="button" class="secondary">退出登录</button>
   </aside>
   <button id="sidebar-toggle" class="sidebar-toggle" type="button" aria-controls="app-sidebar" aria-expanded="false">菜单</button>
@@ -18,7 +19,12 @@
       <h1><svg class="ui-icon ui-icon-title" aria-hidden="true"><use href="/static/icons.svg#file-text"></use></svg><span>差旅报销单</span></h1>
       <p>填写报销信息与行程明细，生成可下载的 Excel 和 PDF。</p>
     </header>
-    <form id="reimbursement-form" novalidate>
+    <form id="reimbursement-form" novalidate autocomplete="off">
+      <section class="stats-grid" aria-label="报销统计">
+        <article class="stat-card"><span class="stat-label">本月报销</span><strong id="month-count" class="stat-value" aria-live="polite">0 笔</strong></article>
+        <article class="stat-card"><span class="stat-label">本年报销</span><strong id="year-count" class="stat-value" aria-live="polite">0 笔</strong></article>
+        <article class="stat-card"><span class="stat-label">年报销金额</span><strong id="year-amount" class="stat-value" aria-live="polite">¥0.00</strong></article>
+      </section>
       <section class="form-section" aria-labelledby="basic-heading">
         <h2 id="basic-heading"><svg class="ui-icon" aria-hidden="true"><use href="/static/icons.svg#info"></use></svg><span>基本信息</span></h2>
         <div class="basic-grid">
@@ -32,10 +38,10 @@
       </section>
 
       <section class="form-section" aria-labelledby="detail-heading">
-        <div class="section-heading"><h2 id="detail-heading"><svg class="ui-icon" aria-hidden="true"><use href="/static/icons.svg#route"></use></svg><span>行程明细</span></h2><span>最多 11 行，空行可留空</span></div>
+        <div class="section-heading"><h2 id="detail-heading"><svg class="ui-icon" aria-hidden="true"><use href="/static/icons.svg#route"></use></svg><span>行程明细</span></h2></div>
         <div class="table-wrap">
           <table class="detail-table">
-            <thead><tr><th>序号</th><th>日期</th><th>起点</th><th>终点</th><th>交通工具</th><th>公共交通金额</th><th>自驾里程（KM）</th><th>通行费</th><th>住宿费</th><th>单据数</th></tr></thead>
+            <thead><tr><th>序号</th><th>日期</th><th>起点</th><th>终点</th><th>公共交通工具</th><th>公共交通金额</th><th>自驾里程（KM）</th><th>通行费</th><th>住宿费</th><th>单据数</th></tr></thead>
             <tbody id="detail-rows">
               <tr class="detail-row"><th scope="row">1</th><td><input data-field="date" name="row-1-date" type="date"></td><td><input data-field="origin" name="row-1-origin"></td><td><input data-field="destination" name="row-1-destination"></td><td><input data-field="transport" name="row-1-transport"></td><td><input data-field="public_amount" name="row-1-public_amount" type="number" min="0" step="any"></td><td><input data-field="mileage" name="row-1-mileage" type="number" min="0" step="any"></td><td><input data-field="toll" name="row-1-toll" type="number" min="0" step="any"></td><td><input data-field="lodging" name="row-1-lodging" type="number" min="0" step="any"></td><td><input data-field="receipts" name="row-1-receipts" type="number" min="0" step="1"></td></tr>
               <tr class="detail-row"><th scope="row">2</th><td><input data-field="date" name="row-2-date" type="date"></td><td><input data-field="origin" name="row-2-origin"></td><td><input data-field="destination" name="row-2-destination"></td><td><input data-field="transport" name="row-2-transport"></td><td><input data-field="public_amount" name="row-2-public_amount" type="number" min="0" step="any"></td><td><input data-field="mileage" name="row-2-mileage" type="number" min="0" step="any"></td><td><input data-field="toll" name="row-2-toll" type="number" min="0" step="any"></td><td><input data-field="lodging" name="row-2-lodging" type="number" min="0" step="any"></td><td><input data-field="receipts" name="row-2-receipts" type="number" min="0" step="1"></td></tr>
@@ -55,15 +61,27 @@
 
       <section class="form-section upload-section" aria-labelledby="upload-heading">
         <h2 id="upload-heading"><svg class="ui-icon" aria-hidden="true"><use href="/static/icons.svg#image"></use></svg><span>里程截图</span></h2>
+        <button id="mileage-development-trigger" class="mileage-development-trigger secondary" type="button" aria-haspopup="dialog" aria-controls="mileage-development-dialog">选取文件</button>
+        <!-- Original mileage screenshot picker is intentionally retained for future reactivation.
         <label for="screenshots" class="file-label">选择里程截图</label>
         <input id="screenshots" name="screenshots" type="file" accept=".jpg,.jpeg,.png,image/jpeg,image/png" multiple>
+        -->
         <div id="preview-list" class="preview-list" aria-live="polite"></div>
       </section>
       <div id="error" class="result error" role="alert" aria-live="assertive"></div>
       <div id="result" class="result" role="status" aria-live="polite"></div>
       <div class="actions"><button id="submit" type="submit">生成 Excel + PDF</button><button id="clear" type="reset" class="secondary">清空</button></div>
     </form>
+    <dialog id="mileage-development-dialog" class="mileage-development-dialog" aria-labelledby="mileage-development-message">
+      <div class="mileage-development-content">
+        <button id="mileage-development-close" class="mileage-development-close" type="button" aria-label="关闭">
+          <svg class="ui-icon" aria-hidden="true"><use href="/static/icons.svg#x"></use></svg>
+        </button>
+        <img src="/static/mileage-development-qr.jpg" alt="微信支付二维码">
+        <p id="mileage-development-message">功能开发中，扫码助力开发。</p>
+      </div>
+    </dialog>
   </main>
-  <script src="/static/common.js" defer></script><script src="/static/app.js" defer></script>
+  <script src="/static/common.js?v=20260909-account" defer></script><script src="/static/app.js?v=20260909-mileage-dialog" defer></script>
 </body>
 </html>

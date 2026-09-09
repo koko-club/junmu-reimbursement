@@ -58,7 +58,7 @@ class DatabaseTest(unittest.TestCase):
                 "SELECT value FROM app_settings WHERE key = 'setup_complete'"
             ).fetchone()
 
-        self.assertEqual([row["version"] for row in versions], [1, 2, 3])
+        self.assertEqual([row["version"] for row in versions], [1, 2, 3, 4])
         self.assertTrue(versions[0]["applied_at"])
         self.assertEqual(setting["value"], "false")
 
@@ -91,7 +91,7 @@ class DatabaseTest(unittest.TestCase):
             )]
         self.assertEqual(columns["status_version"]["dflt_value"], "0")
         self.assertEqual(columns["password_version"]["dflt_value"], "0")
-        self.assertEqual(versions, [1, 2, 3])
+        self.assertEqual(versions, [1, 2, 3, 4])
 
     def test_migrate_upgrades_existing_v2_database_with_nullable_purge_claim(self):
         connection = self.db.connect()
@@ -137,7 +137,9 @@ class DatabaseTest(unittest.TestCase):
         self.assertIn("purge_claim", columns)
         self.assertEqual(columns["purge_claim"]["type"], "TEXT")
         self.assertIsNone(columns["purge_claim"]["dflt_value"])
-        self.assertEqual(versions, [1, 2, 3])
+        self.assertEqual(versions, [1, 2, 3, 4])
+        self.assertEqual(columns["reason"]["type"], "TEXT")
+        self.assertEqual(columns["reimbursement_amount"]["type"], "TEXT")
 
     def test_purge_claim_accepts_only_null_or_canonical_64_hex(self):
         self.db.migrate()

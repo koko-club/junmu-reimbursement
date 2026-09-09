@@ -5,6 +5,7 @@ from __future__ import annotations
 from contextlib import closing
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 import hashlib
 import hmac
 import logging
@@ -15,6 +16,7 @@ import stat
 import threading
 from typing import BinaryIO, Callable
 from uuid import UUID, uuid4
+from zoneinfo import ZoneInfo
 
 from config import AppConfig
 from database import Database
@@ -35,6 +37,7 @@ _PURGE_QUARANTINE_AUTH_PURPOSE = b"reimbursement-purge-quarantine:v2"
 _PURGE_COMPLETION_STATE = "complete"
 _PURGE_COMPLETION_AUTH_PURPOSE = b"reimbursement-purge-completion:v1"
 _PURGE_SERIALIZER = threading.Lock()
+_REPORT_TIMEZONE = ZoneInfo("Asia/Shanghai")
 _DIRECTORY_OPEN_FLAGS = (
     os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
 )
@@ -58,6 +61,36 @@ class ReimbursementStorageError(RuntimeError):
     """A stable owner-visible failure while permanently deleting storage."""
 
 
+def _history_amount_text(payload: dict) -> str:
+    """Return the form total using the same inputs as the workbook J20 formula."""
+    total = Decimal(str(payload.get("days", 0))) * Decimal(str(payload.get("allowance", 0)))
+    for row in payload.get("rows", ()):
+        if not isinstance(row, dict):
+            continue
+        public_amount = next(
+            (
+                row[name]
+                for name in ("public_amount", "public_transport_amount", "amount")
+                if row.get(name) not in (None, "")
+            ),
+            0,
+        )
+        mileage = next(
+            (
+                row[name]
+                for name in ("mileage", "driving_mileage")
+                if row.get(name) not in (None, "")
+            ),
+            0,
+        )
+        total += sum(
+            (Decimal(str(row.get(name, 0) or 0)) for name in ("toll", "lodging")),
+            Decimal("0"),
+        )
+        total += Decimal(str(public_amount or 0)) + Decimal(str(mileage or 0))
+    return format(total.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP), ".2f")
+
+
 class _InsertError(Exception):
     def __init__(self, may_have_committed: bool, exception_name: str):
         super().__init__()
@@ -75,6 +108,8 @@ class ReimbursementRecord:
     pdf_path: str
     created_at: str
     deleted_at: str | None
+    reason: str | None = None
+    reimbursement_amount: str | None = None
 
 
 @dataclass
@@ -291,6 +326,8 @@ class ReimbursementService:
                 pdf_path=pdf_relative,
                 created_at=created_at,
                 deleted_at=None,
+                reason=payload["reason"],
+                reimbursement_amount=_history_amount_text(payload),
             )
             self._insert(record)
             return record
@@ -331,6 +368,50 @@ class ReimbursementService:
 
     def list_active(self, user_id: int) -> list[ReimbursementRecord]:
         return self._list(user_id, deleted=False)
+
+    def active_stats(
+        self,
+        user_id: int,
+        now: datetime | None = None,
+    ) -> dict[str, int | str]:
+        """Aggregate active records by their generated date for the current user."""
+        self._require_owner_id(user_id)
+        current_local = self._utc_time(now).astimezone(_REPORT_TIMEZONE)
+        month_key = (current_local.year, current_local.month)
+        year_count = 0
+        month_count = 0
+        year_amount = Decimal("0")
+        with closing(self._database.connect()) as connection:
+            rows = connection.execute(
+                "SELECT created_at, reimbursement_amount FROM reimbursements "
+                "WHERE user_id = ? AND deleted_at IS NULL",
+                (user_id,),
+            ).fetchall()
+        for row in rows:
+            try:
+                created_at = datetime.fromisoformat(row["created_at"])
+                if created_at.tzinfo is None:
+                    continue
+                created_local = created_at.astimezone(_REPORT_TIMEZONE)
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if created_local.year != current_local.year:
+                continue
+            year_count += 1
+            if (created_local.year, created_local.month) == month_key:
+                month_count += 1
+            try:
+                year_amount += Decimal(str(row["reimbursement_amount"] or "0"))
+            except (InvalidOperation, TypeError, ValueError):
+                continue
+        return {
+            "month_count": month_count,
+            "year_count": year_count,
+            "year_amount": format(
+                year_amount.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP),
+                ".2f",
+            ),
+        }
 
     def list_trash(self, user_id: int) -> list[ReimbursementRecord]:
         return self._list(user_id, deleted=True)
@@ -1575,6 +1656,12 @@ class ReimbursementService:
             pdf_path=row["pdf_path"],
             created_at=row["created_at"],
             deleted_at=row["deleted_at"],
+            reason=row["reason"] if "reason" in row.keys() else None,
+            reimbursement_amount=(
+                row["reimbursement_amount"]
+                if "reimbursement_amount" in row.keys()
+                else None
+            ),
         )
 
     @staticmethod
@@ -1811,8 +1898,9 @@ class ReimbursementService:
                 connection.execute(
                     """INSERT INTO reimbursements(
                         id, user_id, reimbursement_date, display_name,
-                        xlsx_path, pdf_path, created_at, deleted_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                        xlsx_path, pdf_path, created_at, deleted_at,
+                        reason, reimbursement_amount
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     self._record_values(record),
                 )
                 statement_applied = True
@@ -1823,7 +1911,8 @@ class ReimbursementService:
         identity_clause = (
             "id = ? AND user_id = ? AND reimbursement_date IS ? AND "
             "display_name = ? AND xlsx_path = ? AND pdf_path = ? AND "
-            "created_at = ? AND deleted_at IS ?"
+            "created_at = ? AND deleted_at IS ? AND reason IS ? AND "
+            "reimbursement_amount IS ?"
         )
         values = self._record_values(record)
         try:
@@ -1867,6 +1956,8 @@ class ReimbursementService:
             record.pdf_path,
             record.created_at,
             record.deleted_at,
+            record.reason,
+            record.reimbursement_amount,
         )
 
     def _cleanup_at(

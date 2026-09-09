@@ -231,6 +231,9 @@ class WebApplication:
             "/api/reimbursements": Route(
                 "_reimbursement_list", authentication=True, roles=("user",)
             ),
+            "/api/reimbursements/stats": Route(
+                "_reimbursement_stats", authentication=True, roles=("user",)
+            ),
             "/history": Route("_history_page", authentication=True, roles=("user",)),
             "/trash": Route("_trash_page", authentication=True, roles=("user",)),
             "/change-password": Route(
@@ -770,6 +773,10 @@ class WebApplication:
             {"reimbursements": [self._record_payload(record) for record in records]},
         )
 
+    def _reimbursement_stats(self, handler, user, _token) -> None:
+        assert user is not None
+        self._json(handler, 200, self.reimbursement_service.active_stats(user.user_id))
+
     def _reimbursement_download(self, handler, user, _token) -> None:
         assert user is not None
         parts = self._reimbursement_parts(handler)
@@ -1007,6 +1014,8 @@ class WebApplication:
             "id": record.id,
             "reimbursement_date": record.reimbursement_date,
             "display_name": record.display_name,
+            "reason": record.reason,
+            "reimbursement_amount": record.reimbursement_amount,
             "created_at": record.created_at,
             "deleted_at": record.deleted_at,
             "xlsx_url": root + "/xlsx",

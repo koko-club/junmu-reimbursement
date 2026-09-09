@@ -177,17 +177,20 @@ class WebReimbursementTest(unittest.TestCase):
         user_id: int,
         record_id: str,
         *,
+        created_at: str | None = None,
         deleted_at: str | None = None,
         xlsx_name: str = "报销 明细.xlsx",
         pdf_name: str = "报销 明细.pdf",
         xlsx_bytes: bytes = b"xlsx",
         pdf_bytes: bytes = b"pdf",
+        reason: str | None = None,
+        reimbursement_amount: str | None = None,
     ) -> ReimbursementRecord:
         record_dir = self.running.data_dir / "users" / str(user_id) / record_id
         record_dir.mkdir(parents=True)
         (record_dir / xlsx_name).write_bytes(xlsx_bytes)
         (record_dir / pdf_name).write_bytes(pdf_bytes)
-        created_at = "2026-09-08T00:00:00+00:00"
+        created_at = created_at or "2026-09-08T00:00:00+00:00"
         record = ReimbursementRecord(
             id=record_id,
             user_id=user_id,
@@ -197,13 +200,16 @@ class WebReimbursementTest(unittest.TestCase):
             pdf_path=f"users/{user_id}/{record_id}/{pdf_name}",
             created_at=created_at,
             deleted_at=deleted_at,
+            reason=reason,
+            reimbursement_amount=reimbursement_amount,
         )
         with self.running.server.database.transaction(immediate=True) as connection:
             connection.execute(
                 """INSERT INTO reimbursements(
                     id, user_id, reimbursement_date, display_name,
-                    xlsx_path, pdf_path, created_at, deleted_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                    xlsx_path, pdf_path, created_at, deleted_at,
+                    reason, reimbursement_amount
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     record.id,
                     record.user_id,
@@ -213,9 +219,28 @@ class WebReimbursementTest(unittest.TestCase):
                     record.pdf_path,
                     record.created_at,
                     record.deleted_at,
+                    record.reason,
+                    record.reimbursement_amount,
                 ),
             )
         return record
+
+    def test_stats_endpoint_is_authenticated_and_returns_active_owner_totals(self):
+        service = mock.Mock()
+        service.active_stats.return_value = {
+            "month_count": 2,
+            "year_count": 5,
+            "year_amount": "1234.50",
+        }
+        application = self.running.server.application
+        with mock.patch.object(application, "reimbursement_service", service):
+            response = self.alice.get("/api/reimbursements/stats")
+
+        self.assertEqual(response.status, 200)
+        self.assertEqual(response.json(), service.active_stats.return_value)
+        service.active_stats.assert_called_once_with(self.alice_id)
+        self.assertEqual(self.admin.get("/api/reimbursements/stats").status, 403)
+        self.assertEqual(self.anonymous.get("/api/reimbursements/stats").status, 401)
 
     def test_file_permission_matrix_and_download_metadata(self):
         record = self._insert_record(
@@ -561,13 +586,18 @@ class WebReimbursementTest(unittest.TestCase):
 
     def test_active_and_trash_lists_are_isolated_and_do_not_expose_paths(self):
         active = self._insert_record(
-            self.alice_id, "40000000-0000-4000-8000-000000000001"
+            self.alice_id,
+            "40000000-0000-4000-8000-000000000001",
+            reason="客户拜访",
+            reimbursement_amount="101.00",
         )
         deleted_at = (datetime.now(timezone.utc) - timedelta(days=2)).isoformat()
         trashed = self._insert_record(
             self.alice_id,
             "40000000-0000-4000-8000-000000000002",
             deleted_at=deleted_at,
+            reason="现场服务",
+            reimbursement_amount="220.50",
         )
         self._insert_record(
             self.bob_id, "40000000-0000-4000-8000-000000000003"
@@ -581,8 +611,13 @@ class WebReimbursementTest(unittest.TestCase):
             [item["id"] for item in active_response.json()["reimbursements"]],
             [active.id],
         )
+        active_payload = active_response.json()["reimbursements"][0]
+        self.assertEqual(active_payload["reason"], "客户拜访")
+        self.assertEqual(active_payload["reimbursement_amount"], "101.00")
         trash_payload = trash_response.json()["reimbursements"]
         self.assertEqual([item["id"] for item in trash_payload], [trashed.id])
+        self.assertEqual(trash_payload[0]["reason"], "现场服务")
+        self.assertEqual(trash_payload[0]["reimbursement_amount"], "220.50")
         self.assertEqual(
             trash_payload[0]["purge_at"],
             (datetime.fromisoformat(deleted_at) + timedelta(days=30)).isoformat(),
@@ -723,6 +758,8 @@ class WebReimbursementTest(unittest.TestCase):
             f"users/{self.alice_id}/{record_id}/生成结果.pdf",
             "2026-09-08T00:00:00+00:00",
             None,
+            "客户拜访",
+            "101.00",
         )
         captured = {}
 
@@ -760,6 +797,8 @@ class WebReimbursementTest(unittest.TestCase):
         self.assertEqual(generated["pdf_url"], f"/api/reimbursements/{record_id}/pdf")
         self.assertEqual(generated["xlsx_filename"], "生成结果.xlsx")
         self.assertEqual(generated["pdf_filename"], "生成结果.pdf")
+        self.assertEqual(generated["record"]["reason"], "客户拜访")
+        self.assertEqual(generated["record"]["reimbursement_amount"], "101.00")
         self.assertEqual(captured["user"].user_id, self.alice_id)
         self.assertEqual(captured["payload"]["traveler"], "client traveler")
         self.assertEqual(captured["screenshots"], [("0000-route.png", b"PNGDATA", True)])
