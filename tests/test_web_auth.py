@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import hashlib
 import inspect
+from pathlib import Path
+import re
 import threading
 import unittest
 from unittest import mock
@@ -13,6 +15,7 @@ from web import AttemptRateLimiter
 
 ADMIN_PASSWORD = "administrator1"
 USER_PASSWORD = "correct horse battery staple"
+ROOT = Path(__file__).resolve().parents[1]
 EXPECTED_LOGIN_IP_RATE_LIMIT_ATTEMPTS = 10
 EXPECTED_LOGIN_GLOBAL_RATE_LIMIT_ATTEMPTS = 100
 
@@ -135,6 +138,58 @@ class WebAuthenticationTest(unittest.TestCase):
         admin = self.running.users.authenticate("admin", ADMIN_PASSWORD)
         pending = next(user for user in self.running.users.list_pending(admin.id) if user.username == username)
         return self.running.users.approve(admin.id, pending.id)
+
+    def test_rendered_pages_expose_site_metadata_and_favicon(self):
+        title_pattern = re.compile(
+            r"<title(?:\s+data-page-title)?[^>]*>在线报销系统</title>"
+        )
+        favicon = '<link rel="icon" type="image/png" href="/static/favicon.png">'
+
+        setup_page = self.client.get("/setup")
+        self.assertEqual(setup_page.status, 200)
+        self.assertRegex(setup_page.text, title_pattern)
+        self.assertIn(favicon, setup_page.text)
+        favicon_response = self.client.get("/static/favicon.png")
+        self.assertEqual(favicon_response.status, 200)
+        self.assertEqual(favicon_response.headers["Content-Type"], "image/png")
+        self.assertEqual(favicon_response.body[:8], b"\x89PNG\r\n\x1a\n")
+
+        self.assertEqual(self.setup_admin().status, 201)
+        for path in ("/login", "/register"):
+            with self.subTest(path=path):
+                response = self.client.get(path)
+                self.assertEqual(response.status, 200)
+                self.assertRegex(response.text, title_pattern)
+                self.assertIn(favicon, response.text)
+
+        self.assertEqual(self.register().status, 201)
+        self.approve_user()
+        self.assertEqual(
+            self.client.post_json(
+                "/api/login", {"username": "admin", "password": ADMIN_PASSWORD}
+            ).status,
+            200,
+        )
+        for path in ("/admin", "/change-password"):
+            with self.subTest(path=path):
+                response = self.client.get(path)
+                self.assertEqual(response.status, 200)
+                self.assertRegex(response.text, title_pattern)
+                self.assertIn(favicon, response.text)
+
+        user_client = self.running.new_client()
+        self.assertEqual(
+            user_client.post_json(
+                "/api/login", {"username": "alice", "password": USER_PASSWORD}
+            ).status,
+            200,
+        )
+        for path in ("/", "/history", "/trash"):
+            with self.subTest(path=path):
+                response = user_client.get(path)
+                self.assertEqual(response.status, 200)
+                self.assertRegex(response.text, title_pattern)
+                self.assertIn(favicon, response.text)
 
     def test_uninitialized_app_allows_only_setup_health_and_static(self):
         self.assertEqual(self.client.get("/healthz").status, 200)

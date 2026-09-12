@@ -10,6 +10,31 @@ class FrontendContractTest(unittest.TestCase):
     def read_template(self, name: str) -> str:
         return (ROOT / "templates" / name).read_text(encoding="utf-8")
 
+    def test_all_pages_use_site_title_and_favicon(self):
+        title_pattern = re.compile(
+            r"<title(?:\s+data-page-title)?[^>]*>在线报销系统</title>"
+        )
+        favicon = '<link rel="icon" type="image/png" href="/static/favicon.png">'
+        for page in (
+            "setup.html",
+            "register.html",
+            "login.html",
+            "change-password.html",
+            "index.html",
+            "history.html",
+            "admin.html",
+        ):
+            with self.subTest(page=page):
+                markup = self.read_template(page)
+                self.assertRegex(markup, title_pattern)
+                self.assertIn(favicon, markup)
+
+        favicon_path = ROOT / "static" / "favicon.png"
+        self.assertTrue(favicon_path.is_file())
+        self.assertEqual(favicon_path.read_bytes()[:8], b"\x89PNG\r\n\x1a\n")
+        history = (ROOT / "static" / "history.js").read_text(encoding="utf-8")
+        self.assertNotRegex(history, r"document\s*\.\s*title\s*=\s*['\"]回收站['\"]")
+
     def test_auth_pages_have_expected_fields_and_safe_password_defaults(self):
         expected = {
             "setup.html": ("username", "password", "confirm-password", "real-name", "department"),
