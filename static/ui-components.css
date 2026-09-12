@@ -1,0 +1,909 @@
+/*
+ * Shared presentation components. This layer intentionally targets existing
+ * semantic classes only; it does not alter form fields, data attributes, or
+ * event-driven behavior used by the reimbursement workflow.
+ */
+html {
+  min-height: 100%;
+  background: var(--ui-bg);
+}
+
+html body,
+html body.auth-body {
+  color: var(--ui-text);
+  background-color: var(--ui-bg);
+  background-image: var(--ui-bg-gradient);
+  background-attachment: fixed;
+  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "PingFang SC", "Microsoft YaHei", sans-serif;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* styles.css keeps an older Aurora background with !important; match that
+   priority so this token layer remains the final site-wide visual authority. */
+html body,
+html body.auth-body {
+  background-color: var(--ui-bg) !important;
+  background-image: var(--ui-bg-gradient) !important;
+}
+
+/* Keep the records canvas continuous below the content. The previous body
+   background ended with the short document height, exposing html's solid
+   canvas and creating a hard horizontal seam in the viewport. */
+html body.history-body {
+  min-height: 100vh;
+  background-color: #f7f8fa !important;
+  background-image: linear-gradient(
+    180deg,
+    #edf3f8 0%,
+    #eef3f7 28%,
+    #f2f5f8 56%,
+    #f6f7f9 80%,
+    #f7f8fa 100%
+  ) !important;
+}
+
+h1,
+h2,
+p {
+  color: inherit;
+}
+
+h1,
+h2 {
+  letter-spacing: -0.018em;
+}
+
+h1 {
+  color: var(--ui-text);
+  font-size: 2.1rem;
+  line-height: 1.12;
+  font-weight: 750;
+}
+
+h2 {
+  color: var(--ui-text);
+  font-size: 1.05rem;
+  line-height: 1.3;
+  font-weight: 700;
+}
+
+.page-shell {
+  width: min(100% - 48px, 1440px);
+  max-width: none;
+  margin: 0 auto;
+  padding: 42px 0 68px;
+}
+
+.page-header {
+  margin-bottom: 28px;
+  padding: 0 4px 21px;
+  border-bottom: 1px solid var(--ui-line);
+}
+
+.page-header p {
+  max-width: 680px;
+  margin-top: 9px;
+  color: var(--ui-text-muted);
+  font-size: 0.875rem;
+  line-height: 1.6;
+}
+
+.ui-icon-title,
+h2 .ui-icon {
+  color: var(--ui-brand-blue);
+}
+
+/* App shell and navigation */
+.app-body {
+  min-width: 0;
+  padding-left: 258px;
+}
+
+.app-sidebar,
+body .app-sidebar {
+  width: 258px;
+  padding: 30px 20px 26px;
+  gap: 28px;
+  color: var(--ui-text);
+  background: rgba(247, 250, 252, 0.7);
+  border-right: 1px solid rgba(255, 255, 255, 0.86);
+  box-shadow: 12px 0 36px rgba(67, 91, 110, 0.08);
+  backdrop-filter: blur(26px) saturate(125%);
+}
+
+.brand {
+  gap: 10px;
+  margin: 0 10px;
+  color: var(--ui-text);
+  font-size: 1.02rem;
+  letter-spacing: -0.01em;
+}
+
+.brand-logo {
+  width: 29px;
+  height: 29px;
+  filter: saturate(0.86);
+}
+
+.app-sidebar nav {
+  gap: 10px;
+}
+
+.app-sidebar nav a {
+  min-height: 54px;
+  gap: 11px;
+  padding: 14px 18px;
+  color: var(--ui-text);
+  background: var(--ui-button-secondary);
+  border: 1px solid rgba(221, 228, 235, 0.95);
+  border-radius: var(--ui-radius-pill);
+  font-size: 0.9rem;
+  box-shadow: 0 8px 18px rgba(76, 96, 113, 0.1);
+  transition: background-color 160ms var(--ui-ease), border-color 160ms ease-out, color 160ms ease-out, box-shadow 160ms ease-out, transform 120ms var(--ui-ease);
+}
+
+.app-sidebar nav a:not([aria-current="page"]) {
+  color: var(--ui-text);
+  background: var(--ui-button-secondary);
+}
+
+.app-sidebar nav a:not([aria-current="page"]):hover {
+  color: var(--ui-text);
+  background: var(--ui-button-secondary-hover);
+  border-color: rgba(205, 216, 226, 0.98);
+  box-shadow: 0 11px 21px rgba(76, 96, 113, 0.16);
+  transform: translateY(-1px);
+}
+
+.app-sidebar nav a:hover,
+body .app-sidebar nav a:hover {
+  color: var(--ui-text);
+  background: var(--ui-button-secondary-hover);
+  border-color: rgba(205, 216, 226, 0.98);
+  box-shadow: 0 11px 21px rgba(76, 96, 113, 0.16);
+  transform: translateY(-1px);
+}
+
+.app-sidebar nav a[aria-current="page"],
+body .app-sidebar nav a[aria-current="page"] {
+  color: #fff;
+  background: var(--ui-button-primary);
+  border-color: var(--ui-button-primary);
+  box-shadow: 0 10px 22px rgba(29, 29, 31, 0.2), 0 1px 0 rgba(255, 255, 255, 0.12) inset;
+  font-weight: 700;
+}
+
+.app-sidebar nav a[aria-current="page"]:hover,
+body .app-sidebar nav a[aria-current="page"]:hover {
+  color: #fff;
+  background: var(--ui-button-primary-hover);
+  border-color: var(--ui-button-primary-hover);
+  box-shadow: 0 12px 25px rgba(29, 29, 31, 0.26), 0 1px 0 rgba(255, 255, 255, 0.14) inset;
+}
+
+.app-sidebar nav a:active {
+  transform: scale(0.985);
+}
+
+.app-sidebar nav a:focus-visible {
+  outline: 0;
+  box-shadow: var(--ui-focus), 0 8px 18px rgba(76, 96, 113, 0.1);
+}
+
+.app-sidebar nav a .ui-icon {
+  width: 18px;
+  height: 18px;
+  color: currentColor;
+}
+
+.sidebar-account {
+  margin-top: auto;
+  padding: 13px 14px 0;
+  color: var(--ui-text-subtle);
+  font-size: 0.7rem;
+  letter-spacing: 0.01em;
+}
+
+.sidebar-account strong {
+  color: var(--ui-text-muted);
+}
+
+.sidebar-version {
+  padding: 0 14px;
+}
+
+.app-sidebar > button.secondary {
+  min-height: 42px;
+  margin: 0;
+  color: var(--ui-text);
+  background: var(--ui-button-secondary);
+  border: 1px solid rgba(221, 228, 235, 0.95);
+  box-shadow: 0 8px 18px rgba(76, 96, 113, 0.12);
+}
+
+.app-sidebar > button.secondary:hover {
+  color: var(--ui-text);
+  background: var(--ui-button-secondary-hover);
+  box-shadow: 0 11px 21px rgba(76, 96, 113, 0.16);
+}
+
+.sidebar-toggle {
+  border-radius: var(--ui-radius-pill);
+  background: var(--ui-button-primary);
+  box-shadow: 0 8px 18px rgba(29, 29, 31, 0.18);
+}
+
+/* Shared surfaces */
+.form-section,
+.stat-card,
+.auth-panel {
+  background: var(--ui-surface);
+  border: 1px solid rgba(255, 255, 255, 0.88);
+  box-shadow: var(--ui-shadow-md);
+  backdrop-filter: blur(20px) saturate(120%);
+}
+
+/* These selectors intentionally match the legacy glass overrides in
+   styles.css so the component layer is the final visual authority. */
+.page-shell .form-section {
+  background: var(--ui-surface);
+  border-color: rgba(255, 255, 255, 0.88);
+  box-shadow: var(--ui-shadow-md);
+  backdrop-filter: blur(20px) saturate(120%);
+}
+
+.form-section {
+  margin-bottom: 20px;
+  padding: 25px 26px;
+  border-radius: var(--ui-radius-lg);
+}
+
+.form-section:hover,
+.page-shell .form-section:hover,
+.stat-card:hover {
+  border-color: rgba(169, 193, 211, 0.62);
+  box-shadow: 0 22px 48px rgba(63, 89, 111, 0.13), 0 1px 0 rgba(255, 255, 255, 0.92) inset;
+}
+
+.section-heading {
+  min-height: 29px;
+  margin-bottom: 18px;
+}
+
+.section-heading > span {
+  color: var(--ui-text-subtle);
+  font-size: 0.78rem;
+}
+
+.stats-grid {
+  gap: 20px;
+  margin-bottom: 20px;
+}
+
+.stat-card {
+  min-height: 142px;
+  padding: 24px 26px;
+  border-radius: var(--ui-radius-lg);
+  transition: transform 180ms var(--ui-ease), box-shadow 180ms ease-out, border-color 180ms ease-out;
+}
+
+.stat-card:hover {
+  transform: translateY(-2px);
+}
+
+.stat-label {
+  color: var(--ui-text-muted);
+  font-size: 0.78rem;
+  letter-spacing: 0.02em;
+}
+
+.stat-value {
+  color: var(--ui-text);
+  font-size: 2.35rem;
+  line-height: 1;
+  font-weight: 760;
+  letter-spacing: -0.035em;
+  font-variant-numeric: tabular-nums;
+}
+
+.stat-card:nth-child(3) .stat-value {
+  color: #1d1d1f;
+}
+
+/* Forms and controls */
+label {
+  gap: 8px;
+  color: var(--ui-text-muted);
+  font-size: 0.78rem;
+  letter-spacing: 0.01em;
+}
+
+input,
+.page-shell input {
+  min-height: 42px;
+  padding: 9px 12px;
+  color: var(--ui-text);
+  background: rgba(255, 255, 255, 0.76);
+  border: 1px solid var(--ui-line);
+  border-radius: var(--ui-radius-sm);
+  box-shadow: 0 1px 0 rgba(255, 255, 255, 0.7) inset;
+  transition: border-color 160ms ease-out, box-shadow 160ms ease-out, background-color 160ms ease-out;
+}
+
+input:hover,
+.page-shell input:hover {
+  border-color: var(--ui-line-strong);
+  background: rgba(255, 255, 255, 0.9);
+}
+
+input:focus,
+.page-shell input:focus {
+  border-color: rgba(88, 123, 158, 0.75);
+  box-shadow: var(--ui-focus), 0 1px 0 rgba(255, 255, 255, 0.78) inset;
+}
+
+input[readonly],
+.page-shell input[readonly] {
+  color: var(--ui-text-muted);
+  background: var(--ui-surface-muted);
+}
+
+button,
+.page-shell button,
+.table-action-button {
+  min-height: 42px;
+  padding: 10px 19px;
+  color: #fff;
+  background: #1d1d1f;
+  background: var(--ui-button-primary);
+  border: 1px solid transparent;
+  border-radius: var(--ui-radius-pill);
+  box-shadow: 0 8px 18px rgba(29, 29, 31, 0.18);
+  font-weight: 700;
+  transition: background-color 160ms ease-out, box-shadow 160ms ease-out, transform 120ms ease-out;
+}
+
+button:hover,
+.page-shell button:hover,
+.table-action-button:hover {
+  background: var(--ui-button-primary-hover);
+  box-shadow: 0 12px 24px rgba(29, 29, 31, 0.24);
+}
+
+button:active,
+.page-shell button:active,
+.table-action-button:active {
+  transform: scale(0.975);
+}
+
+button:disabled,
+.page-shell button:disabled,
+.table-action-button:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+  transform: none;
+  box-shadow: none;
+}
+
+button:focus-visible,
+input:focus-visible,
+a:focus-visible,
+.table-action-button:focus-visible {
+  outline: 0;
+  box-shadow: var(--ui-focus);
+}
+
+button.secondary,
+.page-shell button.secondary,
+.remove-file {
+  color: var(--ui-text);
+  background: #fff;
+  background: var(--ui-button-secondary);
+  border-color: rgba(221, 228, 235, 0.95);
+  box-shadow: 0 8px 18px rgba(76, 96, 113, 0.12);
+}
+
+button.secondary:hover,
+.page-shell button.secondary:hover,
+.remove-file:hover {
+  color: var(--ui-text);
+  background: var(--ui-button-secondary-hover);
+  box-shadow: 0 11px 21px rgba(76, 96, 113, 0.16);
+}
+
+button.danger,
+.page-shell button.danger {
+  color: #fff;
+  background: var(--ui-danger);
+  border-color: var(--ui-danger);
+  box-shadow: 0 8px 18px rgba(143, 73, 70, 0.16);
+}
+
+button.danger:hover,
+.page-shell button.danger:hover {
+  color: #fff;
+  background: var(--ui-danger-strong);
+  box-shadow: 0 11px 22px rgba(143, 73, 70, 0.22);
+}
+
+.actions {
+  gap: 12px;
+  margin-top: 4px;
+}
+
+.actions button:first-child {
+  min-width: 164px;
+}
+
+/* Tables and data states */
+.table-wrap,
+.page-shell .table-wrap {
+  overflow: auto;
+  border: 1px solid var(--ui-line);
+  border-radius: var(--ui-radius-md);
+  background: rgba(255, 255, 255, 0.32);
+  box-shadow: 0 2px 12px rgba(60, 85, 106, 0.04) inset;
+}
+
+.detail-table th,
+.detail-table td,
+.history-table th,
+.history-table td,
+.admin-table th,
+.admin-table td {
+  border-bottom-color: var(--ui-line);
+}
+
+.detail-table thead th,
+.history-table th,
+.admin-table th,
+.page-shell .detail-table thead th,
+.page-shell .history-table th,
+.page-shell .admin-table th {
+  color: var(--ui-text-muted);
+  background: rgba(232, 240, 246, 0.72);
+  font-size: 0.72rem;
+  font-weight: 700;
+  letter-spacing: 0.01em;
+}
+
+.detail-table thead th {
+  padding-top: 16px;
+  padding-bottom: 16px;
+}
+
+.detail-table tbody tr,
+.history-table tbody tr,
+.admin-table tbody tr {
+  transition: background-color 150ms ease-out;
+}
+
+.detail-table tbody tr:hover,
+.history-table tbody tr:hover,
+.admin-table tbody tr:hover,
+.page-shell .detail-table tbody tr:hover,
+.page-shell .history-table tbody tr:hover,
+.page-shell .admin-table tbody tr:hover {
+  background: rgba(220, 233, 242, 0.36);
+}
+
+.detail-table tbody td,
+.detail-table tbody th {
+  border-bottom-color: rgba(105, 128, 149, 0.12);
+}
+
+.detail-table tbody th {
+  color: var(--ui-brand-blue);
+  font-weight: 400;
+}
+
+.history-table tbody th.history-col-index {
+  color: var(--ui-brand-blue);
+  background: transparent;
+  font-weight: 500;
+  text-align: center;
+}
+
+.detail-table .detail-col-index {
+  width: 64px;
+}
+
+.detail-table .detail-col-date {
+  width: 180px;
+}
+
+.detail-table input {
+  background: transparent;
+  border-color: transparent;
+  box-shadow: none;
+}
+
+.detail-table input:hover,
+.detail-table input:focus {
+  background: rgba(255, 255, 255, 0.68);
+}
+
+.empty-state {
+  color: var(--ui-text-muted);
+  padding: 42px 14px;
+}
+
+.count-badge {
+  min-width: 25px;
+  padding: 3px 8px;
+  color: #fff;
+  background: var(--ui-brand-blue);
+  border-radius: var(--ui-radius-pill);
+  font-size: 0.7rem;
+}
+
+.result {
+  min-height: 0;
+  margin: 12px 0;
+  padding: 11px 14px;
+  border: 1px solid transparent;
+  border-radius: var(--ui-radius-sm);
+  font-size: 0.84rem;
+}
+
+.result.error {
+  color: var(--ui-danger-strong);
+  background: var(--ui-danger-soft);
+  border-color: rgba(168, 90, 87, 0.14);
+}
+
+.result.success {
+  color: var(--ui-success);
+  background: var(--ui-success-soft);
+  border-color: rgba(79, 125, 99, 0.14);
+}
+
+.result-success-status,
+.result-success-icon {
+  color: var(--ui-success);
+}
+
+.table-action-button {
+  min-height: 34px;
+  padding: 7px 11px;
+  border-radius: var(--ui-radius-pill);
+  font-size: 0.78rem;
+}
+
+/* Keep active reimbursement actions aligned without changing other pages. */
+body[data-scope="active"] .history-page .table-action-items .table-action-button {
+  width: 96px;
+  height: 34px;
+  min-height: 34px;
+  padding: 0 11px;
+  justify-content: center;
+}
+
+/* Keep recovery actions in the trash view aligned with the active records
+   actions so both history states use the same compact button footprint. */
+body[data-scope="trash"] .history-page .table-action-items .table-action-button {
+  width: 96px;
+  height: 34px;
+  min-height: 34px;
+  padding: 0 11px;
+  justify-content: center;
+}
+
+/* Anchor actions inherit link styles elsewhere; keep them visually identical
+   to button actions in the table. */
+.table-actions a.table-action-button:not(.secondary),
+a.table-action-button:not(.secondary) {
+  color: #fff !important;
+}
+
+.table-action-button.secondary {
+  color: var(--ui-text) !important;
+  background: var(--ui-button-secondary);
+  border-color: rgba(221, 228, 235, 0.95);
+  box-shadow: 0 6px 14px rgba(76, 96, 113, 0.12);
+}
+
+.table-action-button.secondary:hover {
+  color: var(--ui-text) !important;
+  background: var(--ui-button-secondary-hover);
+  box-shadow: 0 9px 18px rgba(76, 96, 113, 0.16);
+}
+
+.page-shell button.pagination-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 34px;
+  min-width: 34px;
+  height: 34px;
+  min-height: 34px;
+  padding: 0;
+}
+
+.page-shell button.pagination-button .ui-icon {
+  width: 16px;
+  height: 16px;
+}
+
+/* The reimbursement switcher is also a capsule control, with an explicit
+   selected state matching the reference screenshot. */
+.reimbursement-type-switcher button {
+  border-radius: var(--ui-radius-pill);
+}
+
+.reimbursement-type-switcher button:not([aria-selected="true"]) {
+  color: var(--ui-text-muted);
+  background: var(--ui-button-secondary);
+  border-color: rgba(221, 228, 235, 0.95);
+  box-shadow: 0 8px 18px rgba(76, 96, 113, 0.12);
+}
+
+.reimbursement-type-switcher button:not([aria-selected="true"]):hover {
+  background: var(--ui-button-secondary-hover);
+}
+
+.reimbursement-type-switcher button[aria-selected="true"] {
+  color: #fff;
+  background: var(--ui-button-primary);
+  border-color: var(--ui-button-primary);
+  box-shadow: 0 8px 18px rgba(29, 29, 31, 0.2);
+}
+
+.table-actions button.danger,
+.table-actions .table-action-button.danger {
+  color: #fff;
+  background: var(--ui-danger);
+  border-color: var(--ui-danger);
+  box-shadow: 0 6px 14px rgba(143, 73, 70, 0.14);
+}
+
+.table-actions button.danger:hover,
+.table-actions .table-action-button.danger:hover {
+  background: var(--ui-danger-strong);
+}
+
+/* Variant shadows must not hide the keyboard focus indicator. */
+button.secondary:focus-visible,
+button.danger:focus-visible,
+.table-action-button.secondary:focus-visible,
+.table-action-button.danger:focus-visible,
+a.table-action-button.secondary:focus-visible {
+  outline: 0;
+  box-shadow: var(--ui-focus);
+}
+
+/* Authentication and dialogs */
+.auth-body {
+  min-height: 100vh;
+  padding: 28px;
+}
+
+.auth-shell {
+  width: min(100%, 480px);
+}
+
+.auth-panel {
+  padding: 38px;
+  border-radius: var(--ui-radius-lg);
+  box-shadow: var(--ui-shadow-lg);
+}
+
+body .auth-panel {
+  background: var(--ui-surface-strong);
+  border-color: rgba(255, 255, 255, 0.88);
+  box-shadow: var(--ui-shadow-lg);
+  backdrop-filter: blur(22px) saturate(122%);
+}
+
+.auth-header {
+  margin-bottom: 27px;
+  padding-bottom: 21px;
+  border-bottom-color: var(--ui-line);
+}
+
+.auth-header .eyebrow {
+  color: var(--ui-accent-rose);
+  font-size: 0.72rem;
+  letter-spacing: 0.11em;
+  text-transform: uppercase;
+}
+
+.auth-header h1 {
+  margin-bottom: 9px;
+  font-size: 2rem;
+}
+
+.auth-header p:last-child {
+  color: var(--ui-text-muted);
+  line-height: 1.55;
+}
+
+.auth-form {
+  gap: 10px;
+}
+
+.auth-form label {
+  margin-top: 9px;
+}
+
+.auth-form input,
+body .auth-form input,
+.auth-form button {
+  min-height: 46px;
+}
+
+.auth-form button {
+  margin-top: 14px;
+  border-radius: var(--ui-radius-pill);
+}
+
+.auth-link {
+  margin-top: 22px;
+  color: var(--ui-text-muted);
+}
+
+.auth-link a,
+.table-actions a {
+  color: var(--ui-brand-blue-strong);
+}
+
+dialog {
+  overflow: hidden;
+  color: var(--ui-text);
+  background: var(--ui-surface-strong);
+  border-color: rgba(255, 255, 255, 0.84);
+  border-radius: var(--ui-radius-lg);
+  box-shadow: var(--ui-shadow-lg);
+  backdrop-filter: blur(24px) saturate(125%);
+}
+
+dialog::backdrop {
+  background: rgba(26, 42, 56, 0.25);
+  backdrop-filter: blur(5px);
+}
+
+.dialog-form {
+  gap: 12px;
+  padding: 28px;
+}
+
+.dialog-value,
+.temporary-password {
+  padding: 12px 13px;
+  color: var(--ui-text-muted);
+  background: var(--ui-surface-muted);
+  border-color: var(--ui-line);
+  border-radius: var(--ui-radius-sm);
+}
+
+.preview-item,
+body .preview-item {
+  padding: 8px;
+  color: var(--ui-text-muted);
+  background: rgba(255, 255, 255, 0.64);
+  border-color: var(--ui-line);
+  border-radius: var(--ui-radius-sm);
+}
+
+.mileage-development-dialog {
+  border-radius: var(--ui-radius-lg);
+}
+
+@media (max-width: 900px) {
+  .app-body {
+    padding-left: 0;
+  }
+
+  .page-shell {
+    width: min(100% - 36px, 1440px);
+  }
+}
+
+@media (max-width: 520px) {
+  html body.auth-body {
+    width: 100%;
+    min-width: 0;
+    overflow-x: hidden;
+  }
+
+  .page-shell {
+    width: calc(100% - 28px);
+    padding-top: 72px;
+  }
+
+  .auth-shell,
+  .auth-panel,
+  .auth-form,
+  .auth-form input {
+    width: 100%;
+    min-width: 0;
+    box-sizing: border-box;
+  }
+
+  .form-section {
+    padding: 20px 17px;
+    border-radius: var(--ui-radius-md);
+  }
+
+  .auth-body {
+    padding: 14px;
+  }
+
+  .auth-panel {
+    padding: 27px 20px;
+    border-radius: var(--ui-radius-md);
+  }
+
+  .actions {
+    flex-direction: column-reverse;
+  }
+
+  .actions button,
+  .actions button:first-child {
+    width: 100%;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .app-sidebar nav a,
+  .form-section,
+  .stat-card,
+  .detail-table tbody tr,
+  .history-table tbody tr,
+  .admin-table tbody tr,
+  input,
+  button,
+  .table-action-button {
+    transition: none;
+  }
+}
+
+@media (prefers-reduced-transparency: reduce) {
+  body,
+  body.auth-body {
+    background-image: none;
+  }
+
+  .app-sidebar,
+  .form-section,
+  .stat-card,
+  .auth-panel,
+  dialog,
+  .preview-item {
+    background: var(--ui-surface-solid);
+    backdrop-filter: none;
+  }
+}
+
+@media print {
+  html,
+  body,
+  body.auth-body {
+    background: #fff;
+    background-image: none;
+  }
+
+  .app-sidebar,
+  .sidebar-toggle {
+    display: none;
+  }
+
+  .app-body {
+    padding-left: 0;
+  }
+
+  .page-shell {
+    width: 100%;
+    padding: 0;
+  }
+
+  .form-section,
+  .stat-card,
+  .auth-panel {
+    background: #fff;
+    border: 0;
+    box-shadow: none;
+    backdrop-filter: none;
+  }
+}

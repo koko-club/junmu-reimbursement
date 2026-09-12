@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import hashlib
 import inspect
+from pathlib import Path
+import re
 import threading
 import unittest
 from unittest import mock
@@ -13,6 +15,7 @@ from web import AttemptRateLimiter
 
 ADMIN_PASSWORD = "administrator1"
 USER_PASSWORD = "correct horse battery staple"
+ROOT = Path(__file__).resolve().parents[1]
 EXPECTED_LOGIN_IP_RATE_LIMIT_ATTEMPTS = 10
 EXPECTED_LOGIN_GLOBAL_RATE_LIMIT_ATTEMPTS = 100
 
@@ -135,6 +138,62 @@ class WebAuthenticationTest(unittest.TestCase):
         admin = self.running.users.authenticate("admin", ADMIN_PASSWORD)
         pending = next(user for user in self.running.users.list_pending(admin.id) if user.username == username)
         return self.running.users.approve(admin.id, pending.id)
+
+    def test_rendered_pages_expose_site_metadata_and_favicon(self):
+        title_pattern = re.compile(
+            r"<title(?:\s+data-page-title)?[^>]*>在线报销系统</title>"
+        )
+        favicon = '<link rel="icon" type="image/png" href="/static/favicon.png">'
+
+        setup_page = self.client.get("/setup")
+        self.assertEqual(setup_page.status, 200)
+        self.assertRegex(setup_page.text, title_pattern)
+        self.assertIn(favicon, setup_page.text)
+        favicon_response = self.client.get("/static/favicon.png")
+        self.assertEqual(favicon_response.status, 200)
+        self.assertEqual(favicon_response.headers["Content-Type"], "image/png")
+        self.assertEqual(favicon_response.body[:8], b"\x89PNG\r\n\x1a\n")
+        self.assertEqual(
+            hashlib.sha256(favicon_response.body).hexdigest(),
+            "0e11960647ac87168036ad7ad78e8e7a10aaf40b659d7fa5d7fe7f1d9f7c6015",
+        )
+
+        self.assertEqual(self.setup_admin().status, 201)
+        for path in ("/login", "/register"):
+            with self.subTest(path=path):
+                response = self.client.get(path)
+                self.assertEqual(response.status, 200)
+                self.assertRegex(response.text, title_pattern)
+                self.assertIn(favicon, response.text)
+
+        self.assertEqual(self.register().status, 201)
+        self.approve_user()
+        self.assertEqual(
+            self.client.post_json(
+                "/api/login", {"username": "admin", "password": ADMIN_PASSWORD}
+            ).status,
+            200,
+        )
+        for path in ("/admin", "/change-password"):
+            with self.subTest(path=path):
+                response = self.client.get(path)
+                self.assertEqual(response.status, 200)
+                self.assertRegex(response.text, title_pattern)
+                self.assertIn(favicon, response.text)
+
+        user_client = self.running.new_client()
+        self.assertEqual(
+            user_client.post_json(
+                "/api/login", {"username": "alice", "password": USER_PASSWORD}
+            ).status,
+            200,
+        )
+        for path in ("/", "/history", "/trash"):
+            with self.subTest(path=path):
+                response = user_client.get(path)
+                self.assertEqual(response.status, 200)
+                self.assertRegex(response.text, title_pattern)
+                self.assertIn(favicon, response.text)
 
     def test_uninitialized_app_allows_only_setup_health_and_static(self):
         self.assertEqual(self.client.get("/healthz").status, 200)
@@ -706,6 +765,43 @@ class WebAuthenticationTest(unittest.TestCase):
         self.assertEqual(user_login.json()["next"], "/")
         self.assertEqual(user_client.get("/").status, 200)
         self.assertEqual(user_client.get("/login", follow_redirects=False).headers["Location"], "/")
+
+    def test_authenticated_pages_render_repository_version_without_marker(self):
+        self.setup_admin()
+        admin_login = self.client.post_json(
+            "/api/login", {"username": "admin", "password": ADMIN_PASSWORD}
+        )
+        self.assertEqual(admin_login.status, 200)
+        registration_client = self.running.new_client()
+        self.assertEqual(registration_client.post_json(
+            "/api/register",
+            {
+                "username": "alice",
+                "password": USER_PASSWORD,
+                "real_name": "张三",
+                "department": "技术部",
+            },
+        ).status, 201)
+        self.approve_user()
+        user_client = self.running.new_client()
+        self.assertEqual(user_client.post_json(
+            "/api/login", {"username": "alice", "password": USER_PASSWORD}
+        ).status, 200)
+        version = (ROOT / "VERSION").read_text(encoding="utf-8").strip()
+
+        for client, path in (
+            (user_client, "/"),
+            (user_client, "/history"),
+            (self.client, "/admin"),
+        ):
+            with self.subTest(path=path):
+                response = client.get(path)
+                self.assertEqual(response.status, 200)
+                self.assertIn(
+                    f'<div class="sidebar-version">版本：<span id="app-version">{version}</span></div>',
+                    response.text,
+                )
+                self.assertNotIn("__APP_VERSION__", response.text)
 
     def test_json_parsing_rejects_size_content_type_syntax_and_non_objects(self):
         self.setup_admin()

@@ -1,5 +1,7 @@
 FROM python:3.12-slim-bookworm
 
+ARG APP_VERSION
+
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     HOME=/tmp/app-home \
@@ -20,6 +22,7 @@ RUN apt-get update \
     && chmod 1777 /tmp/app-home
 
 WORKDIR /app
+LABEL org.opencontainers.image.version="${APP_VERSION}"
 COPY requirements.txt requirements-test.txt ./
 RUN python -m pip install --no-cache-dir -r requirements.txt -r requirements-test.txt
 COPY . .

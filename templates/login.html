@@ -3,13 +3,16 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>登录</title>
+  <title>在线报销系统</title>
+  <link rel="icon" type="image/png" href="/static/favicon.png">
   <link rel="stylesheet" href="/static/styles.css">
+  <link rel="stylesheet" href="/static/ui-tokens.css">
+  <link rel="stylesheet" href="/static/ui-components.css">
 </head>
 <body class="auth-body" data-csrf="__CSRF_TOKEN__">
   <main class="auth-shell">
     <section class="auth-panel">
-      <header class="auth-header"><p class="eyebrow">差旅报销系统</p><h1>登录</h1><p>使用已审批的账号继续。</p></header>
+      <header class="auth-header"><h1>登录</h1><p>使用已审批的账号继续。</p></header>
       <form class="auth-form" data-auth-form data-endpoint="/api/login" novalidate>
         <label for="username">账号</label>
         <input id="username" name="username" type="text" autocomplete="username" required maxlength="64">

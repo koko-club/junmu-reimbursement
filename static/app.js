@@ -6,7 +6,8 @@
   const submit = document.getElementById('submit');
   const mileageDialog = document.getElementById('mileage-development-dialog');
   const mileageTrigger = document.getElementById('mileage-development-trigger');
-  const mileageClose = document.getElementById('mileage-development-close');
+  const travelTrigger = document.getElementById('travel-reimbursement-trigger');
+  const expenseTrigger = document.getElementById('expense-reimbursement-trigger');
   const monthCount = document.getElementById('month-count');
   const yearCount = document.getElementById('year-count');
   const yearAmount = document.getElementById('year-amount');
@@ -20,7 +21,6 @@
   }
 
   detailDateFields.forEach(function (field) {
-    field.value = '';
     field.setAttribute('autocomplete', 'off');
     syncDetailDateVisibility(field);
     field.addEventListener('input', function () { syncDetailDateVisibility(field); });
@@ -124,7 +124,7 @@
       const label = document.createElement('span');
       label.textContent = (index + 1) + '. ' + file.name;
       const remove = document.createElement('button');
-      remove.type = 'button'; remove.className = 'remove-file'; remove.textContent = '移除';
+      remove.type = 'button'; remove.className = 'remove-file secondary'; remove.textContent = '移除';
       remove.addEventListener('click', function () { files.splice(index, 1); renderPreviews(); syncInput(); });
       item.append(image, label, remove); previewList.appendChild(item);
     });
@@ -149,8 +149,17 @@
   mileageTrigger.addEventListener('click', function () {
     mileageDialog.showModal();
   });
-  mileageClose.addEventListener('click', function () {
-    mileageDialog.close();
+  function selectTravelReimbursement() {
+    travelTrigger.setAttribute('aria-selected', 'true');
+    expenseTrigger.setAttribute('aria-selected', 'false');
+  }
+  travelTrigger.addEventListener('click', function () {
+    selectTravelReimbursement();
+    if (mileageDialog.open) mileageDialog.close();
+  });
+  expenseTrigger.addEventListener('click', function () {
+    selectTravelReimbursement();
+    mileageDialog.showModal();
   });
   mileageDialog.addEventListener('click', function (event) {
     if (event.target === mileageDialog) mileageDialog.close();

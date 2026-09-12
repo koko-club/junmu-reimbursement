@@ -3,14 +3,18 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title data-page-title>报销记录</title>
+  <title data-page-title>在线报销系统</title>
+  <link rel="icon" type="image/png" href="/static/favicon.png">
   <link rel="stylesheet" href="/static/styles.css?v=20260909-account">
+  <link rel="stylesheet" href="/static/ui-tokens.css">
+  <link rel="stylesheet" href="/static/ui-components.css">
 </head>
-<body class="app-body" data-csrf="__CSRF_TOKEN__" data-scope="active" data-view="active">
+<body class="app-body history-body" data-csrf="__CSRF_TOKEN__" data-scope="active" data-view="active">
   <aside id="app-sidebar" class="app-sidebar" aria-label="主导航">
     <div class="brand"><img class="brand-logo" src="/static/logo.png" alt="" aria-hidden="true"><span>君牧在线报销系统</span></div>
     <nav><a href="/"><svg class="ui-icon" aria-hidden="true"><use href="/static/icons.svg#file-pen"></use></svg><span>填写报销</span></a><a href="/history" data-nav-active="active" data-view="active"><svg class="ui-icon" aria-hidden="true"><use href="/static/icons.svg#history"></use></svg><span>报销记录</span></a><a href="/trash" data-nav-active="trash" data-view="trash"><svg class="ui-icon" aria-hidden="true"><use href="/static/icons.svg#trash-2"></use></svg><span>回收站</span></a></nav>
     <div class="sidebar-account" aria-live="polite"><span>当前登录：</span><strong id="current-user">加载中</strong></div>
+    <div class="sidebar-version">版本：<span id="app-version">__APP_VERSION__</span></div>
     <button id="logout" type="button" class="secondary">退出登录</button>
   </aside>
   <button id="sidebar-toggle" class="sidebar-toggle" type="button" aria-controls="app-sidebar" aria-expanded="false">菜单</button>
@@ -22,18 +26,27 @@
       <div id="history-empty" class="empty-state" hidden>暂无记录</div>
       <div class="table-wrap">
         <table class="history-table" aria-describedby="records-heading">
-          <colgroup class="history-colgroup"><col class="history-col-reason"><col class="history-col-date"><col class="history-col-amount"><col class="history-col-created"><col class="history-col-status"><col class="history-col-actions"></colgroup>
-          <thead><tr><th>出差事由</th><th>报销日期</th><th>报销金额</th><th>生成时间</th><th>状态</th><th>操作</th></tr></thead>
+          <colgroup class="history-colgroup"><col class="history-col-index"><col class="history-col-reason"><col class="history-col-date"><col class="history-col-amount"><col class="history-col-created"><col class="history-col-status"><col class="history-col-actions"></colgroup>
+          <thead><tr><th class="history-col-index">序号</th><th>出差事由</th><th>报销日期</th><th>报销金额</th><th>生成时间</th><th>状态</th><th>操作</th></tr></thead>
           <tbody id="history-rows"></tbody>
         </table>
       </div>
+      <nav id="history-pagination" class="history-pagination" aria-label="报销记录分页" hidden>
+        <button id="history-previous-page" class="pagination-button secondary" type="button" aria-label="上一页" title="上一页" disabled>
+          <svg class="ui-icon" aria-hidden="true"><use href="/static/icons.svg#chevron-left"></use></svg>
+        </button>
+        <span id="history-page-status" class="history-page-status" aria-live="polite"></span>
+        <button id="history-next-page" class="pagination-button secondary" type="button" aria-label="下一页" title="下一页" disabled>
+          <svg class="ui-icon" aria-hidden="true"><use href="/static/icons.svg#chevron-right"></use></svg>
+        </button>
+      </nav>
     </section>
     <dialog id="purge-dialog" aria-labelledby="purge-title">
       <form method="dialog" class="dialog-form" data-purge-form>
         <h2 id="purge-title">永久删除报销记录</h2>
         <p>删除后文件将无法恢复。</p>
         <p id="purge-name" class="dialog-value"></p>
-        <div class="dialog-actions"><button type="submit" value="cancel" class="secondary">取消</button><button type="submit" value="confirm" data-confirm-purge>永久删除</button></div>
+        <div class="dialog-actions"><button type="submit" value="cancel" class="secondary">取消</button><button type="submit" value="confirm" class="danger" data-confirm-purge>永久删除</button></div>
       </form>
     </dialog>
   </main>

@@ -16,14 +16,10 @@ if str(APP_DIR) not in sys.path:
     sys.path.insert(0, str(APP_DIR))
 
 from generator import generate_workbook
-from office import OfficeError, export_pdf, find_soffice
+from office import BUNDLED_SOFFICE, OfficeError, export_pdf, find_soffice
 
 
 TEMPLATE = APP_DIR / "resources" / "差旅报销单模板.xlsx"
-BUNDLED_SOFFICE = Path(
-    "/Users/koko/.cache/codex-runtimes/codex-primary-runtime/"
-    "dependencies/bin/override/soffice"
-)
 
 
 def complete_payload() -> dict:

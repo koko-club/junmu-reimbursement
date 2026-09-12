@@ -15,12 +15,6 @@ import office
 from office import OfficeError, export_pdf, find_soffice
 
 
-BUNDLED_SOFFICE = Path(
-    "/Users/koko/.cache/codex-runtimes/codex-primary-runtime/"
-    "dependencies/bin/override/soffice"
-)
-
-
 def make_executable(path: Path, body: str = "#!/bin/sh\nexit 0\n") -> Path:
     path.write_text(body, encoding="utf-8")
     path.chmod(path.stat().st_mode | stat.S_IXUSR)
@@ -33,6 +27,25 @@ class OfficeTest(unittest.TestCase):
             office.PORTABLE_FONTCONFIG_DIR,
             office.PORTABLE_SOFFICE.parent.parent / "Resources" / "fontconfig",
         )
+
+    def test_bundled_runtime_fallbacks_do_not_embed_a_local_account(self):
+        expected = (
+            Path.home()
+            / ".cache"
+            / "codex-runtimes"
+            / "codex-primary-runtime"
+            / "dependencies"
+            / "bin"
+            / "override"
+            / "soffice"
+        )
+        self.assertEqual(office.BUNDLED_SOFFICE, expected)
+
+        local_user_prefix = "/" + "Users" + "/"
+        for relative_path in ("office.py", "tests/test_office.py", "tests/test_end_to_end.py"):
+            with self.subTest(path=relative_path):
+                source = (APP_DIR / relative_path).read_text(encoding="utf-8")
+                self.assertNotIn(local_user_prefix, source)
 
     def test_amount_to_upper_matches_template_style(self):
         self.assertEqual(office._amount_to_upper(550), "伍佰伍拾元整")
@@ -90,7 +103,7 @@ class OfficeTest(unittest.TestCase):
                 return type("Completed", (), {"returncode": 0, "stderr": ""})()
 
             with patch("office.subprocess.run", side_effect=fake_run):
-                export_pdf(workbook, root, BUNDLED_SOFFICE)
+                export_pdf(workbook, root, office.BUNDLED_SOFFICE)
 
             self.assertTrue(observed["env"]["FONTCONFIG_FILE"].endswith("/Resources/fontconfig/fonts.conf"))
             self.assertTrue(observed["env"]["FONTCONFIG_PATH"].endswith("/Resources/fontconfig"))
@@ -103,7 +116,7 @@ class OfficeTest(unittest.TestCase):
             workbook.write_bytes(b"xlsx")
             with patch("office._conversion_environment", side_effect=OSError("cache is not writable")):
                 with self.assertRaisesRegex(OfficeError, "could not prepare PDF conversion: cache is not writable"):
-                    export_pdf(workbook, root, BUNDLED_SOFFICE)
+                    export_pdf(workbook, root, office.BUNDLED_SOFFICE)
             self.assertEqual(list(root.glob(".soffice-profile-*")), [])
             self.assertEqual(list(root.glob(".pdf-convert-*")), [])
 

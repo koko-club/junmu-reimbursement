@@ -23,9 +23,15 @@ APP_DIR = Path(__file__).resolve().parent
 PORTABLE_SOFFICE = APP_DIR / "runtime" / "libreoffice" / "libreoffice" / "LibreOfficeDev.app" / "Contents" / "MacOS" / "soffice"
 PORTABLE_FONTCONFIG_DIR = (PORTABLE_SOFFICE.parent / "../Resources/fontconfig").resolve()
 PORTABLE_FONTCONFIG_FILE = PORTABLE_FONTCONFIG_DIR / "fonts.conf"
-BUNDLED_SOFFICE = Path(
-    "/Users/koko/.cache/codex-runtimes/codex-primary-runtime/"
-    "dependencies/bin/override/soffice"
+BUNDLED_SOFFICE = (
+    Path.home()
+    / ".cache"
+    / "codex-runtimes"
+    / "codex-primary-runtime"
+    / "dependencies"
+    / "bin"
+    / "override"
+    / "soffice"
 )
 BUNDLED_FONTCONFIG_DIR = (
     BUNDLED_SOFFICE.parent

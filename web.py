@@ -54,6 +54,8 @@ from validation import (
 
 
 _LOGGER = logging.getLogger(__name__)
+VERSION_PATH = Path(__file__).resolve().parent / "VERSION"
+SITE_NAME = "在线报销系统"
 _COOKIE_NAME = "reimbursement_session"
 _COOKIE_MAX_AGE = 7 * 24 * 60 * 60
 RATE_LIMIT_ATTEMPTS = 5
@@ -71,6 +73,16 @@ _STATIC_EXTENSIONS = {
     ".css", ".js", ".html", ".ico", ".png", ".jpg", ".jpeg", ".svg", ".webp",
     ".woff", ".woff2", ".ttf",
 }
+
+
+def _load_app_version() -> str:
+    try:
+        version = VERSION_PATH.read_text(encoding="utf-8").strip()
+    except (OSError, UnicodeError) as error:
+        raise RuntimeError("application version unavailable") from error
+    if not version:
+        raise RuntimeError("application version unavailable")
+    return version
 
 
 @dataclass(frozen=True)
@@ -217,6 +229,10 @@ class WebApplication:
         self.anonymous_csrf = anonymous_csrf
         self.reimbursement_service = reimbursement_service
         self.rate_limiter = rate_limiter or AttemptRateLimiter()
+        try:
+            self.app_version: str | None = _load_app_version()
+        except RuntimeError:
+            self.app_version = None
         self._upload_slots = threading.BoundedSemaphore(
             config.max_concurrent_generations
         )
@@ -520,11 +536,7 @@ class WebApplication:
         self._template_page(handler, "change-password.html", user.csrf_token)
 
     def _root(self, handler, _user, _token) -> None:
-        index_path = self.config.templates_dir / "index.html"
-        if not index_path.is_file():
-            self._json(handler, 500, {"error": "页面模板不可用"})
-            return
-        self._file(handler, index_path, "text/html; charset=utf-8", no_store=True)
+        self._template_page(handler, "index.html", "")
 
     def _history_page(self, handler, user, _token) -> None:
         assert user is not None
@@ -1042,7 +1054,7 @@ class WebApplication:
         self._template_page(handler, template, csrf_token)
 
     def _template_page(self, handler, name: str, csrf_token: str, *, scope: str | None = None) -> None:
-        allowed = {"setup.html", "login.html", "register.html", "change-password.html", "history.html", "admin.html"}
+        allowed = {"setup.html", "login.html", "register.html", "change-password.html", "index.html", "history.html", "admin.html"}
         if name not in allowed:
             self._json(handler, 500, {"error": "页面模板不可用"})
             return
@@ -1052,6 +1064,10 @@ class WebApplication:
         except (OSError, UnicodeError):
             self._json(handler, 500, {"error": "页面模板不可用"})
             return
+        if self.app_version is None:
+            self._json(handler, 500, {"error": "页面模板不可用"})
+            return
+        markup = markup.replace("__APP_VERSION__", html.escape(self.app_version))
         markup = markup.replace(
             'data-csrf="__CSRF_TOKEN__"',
             f'data-csrf="{html.escape(csrf_token, quote=True)}"',
@@ -1066,7 +1082,8 @@ class WebApplication:
         csrf_attribute = "" if csrf_token is None else f' data-csrf="{html.escape(csrf_token)}"'
         markup = (
             "<!doctype html><html lang=\"zh-CN\"><head><meta charset=\"utf-8\">"
-            f"<title>{html.escape(title)}</title></head>"
+            f"<title>{html.escape(SITE_NAME)}</title>"
+            '<link rel="icon" type="image/png" href="/static/favicon.png"></head>'
             f"<body{csrf_attribute}><main><h1>{html.escape(title)}</h1></main></body></html>"
         )
         return markup.encode("utf-8")

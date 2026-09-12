@@ -3,6 +3,7 @@ set -eu
 
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
 cd "$SCRIPT_DIR"
+. scripts/release-vars.sh
 
 PYTHON_BIN=""
 for candidate in \
@@ -35,7 +36,7 @@ if [ "$OPEN_BROWSER" = 1 ] && command -v open >/dev/null 2>&1; then
 url = "http://127.0.0.1:" + os.environ["APP_PORT"]
 for attempt in range(30):
     try:
-        urllib.request.urlopen(url + "/api/health", timeout=1).close()
+        urllib.request.urlopen(url + "/healthz", timeout=1).close()
     except OSError:
         time.sleep(1)
     else:

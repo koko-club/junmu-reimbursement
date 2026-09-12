@@ -150,11 +150,16 @@ class RunningApp:
             self.data_dir = self.root / "data"
             self.templates_dir.mkdir()
             self.static_dir.mkdir()
-            (self.templates_dir / "index.html").write_text(
-                "<!doctype html><html><body>reimbursement form</body></html>", encoding="utf-8"
-            )
             project_templates = Path(__file__).resolve().parents[1] / "templates"
-            for template_name in ("setup.html", "login.html", "register.html", "change-password.html", "history.html", "admin.html"):
+            for template_name in (
+                "index.html",
+                "setup.html",
+                "login.html",
+                "register.html",
+                "change-password.html",
+                "history.html",
+                "admin.html",
+            ):
                 source = project_templates / template_name
                 if source.is_file():
                     (self.templates_dir / template_name).write_text(
@@ -164,12 +169,16 @@ class RunningApp:
                 "window.appLoaded = true;", encoding="utf-8"
             )
             project_static = Path(__file__).resolve().parents[1] / "static"
-            for static_name in ("common.js", "history.js", "admin.js", "styles.css"):
+            for static_name in ("common.js", "history.js", "admin.js", "styles.css", "favicon.png"):
                 source = project_static / static_name
                 if source.is_file():
-                    (self.static_dir / static_name).write_text(
-                        source.read_text(encoding="utf-8"), encoding="utf-8"
-                    )
+                    destination = self.static_dir / static_name
+                    if static_name == "favicon.png":
+                        destination.write_bytes(source.read_bytes())
+                    else:
+                        destination.write_text(
+                            source.read_text(encoding="utf-8"), encoding="utf-8"
+                        )
             (self.root / "template.xlsx").write_bytes(b"template")
             self.config_path = self.root / "config.json"
             self.config_path.write_text(
