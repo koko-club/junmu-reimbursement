@@ -121,10 +121,19 @@ Run:
 cp /var/folders/1_/07yz_m8x07n9l2b45vyv61pr0000gn/T/codex-clipboard-6783cc57-0c55-4cc0-93d5-f236cea86cb2.png static/favicon.png
 ```
 
-Update the `RunningApp.__enter__` copy list in `tests/http_helpers.py` so integration tests receive the new asset:
+Update the `RunningApp.__enter__` copy loop in `tests/http_helpers.py` so integration tests receive the new asset. Because the existing loop copies text files with UTF-8, branch the binary favicon before the text `read_text` call:
 
 ```python
             for static_name in ("common.js", "history.js", "admin.js", "styles.css", "favicon.png"):
+                source = project_static / static_name
+                if source.is_file():
+                    destination = self.static_dir / static_name
+                    if static_name == "favicon.png":
+                        destination.write_bytes(source.read_bytes())
+                    else:
+                        destination.write_text(
+                            source.read_text(encoding="utf-8"), encoding="utf-8"
+                        )
 ```
 
 Keep the existing conditional `if source.is_file()` and all other copied filenames unchanged.
