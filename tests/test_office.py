@@ -1,5 +1,6 @@
 from pathlib import Path
 import os
+import shutil
 import stat
 import sys
 import tempfile
@@ -13,12 +14,8 @@ if str(APP_DIR) not in sys.path:
 
 import office
 from office import OfficeError, export_pdf, find_soffice
-
-
-BUNDLED_SOFFICE = Path(
-    "/Users/koko/.cache/codex-runtimes/codex-primary-runtime/"
-    "dependencies/bin/override/soffice"
-)
+from generator import generate_workbook
+from openpyxl import load_workbook
 
 
 def make_executable(path: Path, body: str = "#!/bin/sh\nexit 0\n") -> Path:
@@ -28,11 +25,59 @@ def make_executable(path: Path, body: str = "#!/bin/sh\nexit 0\n") -> Path:
 
 
 class OfficeTest(unittest.TestCase):
+    def test_pdf_copy_expands_eleven_detail_rows_by_one_third(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = generate_workbook(
+                APP_DIR / "resources" / "差旅报销单模板.xlsx",
+                root,
+                {"date": "2026-09-30", "traveler": "张三", "rows": []},
+                [],
+            ).path
+            copy_dir = root / "conversion"
+            copy_dir.mkdir()
+            pdf_copy = office._prepare_pdf_workbook(source, copy_dir)
+            original = load_workbook(source)
+            prepared = load_workbook(pdf_copy)
+            try:
+                first = original["差旅报销单"]
+                second = prepared["差旅报销单"]
+                self.assertNotEqual(pdf_copy, source)
+                for row in range(9, 20):
+                    self.assertAlmostEqual(
+                        second.row_dimensions[row].height,
+                        first.row_dimensions[row].height * 4 / 3,
+                    )
+                self.assertEqual(second.row_dimensions[8].height, first.row_dimensions[8].height)
+                self.assertEqual(second.row_dimensions[20].height, first.row_dimensions[20].height)
+            finally:
+                original.close()
+                prepared.close()
+
     def test_portable_fontconfig_is_relative_to_libreoffice_contents(self):
         self.assertEqual(
             office.PORTABLE_FONTCONFIG_DIR,
             office.PORTABLE_SOFFICE.parent.parent / "Resources" / "fontconfig",
         )
+
+    def test_bundled_runtime_fallbacks_do_not_embed_a_local_account(self):
+        expected = (
+            Path.home()
+            / ".cache"
+            / "codex-runtimes"
+            / "codex-primary-runtime"
+            / "dependencies"
+            / "bin"
+            / "override"
+            / "soffice"
+        )
+        self.assertEqual(office.BUNDLED_SOFFICE, expected)
+
+        local_user_prefix = "/" + "Users" + "/"
+        for relative_path in ("office.py", "tests/test_office.py", "tests/test_end_to_end.py"):
+            with self.subTest(path=relative_path):
+                source = (APP_DIR / relative_path).read_text(encoding="utf-8")
+                self.assertNotIn(local_user_prefix, source)
 
     def test_amount_to_upper_matches_template_style(self):
         self.assertEqual(office._amount_to_upper(550), "伍佰伍拾元整")
@@ -90,7 +135,7 @@ class OfficeTest(unittest.TestCase):
                 return type("Completed", (), {"returncode": 0, "stderr": ""})()
 
             with patch("office.subprocess.run", side_effect=fake_run):
-                export_pdf(workbook, root, BUNDLED_SOFFICE)
+                export_pdf(workbook, root, office.BUNDLED_SOFFICE)
 
             self.assertTrue(observed["env"]["FONTCONFIG_FILE"].endswith("/Resources/fontconfig/fonts.conf"))
             self.assertTrue(observed["env"]["FONTCONFIG_PATH"].endswith("/Resources/fontconfig"))
@@ -103,7 +148,7 @@ class OfficeTest(unittest.TestCase):
             workbook.write_bytes(b"xlsx")
             with patch("office._conversion_environment", side_effect=OSError("cache is not writable")):
                 with self.assertRaisesRegex(OfficeError, "could not prepare PDF conversion: cache is not writable"):
-                    export_pdf(workbook, root, BUNDLED_SOFFICE)
+                    export_pdf(workbook, root, office.BUNDLED_SOFFICE)
             self.assertEqual(list(root.glob(".soffice-profile-*")), [])
             self.assertEqual(list(root.glob(".pdf-convert-*")), [])
 
@@ -117,6 +162,26 @@ class OfficeTest(unittest.TestCase):
                 export_pdf(workbook, root, fake)
             self.assertFalse((root / "claim.pdf").exists())
             self.assertTrue(workbook.exists())
+
+    def test_export_pdf_rejects_malformed_converter_output_for_real_workbook(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workbook = root / "claim.xlsx"
+            shutil.copy2(APP_DIR / "resources" / "差旅报销单模板.xlsx", workbook)
+            fake = make_executable(
+                root / "soffice",
+                "#!/bin/sh\n"
+                "outdir=''\n"
+                "while [ $# -gt 0 ]; do\n"
+                "  if [ \"$1\" = --outdir ]; then shift; outdir=$1; fi\n"
+                "  shift\n"
+                "done\n"
+                "printf 'invalid pdf' > \"$outdir/claim.pdf\"\n",
+            )
+            with self.assertRaisesRegex(OfficeError, "could not lay out reimbursement PDF"):
+                export_pdf(workbook, root, fake)
+            self.assertFalse((root / "claim.pdf").exists())
+            self.assertEqual(list(root.glob(".pdf-convert-*")), [])
 
     def test_export_pdf_avoids_overwriting_existing_pdf(self):
         with tempfile.TemporaryDirectory() as tmp:

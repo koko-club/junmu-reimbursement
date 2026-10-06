@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from email.message import Message
 import io
 import json
@@ -12,6 +13,10 @@ from types import SimpleNamespace
 import unittest
 from unittest import mock
 from urllib.parse import quote
+from pypdf import PdfWriter
+from PIL import Image
+from license import sign_license
+from license_service import LicenseState
 
 from reimbursements import (
     OwnedReimbursementFile,
@@ -147,6 +152,37 @@ class WebReimbursementTest(unittest.TestCase):
         self.assertEqual(response.status, 200)
         return client
 
+    def test_travel_days_endpoint_is_private_and_monthly(self):
+        record_id = "81000000-0000-4000-8000-000000000001"
+        self._insert_record(self.alice_id, record_id)
+        with self.running.server.database.transaction(immediate=True) as connection:
+            connection.execute(
+                "UPDATE reimbursements SET payload_json = ? WHERE id = ?",
+                (json.dumps({"days": 3, "rows": [{"date": "2026-09-12"}]}), record_id),
+            )
+        self.assertEqual(self.anonymous.get("/api/travel-days").status, 401)
+        self.assertEqual(self.admin.get("/api/travel-days").status, 403)
+        application = self.running.server.application
+        with mock.patch.object(application.license_service, "status",
+                               return_value=LicenseState("serial", "pro", None, "active")):
+            self.assertEqual(self.bob.get("/api/travel-days").json()["months"], [])
+            response = self.alice.get("/api/travel-days")
+        self.assertEqual(response.status, 200)
+        self.assertEqual(response.json()["months"], [
+            {"year": 2026, "month": 9, "days": 3.0}
+        ])
+
+    def test_free_travel_trend_api_rejects_without_querying_real_data(self):
+        application = self.running.server.application
+        with mock.patch.object(application.reimbursement_service, "travel_days_by_month") as aggregate:
+            response = self.alice.get("/api/travel-days")
+            self.assertEqual(response.status, 403, response.text)
+            self.assertIn("Pro 专属功能", response.json()["error"])
+            self.assertEqual(response.json()["upgrade_url"], "/profile")
+            self.assertNotIn("months", response.json())
+            aggregate.assert_not_called()
+        self.assertFalse(self.alice.get("/api/permissions").json()["travel_trend"])
+
     def _post_generation(self):
         payload = {
             "date": "2026-09-08",
@@ -171,6 +207,34 @@ class WebReimbursementTest(unittest.TestCase):
                 "X-CSRF-Token": self.alice.csrf_for("/api/reimbursements/generate"),
             },
         )
+
+    def test_edit_detail_is_owner_scoped(self):
+        record_id = "bf087913-f923-47f8-ae31-34f6a4372173"
+        self._insert_record(self.alice_id, record_id)
+        path = f"/api/reimbursements/{record_id}/edit"
+        with mock.patch.object(self.running.server.application.reimbursement_service, "edit_details", return_value={"payload": {"reason": "旧行程"}, "invoices": [], "invoice_layout": 2}):
+            self.assertEqual(self.alice.get(path).json()["payload"]["reason"], "旧行程")
+        self.assertEqual(self.anonymous.get(path, follow_redirects=False).status, 401)
+        self.assertEqual(self.bob.get(path).status, 404)
+
+    def test_regenerate_route_requires_confirmation_payload_and_owner(self):
+        record_id = "bf087913-f923-47f8-ae31-34f6a4372173"
+        record = self._insert_record(self.alice_id, record_id)
+        path = f"/api/reimbursements/{record_id}/regenerate"
+        payload = {"date": "2026-09-08", "reason": "改过的行程", "days": 1,
+                   "allowance": 50, "rows": [], "keep_invoices": []}
+        body, content_type = multipart([
+            ("payload", json.dumps(payload), None, "application/json"),
+        ])
+        headers = {"Content-Type": content_type, "Content-Length": str(len(body)),
+                   "X-CSRF-Token": self.alice.csrf_for(path)}
+        with mock.patch.object(self.running.server.application.reimbursement_service, "regenerate", return_value=record) as regenerate:
+            response = self.alice.request("POST", path, body=body, headers=headers)
+        self.assertEqual(response.status, 200)
+        self.assertEqual(response.json()["record"]["id"], record_id)
+        self.assertEqual(regenerate.call_args.args[1], record_id)
+        self.assertEqual(self.bob.request("POST", path, body=body,
+                          headers={**headers, "X-CSRF-Token": self.bob.csrf_for(path)}).status, 404)
 
     def _insert_record(
         self,
@@ -225,6 +289,80 @@ class WebReimbursementTest(unittest.TestCase):
             )
         return record
 
+    def test_free_history_lists_stats_and_trend_exclude_old_records_until_pro_upgrade(self):
+        current = datetime.now(timezone.utc)
+        recent_id = "90000000-0000-4000-8000-000000000001"
+        old_id = "90000000-0000-4000-8000-000000000002"
+        self._insert_record(self.alice_id, recent_id,
+            created_at=(current - timedelta(days=30)).isoformat(), reimbursement_amount="10.00")
+        self._insert_record(self.alice_id, old_id,
+            created_at=(current - timedelta(days=220)).isoformat(), reimbursement_amount="90.00")
+        with self.running.server.database.transaction(immediate=True) as connection:
+            connection.execute("UPDATE reimbursements SET payload_json = ? WHERE id = ?",
+                (json.dumps({"date": "2026-03-01", "reason": "历史差旅", "rows": []}), old_id))
+        response = self.alice.get("/api/reimbursements?scope=active")
+        self.assertEqual(response.status, 200, response.text)
+        self.assertEqual([item["id"] for item in response.json()["reimbursements"]], [recent_id])
+        self.assertEqual(self.alice.get("/api/permissions").json()["history_retention_months"], 6)
+        self.assertEqual(self.alice.get("/api/reimbursements/stats?form_type=travel").status, 200)
+        self.assertEqual(self.alice.get("/api/reimbursements/stats").status, 403)
+        self.assertEqual(self.alice.get("/api/travel-days").status, 403)
+
+        application = self.running.server.application
+        key = Ed25519PrivateKey.generate()
+        application.license_service._public_key = key.public_key()
+        serial = self.alice.get("/api/license").json()["serial"]
+        upgraded = self.alice.post_json("/api/license/import", {"code": sign_license(key, serial)})
+        self.assertEqual(upgraded.status, 200, upgraded.text)
+        self.assertIsNone(self.alice.get("/api/permissions").json()["history_retention_months"])
+        self.assertTrue(self.alice.get("/api/permissions").json()["reimbursement_stats"])
+        self.assertTrue(self.alice.get("/api/permissions").json()["travel_trend"])
+        response = self.alice.get("/api/reimbursements?scope=active")
+        self.assertEqual([item["id"] for item in response.json()["reimbursements"]], [recent_id, old_id])
+        self.assertEqual(self.alice.get("/api/reimbursements/stats").json()["year_amount"], "100.00")
+        self.assertEqual(self.alice.get("/api/travel-days").json()["excluded_records"], 2)
+        self.assertEqual(self.alice.get(f"/api/reimbursements/{old_id}/pdf").status, 200)
+        self.assertEqual(self.alice.get(f"/api/reimbursements/{old_id}/edit").status, 200)
+        with mock.patch.object(application.license_service, "status",
+                               return_value=LicenseState(serial, "basic", None, "expired")):
+            response = self.alice.get("/api/reimbursements?scope=active")
+            self.assertEqual([item["id"] for item in response.json()["reimbursements"]], [recent_id])
+            self.assertEqual(self.alice.get("/api/reimbursements/stats?form_type=travel").status, 200)
+            self.assertEqual(self.alice.get("/api/reimbursements/stats").status, 403)
+            expired_access = self.alice.get("/api/permissions").json()
+            self.assertEqual(expired_access["invoice_limit"], 6)
+            self.assertEqual(expired_access["history_retention_months"], 6)
+            self.assertFalse(expired_access["reimbursement_stats"])
+            self.assertEqual(self.alice.get("/api/travel-days").status, 403)
+            self.assertFalse(expired_access["travel_trend"])
+        with self.running.server.database.connect() as connection:
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM reimbursements WHERE user_id = ?",
+                                                (self.alice_id,)).fetchone()[0], 2)
+
+    def test_free_direct_access_to_old_active_and_trashed_records_is_forbidden(self):
+        old = (datetime.now(timezone.utc) - timedelta(days=220)).isoformat()
+        active_id = "90000000-0000-4000-8000-000000000003"
+        trashed_id = "90000000-0000-4000-8000-000000000004"
+        self._insert_record(self.alice_id, active_id, created_at=old)
+        self._insert_record(self.alice_id, trashed_id, created_at=old,
+                            deleted_at=datetime.now(timezone.utc).isoformat())
+        self.assertEqual(self.alice.get("/api/reimbursements?scope=trash").json()["reimbursements"], [])
+        for suffix in ("edit", "xlsx", "pdf"):
+            with self.subTest(suffix=suffix):
+                response = self.alice.get(f"/api/reimbursements/{active_id}/{suffix}")
+                self.assertEqual(response.status, 403, response.text)
+                self.assertIn("普通用户仅可查看最近 6 个月", response.json()["error"])
+        self.assertEqual(self.bob.get(f"/api/reimbursements/{active_id}/pdf").status, 404)
+        for record_id, action, body in ((active_id, "trash", {}), (trashed_id, "restore", {}),
+                                        (trashed_id, "purge", {"confirm": True})):
+            with self.subTest(action=action):
+                response = self.alice.post_json(f"/api/reimbursements/{record_id}/{action}", body)
+                self.assertEqual(response.status, 403, response.text)
+        path = f"/api/reimbursements/{active_id}/regenerate"
+        response = self.alice.request("POST", path, body=b"",
+            headers={"X-CSRF-Token": self.alice.csrf_for(path)})
+        self.assertEqual(response.status, 403, response.text)
+
     def test_stats_endpoint_is_authenticated_and_returns_active_owner_totals(self):
         service = mock.Mock()
         service.active_stats.return_value = {
@@ -233,14 +371,55 @@ class WebReimbursementTest(unittest.TestCase):
             "year_amount": "1234.50",
         }
         application = self.running.server.application
-        with mock.patch.object(application, "reimbursement_service", service):
+        with mock.patch.object(application, "reimbursement_service", service), \
+                mock.patch.object(application.license_service, "status",
+                                  return_value=LicenseState("serial", "pro", None, "active")):
             response = self.alice.get("/api/reimbursements/stats")
 
         self.assertEqual(response.status, 200)
         self.assertEqual(response.json(), service.active_stats.return_value)
-        service.active_stats.assert_called_once_with(self.alice_id)
+        service.active_stats.assert_called_once()
+        self.assertEqual(service.active_stats.call_args.args, (self.alice_id,))
+        self.assertNotIn("created_after", service.active_stats.call_args.kwargs)
         self.assertEqual(self.admin.get("/api/reimbursements/stats").status, 403)
         self.assertEqual(self.anonymous.get("/api/reimbursements/stats").status, 401)
+
+    def test_stats_endpoint_passes_selected_form_type(self):
+        service = mock.Mock()
+        service.active_stats.return_value = {
+            "month_count": 1, "year_count": 1, "year_amount": "25.00",
+        }
+        application = self.running.server.application
+        with mock.patch.object(application, "reimbursement_service", service), \
+                mock.patch.object(application.license_service, "status",
+                                  return_value=LicenseState("serial", "pro", None, "active")):
+            response = self.alice.get("/api/reimbursements/stats?form_type=expense")
+            self.assertEqual(response.status, 200)
+            service.active_stats.assert_called_once()
+            self.assertEqual(service.active_stats.call_args.args, (self.alice_id,))
+            self.assertEqual(service.active_stats.call_args.kwargs["form_type"], "expense")
+            self.assertNotIn("created_after", service.active_stats.call_args.kwargs)
+            self.assertEqual(self.alice.get("/api/reimbursements/stats?form_type=other").status, 400)
+            self.assertEqual(self.alice.get("/api/reimbursements/stats?form_type=travel&form_type=expense").status, 400)
+
+    def test_free_stats_endpoint_allows_only_form_scoped_totals(self):
+        application = self.running.server.application
+        service = mock.Mock()
+        service.active_stats.return_value = {
+            "month_count": 1, "year_count": 2, "year_amount": "30.00",
+        }
+        with mock.patch.object(application, "reimbursement_service", service):
+            response = self.alice.get("/api/reimbursements/stats")
+            self.assertEqual(response.status, 403, response.text)
+            service.active_stats.assert_not_called()
+            for form_type in ("travel", "expense"):
+                with self.subTest(form_type=form_type):
+                    response = self.alice.get("/api/reimbursements/stats?form_type=" + form_type)
+                    self.assertEqual(response.status, 200, response.text)
+                    self.assertEqual(response.json(), service.active_stats.return_value)
+                    self.assertEqual(service.active_stats.call_args.args, (self.alice_id,))
+                    self.assertEqual(service.active_stats.call_args.kwargs, {"form_type": form_type})
+        self.assertFalse(self.alice.get("/api/permissions").json()["reimbursement_stats"])
 
     def test_file_permission_matrix_and_download_metadata(self):
         record = self._insert_record(
@@ -311,6 +490,7 @@ class WebReimbursementTest(unittest.TestCase):
         )
         service = mock.Mock()
         service.owned_file.return_value = owned
+        service.record_created_at.return_value = datetime.now(timezone.utc).isoformat()
         application = self.running.server.application
 
         with mock.patch.object(application, "reimbursement_service", service):
@@ -355,6 +535,7 @@ class WebReimbursementTest(unittest.TestCase):
         handler.wfile.write.side_effect = ConnectionResetError("client left")
         service = mock.Mock()
         service.owned_file.return_value = owned
+        service.record_created_at.return_value = datetime.now(timezone.utc).isoformat()
         user = SimpleNamespace(
             user_id=self.alice_id,
             role="user",
@@ -385,6 +566,7 @@ class WebReimbursementTest(unittest.TestCase):
         owned = OwnedReimbursementFile(record, "xlsx", "claim.xlsx", 65537, stream)
         service = mock.Mock()
         service.owned_file.return_value = owned
+        service.record_created_at.return_value = datetime.now(timezone.utc).isoformat()
         cookie = "; ".join(
             f"{item.name}={item.value}"
             for item in self.alice.cookies
@@ -452,6 +634,7 @@ class WebReimbursementTest(unittest.TestCase):
         )
         service = mock.Mock()
         service.owned_file.return_value = owned
+        service.record_created_at.return_value = datetime.now(timezone.utc).isoformat()
         user = SimpleNamespace(
             user_id=self.alice_id,
             role="user",
@@ -505,6 +688,7 @@ class WebReimbursementTest(unittest.TestCase):
         )
         service = mock.Mock()
         service.owned_file.return_value = owned
+        service.record_created_at.return_value = datetime.now(timezone.utc).isoformat()
         user = SimpleNamespace(
             user_id=self.alice_id,
             role="user",
@@ -561,6 +745,7 @@ class WebReimbursementTest(unittest.TestCase):
         )
         service = mock.Mock()
         service.owned_file.return_value = owned
+        service.record_created_at.return_value = datetime.now(timezone.utc).isoformat()
         user = SimpleNamespace(
             user_id=self.alice_id,
             role="user",
@@ -630,6 +815,21 @@ class WebReimbursementTest(unittest.TestCase):
         self.assertEqual(self.anonymous.get("/api/reimbursements?scope=active").status, 401)
         self.assertEqual(self.alice.get("/api/reimbursements?scope=unknown").status, 400)
 
+    def test_history_api_identifies_expense_and_legacy_travel_records(self):
+        travel = self._insert_record(self.alice_id, "40000000-0000-4000-8000-000000000011")
+        expense = self._insert_record(self.alice_id, "40000000-0000-4000-8000-000000000012")
+        with self.running.server.database.transaction(immediate=True) as connection:
+            connection.execute(
+                "UPDATE reimbursements SET payload_json = ? WHERE id = ?",
+                (json.dumps({"form_type": "expense"}), expense.id),
+            )
+        response = self.alice.get("/api/reimbursements?scope=active")
+        self.assertEqual(response.status, 200)
+        by_id = {item["id"]: item for item in response.json()["reimbursements"]}
+        self.assertEqual(by_id[travel.id]["form_type"], "travel")
+        self.assertEqual(by_id[expense.id]["form_type"], "expense")
+        self.assertNotIn("payload_json", response.text)
+
     def test_trash_restore_and_exact_confirmation_purge_require_csrf(self):
         record = self._insert_record(
             self.alice_id, "50000000-0000-4000-8000-000000000001"
@@ -661,6 +861,8 @@ class WebReimbursementTest(unittest.TestCase):
 
     def test_purge_storage_failure_returns_stable_retryable_error(self):
         record_id = "50000000-0000-4000-8000-000000000002"
+        self._insert_record(self.alice_id, record_id,
+                            deleted_at=datetime.now(timezone.utc).isoformat())
         path = f"/api/reimbursements/{record_id}/purge"
         service = self.running.server.application.reimbursement_service
 
@@ -732,7 +934,9 @@ class WebReimbursementTest(unittest.TestCase):
         self.assertEqual(stale.status, 401)
         self.assertIn("Max-Age=0", stale.headers["Set-Cookie"])
         self.assertEqual(current.status, 200)
-        service.list_active.assert_called_once_with(self.alice_id)
+        service.list_active.assert_called_once()
+        self.assertEqual(service.list_active.call_args.args, (self.alice_id,))
+        self.assertIsInstance(service.list_active.call_args.kwargs["created_after"], datetime)
 
     def test_generation_route_preserves_multipart_screenshots_and_returns_downloads(self):
         payload = {
@@ -803,6 +1007,236 @@ class WebReimbursementTest(unittest.TestCase):
         self.assertEqual(captured["payload"]["traveler"], "client traveler")
         self.assertEqual(captured["screenshots"], [("0000-route.png", b"PNGDATA", True)])
         self.assertFalse(captured["upload_directory"].exists())
+
+    def test_generation_route_passes_valid_pdf_invoices_in_upload_order(self):
+        payload = {"date": "2026-09-08", "department": "ignored", "traveler": "ignored",
+                   "reason": "客户拜访", "days": 1, "allowance": 50, "rows": []}
+        writer = PdfWriter()
+        writer.add_blank_page(width=420, height=297)
+        pdf = io.BytesIO()
+        writer.write(pdf)
+        body, content_type = multipart([
+            ("payload", json.dumps(payload), None, "application/json"),
+            ("invoices", pdf.getvalue(), "first.pdf", "application/pdf"),
+            ("invoices", pdf.getvalue(), "second.PDF", "application/pdf"),
+        ])
+        record_id = "70000000-0000-4000-8000-000000000002"
+        record = ReimbursementRecord(record_id, self.alice_id, "2026-09-08", "result.xlsx",
+                                     f"users/{self.alice_id}/{record_id}/result.xlsx",
+                                     f"users/{self.alice_id}/{record_id}/result.pdf",
+                                     "2026-09-08T00:00:00+00:00", None, "客户拜访", "50.00")
+        captured = []
+        def generate(_user, _payload, screenshots, invoices):
+            self.assertEqual(screenshots, [])
+            captured.extend((path.name, path.read_bytes()) for path in invoices)
+            return record
+        service = mock.Mock()
+        service.generate.side_effect = generate
+        application = self.running.server.application
+        with mock.patch.object(application, "reimbursement_service", service):
+            response = self.alice.request("POST", "/api/reimbursements/generate", body=body,
+                headers={"Content-Type": content_type, "Content-Length": str(len(body)),
+                         "X-CSRF-Token": self.alice.csrf_for("/api/reimbursements/generate")})
+        self.assertEqual(response.status, 200)
+        self.assertEqual(captured, [("0000-first.pdf", pdf.getvalue()),
+                                    ("0001-second.PDF", pdf.getvalue())])
+
+    def test_generation_route_passes_selected_four_up_layout(self):
+        payload = {"date": "2026-09-08", "department": "ignored", "traveler": "ignored",
+                   "reason": "客户拜访", "days": 1, "allowance": 50, "rows": []}
+        writer = PdfWriter()
+        writer.add_blank_page(width=420, height=297)
+        pdf = io.BytesIO()
+        writer.write(pdf)
+        body, content_type = multipart([
+            ("payload", json.dumps(payload), None, "application/json"),
+            ("invoice_layout", b"4", None, "text/plain"),
+            ("invoices", pdf.getvalue(), "invoice.pdf", "application/pdf"),
+        ])
+        service = mock.Mock()
+        service.generate.return_value = SimpleNamespace(
+            id="00000000-0000-0000-0000-000000000001", reimbursement_date="2026-09-08",
+            display_name="test.xlsx", reason="客户拜访", reimbursement_amount="0",
+            created_at="2026-09-08T00:00:00+00:00", deleted_at=None, payload_json=None,
+        )
+        application = self.running.server.application
+        with mock.patch.object(application, "reimbursement_service", service):
+            response = self.alice.request("POST", "/api/reimbursements/generate", body=body,
+                headers={"Content-Type": content_type, "Content-Length": str(len(body)),
+                         "X-CSRF-Token": self.alice.csrf_for("/api/reimbursements/generate")})
+        self.assertEqual(response.status, 200, response.json())
+        self.assertEqual(service.generate.call_args.kwargs, {"invoice_layout": 4})
+
+    def test_generation_route_rejects_unknown_invoice_layout(self):
+        payload = {"date": "2026-09-08", "department": "ignored", "traveler": "ignored",
+                   "reason": "客户拜访", "days": 1, "allowance": 50, "rows": []}
+        body, content_type = multipart([
+            ("payload", json.dumps(payload), None, "application/json"),
+            ("invoice_layout", b"3", None, "text/plain"),
+        ])
+        service = mock.Mock()
+        application = self.running.server.application
+        with mock.patch.object(application, "reimbursement_service", service):
+            response = self.alice.request("POST", "/api/reimbursements/generate", body=body,
+                headers={"Content-Type": content_type, "Content-Length": str(len(body)),
+                         "X-CSRF-Token": self.alice.csrf_for("/api/reimbursements/generate")})
+        self.assertEqual(response.status, 400)
+        service.generate.assert_not_called()
+
+    def test_generation_route_rejects_invalid_invoice_pdf(self):
+        payload = {"date": "2026-09-08", "department": "ignored", "traveler": "ignored",
+                   "reason": "客户拜访", "days": 1, "allowance": 50, "rows": []}
+        body, content_type = multipart([
+            ("payload", json.dumps(payload), None, "application/json"),
+            ("invoices", b"not a pdf", "fake.pdf", "application/pdf"),
+        ])
+        service = mock.Mock()
+        application = self.running.server.application
+        with mock.patch.object(application, "reimbursement_service", service):
+            response = self.alice.request("POST", "/api/reimbursements/generate", body=body,
+                headers={"Content-Type": content_type, "Content-Length": str(len(body)),
+                         "X-CSRF-Token": self.alice.csrf_for("/api/reimbursements/generate")})
+        self.assertEqual(response.status, 400)
+        service.generate.assert_not_called()
+
+    def test_generation_route_accepts_more_than_one_hundred_invoice_pages(self):
+        payload = {"date": "2026-09-08", "department": "ignored", "traveler": "ignored",
+                   "reason": "客户拜访", "days": 1, "allowance": 50, "rows": []}
+        documents = []
+        for count in (51, 50):
+            writer = PdfWriter()
+            for _ in range(count):
+                writer.add_blank_page(width=420, height=297)
+            content = io.BytesIO()
+            writer.write(content)
+            documents.append(content.getvalue())
+        body, content_type = multipart([
+            ("payload", json.dumps(payload), None, "application/json"),
+            ("invoices", documents[0], "first.pdf", "application/pdf"),
+            ("invoices", documents[1], "second.pdf", "application/pdf"),
+        ])
+        service = mock.Mock()
+        application = self.running.server.application
+        service.generate.return_value = SimpleNamespace(
+            id="00000000-0000-0000-0000-000000000001", reimbursement_date="2026-09-08",
+            display_name="test.xlsx", reason="客户拜访", reimbursement_amount="0",
+            created_at="2026-09-08T00:00:00+00:00", deleted_at=None, payload_json=None,
+        )
+        with mock.patch.object(application, "reimbursement_service", service), \
+                mock.patch.object(application.license_service, "status", return_value=SimpleNamespace(tier="pro")):
+            response = self.alice.request("POST", "/api/reimbursements/generate", body=body,
+                headers={"Content-Type": content_type, "Content-Length": str(len(body)),
+                         "X-CSRF-Token": self.alice.csrf_for("/api/reimbursements/generate")})
+        self.assertEqual(response.status, 200)
+        service.generate.assert_called_once()
+
+    def test_free_generation_counts_pdf_pages_and_rejects_seventh_invoice(self):
+        payload = {"date": "2026-09-08", "department": "ignored", "traveler": "ignored",
+                   "reason": "客户拜访", "days": 1, "allowance": 50, "rows": []}
+        service = mock.Mock()
+        application = self.running.server.application
+        for count, expected_status in ((6, 200), (7, 403)):
+            with self.subTest(count=count):
+                writer = PdfWriter()
+                for _ in range(count):
+                    writer.add_blank_page(width=420, height=297)
+                pdf = io.BytesIO()
+                writer.write(pdf)
+                body, content_type = multipart([
+                    ("payload", json.dumps(payload), None, "application/json"),
+                    ("invoices", pdf.getvalue(), "combined.pdf", "application/pdf"),
+                ])
+                service.generate.return_value = SimpleNamespace(
+                    id="00000000-0000-4000-8000-000000000001", reimbursement_date="2026-09-08",
+                    display_name="test.xlsx", reason="客户拜访", reimbursement_amount="0",
+                    created_at="2026-09-08T00:00:00+00:00", deleted_at=None, payload_json=None,
+                )
+                service.generate.reset_mock()
+                with mock.patch.object(application, "reimbursement_service", service):
+                    response = self.alice.request("POST", "/api/reimbursements/generate", body=body,
+                        headers={"Content-Type": content_type, "Content-Length": str(len(body)),
+                                 "X-CSRF-Token": self.alice.csrf_for("/api/reimbursements/generate")})
+                self.assertEqual(response.status, expected_status, response.text)
+                if expected_status == 403:
+                    self.assertIn("普通用户每张报销单最多可导入 6 张发票", response.json()["error"])
+                    service.generate.assert_not_called()
+                else:
+                    service.generate.assert_called_once()
+
+    def test_free_expense_generation_rejects_seven_pdf_pages(self):
+        payload = {"form_type": "expense", "date": "2026-09-30", "department": "ignored",
+                   "traveler": "ignored", "rows": [{"project": "交通费", "summary": "车票", "amount": "10"}]}
+        writer = PdfWriter()
+        for _ in range(7):
+            writer.add_blank_page(width=420, height=297)
+        pdf = io.BytesIO()
+        writer.write(pdf)
+        body, content_type = multipart([
+            ("payload", json.dumps(payload), None, "application/json"),
+            ("invoices", pdf.getvalue(), "seven.pdf", "application/pdf"),
+        ])
+        service = mock.Mock()
+        with mock.patch.object(self.running.server.application, "reimbursement_service", service):
+            response = self.alice.request("POST", "/api/reimbursements/generate", body=body,
+                headers={"Content-Type": content_type, "Content-Length": str(len(body)),
+                         "X-CSRF-Token": self.alice.csrf_for("/api/reimbursements/generate")})
+        self.assertEqual(response.status, 403, response.text)
+        service.generate.assert_not_called()
+
+    def test_free_generation_counts_mixed_pdf_and_images(self):
+        payload = {"date": "2026-09-08", "department": "ignored", "traveler": "ignored",
+                   "reason": "客户拜访", "days": 1, "allowance": 50, "rows": []}
+        writer = PdfWriter()
+        for _ in range(5):
+            writer.add_blank_page(width=420, height=297)
+        pdf = io.BytesIO()
+        writer.write(pdf)
+        image = io.BytesIO()
+        Image.new("RGB", (64, 64), "white").save(image, format="PNG")
+        application = self.running.server.application
+        service = mock.Mock()
+        service.generate.return_value = SimpleNamespace(
+            id="00000000-0000-4000-8000-000000000001", reimbursement_date="2026-09-08",
+            display_name="test.xlsx", reason="客户拜访", reimbursement_amount="0",
+            created_at="2026-09-08T00:00:00+00:00", deleted_at=None, payload_json=None,
+        )
+        for image_count, status in ((1, 200), (2, 403)):
+            with self.subTest(image_count=image_count):
+                body, content_type = multipart([
+                    ("payload", json.dumps(payload), None, "application/json"),
+                    ("invoices", pdf.getvalue(), "five.pdf", "application/pdf"),
+                    *(("invoices", image.getvalue(), f"image-{index}.png", "image/png")
+                      for index in range(image_count)),
+                ])
+                service.generate.reset_mock()
+                with mock.patch.object(application, "reimbursement_service", service):
+                    response = self.alice.request("POST", "/api/reimbursements/generate", body=body,
+                        headers={"Content-Type": content_type, "Content-Length": str(len(body)),
+                                 "X-CSRF-Token": self.alice.csrf_for("/api/reimbursements/generate")})
+                self.assertEqual(response.status, status, response.text)
+                if status == 200:
+                    service.generate.assert_called_once()
+                else:
+                    service.generate.assert_not_called()
+
+    def test_invoice_inspection_returns_counts_for_pdf_pages_and_images(self):
+        writer = PdfWriter()
+        for _ in range(3):
+            writer.add_blank_page(width=420, height=297)
+        pdf = io.BytesIO()
+        writer.write(pdf)
+        image = io.BytesIO()
+        Image.new("RGB", (64, 64), "white").save(image, format="PNG")
+        body, content_type = multipart([
+            ("invoices", pdf.getvalue(), "three.pdf", "application/pdf"),
+            ("invoices", image.getvalue(), "one.png", "image/png"),
+        ])
+        path = "/api/invoices/inspect"
+        response = self.alice.request("POST", path, body=body,
+            headers={"Content-Type": content_type, "Content-Length": str(len(body)),
+                     "X-CSRF-Token": self.alice.csrf_for(path)})
+        self.assertEqual(response.status, 200, response.text)
+        self.assertEqual(response.json()["counts"], [3, 1])
 
     def test_generation_returns_committed_record_when_upload_cleanup_fails(self):
         service = self.running.server.application.reimbursement_service
@@ -878,14 +1312,14 @@ class WebReimbursementTest(unittest.TestCase):
         temporary = tempfile.TemporaryDirectory(dir=self.running.root)
         self.addCleanup(temporary.cleanup)
         upload_error = OSError("private upload write failure")
-        original_write_bytes = Path.write_bytes
+        original_open = Path.open
 
-        def write_bytes(path, data):
-            if path.parent == Path(temporary.name):
+        def open_upload(path, mode="r", *args, **kwargs):
+            if path.parent == Path(temporary.name) and mode == "xb":
                 raise upload_error
-            return original_write_bytes(path, data)
+            return original_open(path, mode, *args, **kwargs)
 
-        with mock.patch.object(Path, "write_bytes", write_bytes), \
+        with mock.patch.object(Path, "open", open_upload), \
             mock.patch.object(service, "generate", wraps=service.generate) as generate, \
             mock.patch("web.tempfile.TemporaryDirectory", return_value=temporary), \
             mock.patch.object(
@@ -906,8 +1340,10 @@ class WebReimbursementTest(unittest.TestCase):
     def test_generation_requires_user_role_current_session_and_csrf_before_parsing(self):
         service = mock.Mock()
         application = self.running.server.application
+        payload = {"date": "2026-09-08", "department": "ignored", "traveler": "ignored",
+                   "reason": "客户拜访", "days": 1, "allowance": 50, "rows": []}
         body, content_type = multipart([
-            ("payload", b"{}", None, "application/json"),
+            ("payload", json.dumps(payload), None, "application/json"),
         ])
         headers = {"Content-Type": content_type, "Content-Length": str(len(body))}
 
@@ -932,11 +1368,18 @@ class WebReimbursementTest(unittest.TestCase):
             )
         service.generate.assert_not_called()
 
-    def test_generation_enforces_multipart_body_limit_before_service(self):
+    def test_generation_does_not_apply_json_body_limit_to_multipart_uploads(self):
+        payload = {"date": "2026-09-08", "department": "ignored", "traveler": "ignored",
+                   "reason": "客户拜访", "days": 1, "allowance": 50, "rows": []}
         body, content_type = multipart([
-            ("payload", b"{}", None, "application/json"),
+            ("payload", json.dumps(payload), None, "application/json"),
         ])
         service = mock.Mock()
+        service.generate.return_value = SimpleNamespace(
+            id="00000000-0000-0000-0000-000000000001", reimbursement_date="2026-09-08",
+            display_name="test.xlsx", reason="客户拜访", reimbursement_amount="0",
+            created_at="2026-09-08T00:00:00+00:00", deleted_at=None, payload_json=None,
+        )
         application = self.running.server.application
         csrf = self.alice.csrf_for("/api/reimbursements/generate")
         headers = {
@@ -957,9 +1400,9 @@ class WebReimbursementTest(unittest.TestCase):
         finally:
             object.__setattr__(application.config, "max_body_bytes", original_limit)
 
-        self.assertEqual(response.status, 413)
+        self.assertEqual(response.status, 200, response.json())
         self.assertEqual(response.headers["Cache-Control"], "no-store")
-        service.generate.assert_not_called()
+        service.generate.assert_called_once()
 
     def test_upload_admission_bounds_body_buffering_to_generation_capacity(self):
         application = self.running.server.application
@@ -974,7 +1417,7 @@ class WebReimbursementTest(unittest.TestCase):
         peak = 0
         user = SimpleNamespace(user_id=self.alice_id, role="user")
 
-        def block_body_buffering(_handler):
+        def block_body_buffering(_handler, _directory):
             nonlocal active, peak
             with count_lock:
                 active += 1
@@ -1045,7 +1488,7 @@ class WebReimbursementTest(unittest.TestCase):
         with mock.patch.object(
             application,
             "_multipart_body",
-            return_value=b"not multipart",
+            side_effect=ValueError("invalid multipart body"),
         ):
             application._reimbursement_generate(invalid_handler, user, None)
         self.assertTrue(slots.acquire(blocking=False))
@@ -1071,7 +1514,9 @@ class WebReimbursementTest(unittest.TestCase):
         with mock.patch.object(
             application,
             "_multipart_body",
-            return_value=body,
+            return_value=__import__("multipart_upload").UploadParts(
+                json.dumps(payload).encode(), [], []
+            ),
         ), mock.patch.object(application, "reimbursement_service", service):
             application._reimbursement_generate(failing_handler, user, None)
         self.assertTrue(slots.acquire(blocking=False))

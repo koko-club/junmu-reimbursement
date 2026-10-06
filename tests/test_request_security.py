@@ -355,7 +355,7 @@ class RequestSecurityTest(unittest.TestCase):
 
     def test_password_reset_response_secret_never_appears_in_logs(self):
         admin, session = self.admin_session()
-        pending = self.running.users.register("alice", USER_PASSWORD, "Private Name", "Private Department")
+        pending = self.running.users.register("alice", USER_PASSWORD, "张三", "技术部")
         user = self.running.users.approve(admin.id, pending.id)
         response = self.client.request(
             "POST", f"/api/admin/users/{user.id}/reset-password", body=b"{}",
@@ -372,7 +372,7 @@ class RequestSecurityTest(unittest.TestCase):
 
     def test_password_reset_revocation_failure_does_not_leak_domain_traceback(self):
         admin, session = self.admin_session()
-        pending = self.running.users.register("alice", USER_PASSWORD, "Private Name", "Private Department")
+        pending = self.running.users.register("alice", USER_PASSWORD, "张三", "技术部")
         user = self.running.users.approve(admin.id, pending.id)
         with mock.patch.object(
             self.running.users, "_revoke_sessions",

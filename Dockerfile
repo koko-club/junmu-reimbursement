@@ -1,5 +1,7 @@
 FROM python:3.12-slim-bookworm
 
+ARG APP_VERSION
+
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     HOME=/tmp/app-home \
@@ -20,9 +22,15 @@ RUN apt-get update \
     && chmod 1777 /tmp/app-home
 
 WORKDIR /app
+LABEL org.opencontainers.image.version="${APP_VERSION}"
 COPY requirements.txt requirements-test.txt ./
 RUN python -m pip install --no-cache-dir -r requirements.txt -r requirements-test.txt
-COPY . .
+COPY VERSION config.json app.py backup.py config.py database.py generator.py invoice_pdf.py license.py license_service.py multipart_upload.py office.py permissions.py reimbursements.py security.py sessions.py users.py validation.py web.py ./
+COPY resources/差旅报销单模板.xlsx resources/费用报销单模板.xlsx ./resources/
+COPY templates/admin.html templates/change-password.html templates/history.html templates/index.html templates/login.html templates/register.html templates/setup.html templates/profile.html ./templates/
+COPY static/admin.js static/app.js static/auth.js static/calendar.css static/calendar.js static/common.js static/favicon.png static/history.js static/icons.svg static/invoice-jpg.svg static/invoice-png.svg static/invoice-pdf.svg static/logo.png static/mileage-development-qr.jpg static/pro-upgrade-payment-qr.jpg static/profile.css static/profile.js static/sidebar.js static/styles.css static/ui-components.css static/ui-tokens.css ./static/
+COPY scripts/reset-license-clock.py ./scripts/
+RUN chmod -R a+rX,go-w /app
 USER app
 EXPOSE 8800
 CMD ["python", "app.py"]

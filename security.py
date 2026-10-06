@@ -79,8 +79,8 @@ class PasswordHasher:
 
     @staticmethod
     def _password_bytes(password: str) -> bytes:
-        if not isinstance(password, str) or not 8 <= len(password) <= 128:
-            raise ValueError("password must contain 8 to 128 Unicode characters")
+        if not isinstance(password, str) or not 6 <= len(password) <= 128:
+            raise ValueError("password must contain 6 to 128 Unicode characters")
         return password.encode("utf-8")
 
     @staticmethod

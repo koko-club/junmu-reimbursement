@@ -3,8 +3,11 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>注册</title>
+  <title>在线报销系统</title>
+  <link rel="icon" type="image/png" href="/static/favicon.png">
   <link rel="stylesheet" href="/static/styles.css">
+  <link rel="stylesheet" href="/static/ui-tokens.css">
+  <link rel="stylesheet" href="/static/ui-components.css">
 </head>
 <body class="auth-body" data-csrf="__CSRF_TOKEN__">
   <main class="auth-shell">
@@ -12,15 +15,20 @@
       <header class="auth-header"><p class="eyebrow">差旅报销系统</p><h1>立即注册</h1><p>注册后需管理员审批，通过后才可登录。</p></header>
       <form class="auth-form" data-auth-form data-endpoint="/api/register" novalidate>
         <label for="username">账号</label>
-        <input id="username" name="username" type="text" autocomplete="username" required maxlength="64">
+        <input id="username" name="username" type="text" autocomplete="username" required maxlength="50" aria-describedby="username-error">
+        <span id="username-error" class="field-error" data-field-error="username" aria-live="polite"></span>
         <label for="password">密码</label>
-        <input id="password" name="password" type="password" autocomplete="new-password" required>
+        <input id="password" name="password" type="password" autocomplete="new-password" required minlength="6" maxlength="128" aria-describedby="password-error">
+        <span id="password-error" class="field-error" data-field-error="password" aria-live="polite"></span>
         <label for="confirm-password">确认密码</label>
-        <input id="confirm-password" name="confirm_password" type="password" autocomplete="new-password" required>
+        <input id="confirm-password" name="confirm_password" type="password" autocomplete="new-password" required aria-describedby="confirm-password-error">
+        <span id="confirm-password-error" class="field-error" data-field-error="confirm_password" aria-live="polite"></span>
         <label for="real-name">姓名</label>
-        <input id="real-name" name="real_name" type="text" autocomplete="name" required maxlength="100">
+        <input id="real-name" name="real_name" type="text" autocomplete="name" required maxlength="100" aria-describedby="real-name-error">
+        <span id="real-name-error" class="field-error" data-field-error="real_name" aria-live="polite"></span>
         <label for="department">部门</label>
-        <input id="department" name="department" type="text" autocomplete="organization" required maxlength="100">
+        <input id="department" name="department" type="text" autocomplete="organization" required maxlength="100" aria-describedby="department-error">
+        <span id="department-error" class="field-error" data-field-error="department" aria-live="polite"></span>
         <p class="form-message" data-message aria-live="polite"></p>
         <button type="submit">提交注册</button>
       </form>

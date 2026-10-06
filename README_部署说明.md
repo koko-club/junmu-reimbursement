@@ -1,10 +1,32 @@
 # 在线报销系统部署说明
 
-当前版本：`v1.0.1`。版本变更记录见 [`CHANGELOG.md`](CHANGELOG.md)，版本号记录在 [`VERSION`](VERSION)。
+当前版本：`v1.1.0`。版本变更记录见 [`CHANGELOG.md`](CHANGELOG.md)，版本号记录在 [`VERSION`](VERSION)。
 
 适用于 macOS 本地运行和群晖 DS925+ 的 DSM Container Manager，群晖镜像平台为 `linux/amd64`。默认端口 `8800`，仅在可信局域网部署，不做公网端口转发。
 
 首次访问 `/setup` 创建管理员；普通用户注册后由管理员审批。每位用户只能访问自己的报销记录，删除后进入回收站，保留 30 天。首次管理员创建应由部署人员在开放局域网访问前完成。首次访问根地址会引导进入初始化页面。
+
+## Pro 离线授权
+
+每个账号有独立的随机序列号。用户在“个人中心 → Pro 授权”复制序列号并发给授权人。授权人在自己的 Mac 上确认付款后，在完整项目目录执行：
+
+```sh
+.venv/bin/python scripts/issue-license.py 用户的32位序列号
+```
+
+命令输出一行授权码。将授权码发给该用户，由用户在个人中心粘贴并点击“验证并导入”。只有对应序列号的账号能使用该码；每次授权自 **Mac 签发时刻**起有效 365 天。到期后自动显示为普通用户，续期时为同一序列号重新签发并导入新码。提前续期也从新签发时刻起算，剩余天数不叠加。首次签发前，应完成下文的 Python 依赖安装。
+
+如需把签发工具复制到其他目录，可在完整项目目录执行 `.venv/bin/python scripts/package-license-issuer.py`，生成 `dist/pro-license-issuer-macos-arm64.zip`。解压后无论当前终端在哪个目录，均可运行 `sh "/解压路径/pro-license-issuer-macos-arm64/issue-license.command" 用户的32位序列号`。ZIP 内附带签发私钥和所需的第三方模块，目标 Mac 仍需安装 Python 3.12；具体用法见 ZIP 内的 `README.txt`。**该 ZIP 等同于签发凭据，仅供授权人保管，不要发送给被授权用户。**
+
+签发私钥原件保存在这台 Mac 的 `~/Library/Application Support/JunmuReimbursement/issuer-private.pem`，权限为 `0600`；签发工具 ZIP 会包含其副本，应用只内置对应公钥。请安全备份私钥和签发工具 ZIP，不要把它们放进项目源码、Docker 镜像、群晖部署目录或发给用户。丢失全部私钥副本后，旧公钥无法验证新密钥签发的授权码，需要更新应用公钥。
+
+Pro 状态由服务器按签名和服务器 UTC 时间计算；用户修改浏览器所在电脑的时间不会改变授权。服务器发现时间比上次记录回退超过 5 分钟时暂停 Pro 状态。先校准服务器时间；如果服务器之前曾误设为未来时间，校准后仍提示回退，停服并备份数据，再由部署人员执行：
+
+```sh
+sudo docker compose run --rm --no-deps -T junmu-reimbursement python scripts/reset-license-clock.py 用户的32位序列号
+```
+
+macOS 本地运行时可用 `.venv/bin/python scripts/reset-license-clock.py 用户的32位序列号 --data-dir data`。完成后重新启动服务。纯离线部署无法彻底防止具有服务器管理员权限的人修改程序、恢复旧数据库或复制整套安装。普通用户每张报销单最多导入 6 张发票，可查看最近 6 个月的记录；Pro 用户可解除这些限制，并使用报销统计与出差趋势看板。授权到期或服务器检测到时间回退时，账号恢复普通用户权限。
 
 ## macOS 本地运行
 
@@ -16,7 +38,7 @@ python3.12 -m venv .venv
 sh start_reimbursement_tool.sh --open-browser
 ```
 
-也可双击 `start_reimbursement_tool.command`；如被系统阻止，用右键“打开”。启动器优先使用项目 `.venv`，检查 Python 版本、openpyxl 和 Pillow，等待健康检查成功后打开 [本机页面](http://127.0.0.1:8800)。终端保持打开，按 Ctrl+C 停服。依赖版本锁定在 `requirements.txt`。
+也可双击 `start_reimbursement_tool.command`；如被系统阻止，用右键“打开”。启动器优先使用项目 `.venv`，检查 Python 版本及 `requirements.txt` 中的依赖，等待健康检查成功后打开 [本机页面](http://127.0.0.1:8800)。终端保持打开，按 Ctrl+C 停服。依赖版本锁定在 `requirements.txt`。
 
 LibreOffice 通常位于 `/Applications/LibreOffice.app/Contents/MacOS/soffice`。发现失败时明确指定：
 
@@ -32,17 +54,17 @@ APP_SOFFICE_PATH=/Applications/LibreOffice.app/Contents/MacOS/soffice sh start_r
 
 ```sh
 sh scripts/build-docker.sh
-docker image inspect --format '{{.Os}}/{{.Architecture}}' reimbursement-system:latest
-docker run --rm --platform linux/amd64 -e REQUIRE_PDF_TESTS=1 reimbursement-system:latest sh -c 'python -m pip install --user -r requirements-test.txt && python -m unittest tests.test_docker_assets tests.test_pdf_regression -v'
+docker image inspect --format '{{.Os}}/{{.Architecture}}' junmu-reimbursement:v1.1.0
+docker run --rm --platform linux/amd64 -e REQUIRE_PDF_TESTS=1 junmu-reimbursement:v1.1.0 sh -c 'python -m pip install --user -r requirements-test.txt && python -m unittest tests.test_docker_assets tests.test_end_to_end -v'
 sh scripts/export-docker.sh
 sh scripts/package-synology.sh
 ```
 
 强制容器验收要求非 root、amd64、LibreOffice、Noto 中文字体和真实 PDF 测试，缺少组件必须失败。此检查需要访问 Python 包源以安装测试依赖；生产启动不需要联网。构建及 PDF 验收成功才可认定镜像可交付。
 
-输出为 `dist/reimbursement-system-linux-amd64.tar.gz` 和 `dist/reimbursement-system-synology.tar.gz`。交付包包含镜像、`compose.yaml`、`.env.example`、`scripts/backup.sh`、备份/恢复工具及本说明。已有同名归档会报错；请改名保留旧版本后重新执行。群晖包的脚本仍在 `scripts/` 中，不要移到根目录。
+输出为 `dist/junmu-reimbursement-v1.1.0-linux-amd64.tar.gz` 和 `dist/junmu-reimbursement-v1.1.0-synology.tar.gz`。交付包包含镜像、`compose.yaml`、`.env.example`、`scripts/backup.sh`、`scripts/release-vars.sh`、备份/恢复工具及本说明。已有同名归档会报错；请改名保留旧版本后重新执行。群晖包的脚本仍在 `scripts/` 中，不要移到根目录。
 
-没有 Docker 的机器可先制作 `dist/reimbursement-system-source.tar.gz`：
+没有 Docker 的机器可先制作 `dist/junmu-reimbursement-v1.1.0-source.tar.gz`：
 
 ```sh
 sh scripts/package-synology.sh --source
@@ -52,47 +74,48 @@ sh scripts/package-synology.sh --source
 
 ## 群晖 DSM Container Manager
 
-1. 安装 Container Manager。解压群晖交付包，将内容放到 `/volume1/docker/reimbursement`，保留 `scripts/` 子目录。
-2. 在 File Station 创建 `/volume1/docker/reimbursement/data` 与 `/volume1/docker/reimbursement/backups`。不要把数据目录放进容器的可写层。
+1. 安装 Container Manager。解压群晖交付包，将内容放到 `/volume1/docker/baoxiao`，保留 `scripts/` 子目录。
+2. 在 File Station 创建 `/volume1/docker/baoxiao/data` 与 `/volume1/docker/baoxiao/backups`。不要把数据目录放进容器的可写层。
 3. SSH 登录 NAS，用 `id 部署用户名` 查询 uid/gid，复制 `.env.example` 为 `.env`，填写真实值：
 
 ```dotenv
 PUID=1026
 PGID=100
-DATA_PATH=/volume1/docker/reimbursement/data
-BACKUP_PATH=/volume1/docker/reimbursement/backups
+APP_VERSION=v1.1.0
+DATA_PATH=/volume1/docker/baoxiao/data
+BACKUP_PATH=/volume1/docker/baoxiao/backups
 ```
 
 上面的 1026/100 只是示例，以 `id` 输出为准。两个目录必须不同且不能相互包含。首次部署为这两个新建目录赋予容器用户权限（替换 uid/gid）：
 
 ```sh
-sudo chown 1026:100 /volume1/docker/reimbursement/data /volume1/docker/reimbursement/backups
-sudo chmod 700 /volume1/docker/reimbursement/data /volume1/docker/reimbursement/backups
+sudo chown 1026:100 /volume1/docker/baoxiao/data /volume1/docker/baoxiao/backups
+sudo chmod 700 /volume1/docker/baoxiao/data /volume1/docker/baoxiao/backups
 ```
 
-4. Container Manager 的“映像 → 新增 → 从文件添加”选择 `reimbursement-system-linux-amd64.tar.gz`。若 DSM 版本不接受 gzip，先解压为 `.tar` 再导入。导入后确认标签 `reimbursement-system:latest`。SSH 的等效命令：
+4. Container Manager 的“映像 → 新增 → 从文件添加”选择 `junmu-reimbursement-v1.1.0-linux-amd64.tar.gz`。若 DSM 版本不接受 gzip，先解压为 `.tar` 再导入。导入后确认标签 `junmu-reimbursement:v1.1.0`。SSH 的等效命令：
 
 ```sh
-cd /volume1/docker/reimbursement
-gzip -dc reimbursement-system-linux-amd64.tar.gz | sudo docker load
+cd /volume1/docker/baoxiao
+gzip -dc junmu-reimbursement-v1.1.0-linux-amd64.tar.gz | sudo docker load
 sudo docker compose config
 sudo docker compose up -d --wait --wait-timeout 120
 ```
 
 5. 可在 Container Manager“项目”里选择现有目录及 `compose.yaml` 创建项目；确保读取同目录 `.env`。开放 DSM 防火墙 TCP 8800，仅允许办公网段访问。访问 `http://NAS局域网IP:8800`，由部署人员完成首次管理员初始化后再交给用户。
 
-Compose 固定服务名 `reimbursement`，映射 `8800:8800`，重启策略 `unless-stopped`，通过 `/api/health` 检查服务。默认使用局域网 HTTP，所以 `APP_COOKIE_SECURE=false`。此部署说明不涵盖公网接入。
+Compose 固定服务名 `junmu-reimbursement`，容器名 `junmu-reimbursement-v1.1.0`，映射 `8800:8800`，重启策略 `unless-stopped`，通过 `/healthz` 检查服务。默认使用局域网 HTTP，所以 `APP_COOKIE_SECURE=false`。此部署说明不涵盖公网接入。
 
 ## 停服备份
 
 `data/database/app.db` 保存账户、会话、配置和文件归属，`data/app-secret` 保存原始 32 字节密钥，`data/users/用户ID/记录UUID/` 保存 Excel/PDF。必须一起备份，不可只复制 SQLite 主文件或重新生成密钥。
 
 ```sh
-cd /volume1/docker/reimbursement
+cd /volume1/docker/baoxiao
 sudo sh scripts/backup.sh
 ```
 
-脚本停止 `reimbursement`，运行一次 `python backup.py --data-dir /data --backup-dir /backups`，退出时无论备份成功或失败都重启服务并等待健康检查。任务调度器可定期执行该命令；避免同时启动两个备份任务。运行期间不要通过其他进程或共享目录写入数据。
+脚本停止 `junmu-reimbursement`，运行一次 `python backup.py --data-dir /data --backup-dir /backups`，退出时无论备份成功或失败都重启服务并等待健康检查。任务调度器可定期执行该命令；避免同时启动两个备份任务。运行期间不要通过其他进程或共享目录写入数据。
 
 输出 `backups/reimbursement-UTC时间.tar.gz`，权限为 0600。工具通过 SQLite backup API 建立一致数据库快照，再收入数据库登记的正常记录和回收站文件、密钥以及 `manifest.json` 的 SHA256 清单。归档原子发布且不覆盖旧归档。未登记的生成孤儿、临时文件、无数据清理墓碑不收入归档。
 
@@ -105,13 +128,13 @@ sudo sh scripts/backup.sh
 先校验归档，校验包括 SHA256、路径、普通文件类型、数据库完整性与文件归属；禁止直接对未校验的归档执行 `tar -x`。恢复必须停服并使用尚不存在的新目录，工具不会合并或覆盖现有数据。以下从备份恢复到当前数据挂载点中的 `restored` 子目录：
 
 ```sh
-cd /volume1/docker/reimbursement
-sudo docker compose stop reimbursement
-sudo docker compose run --rm --no-deps -T reimbursement python backup.py --verify /backups/reimbursement-20260909T080706Z.tar.gz
-sudo docker compose run --rm --no-deps -T reimbursement python backup.py --restore /backups/reimbursement-20260909T080706Z.tar.gz --data-dir /data/restored
+cd /volume1/docker/baoxiao
+sudo docker compose stop junmu-reimbursement
+sudo docker compose run --rm --no-deps -T junmu-reimbursement python backup.py --verify /backups/reimbursement-20260909T080706Z.tar.gz
+sudo docker compose run --rm --no-deps -T junmu-reimbursement python backup.py --restore /backups/reimbursement-20260909T080706Z.tar.gz --data-dir /data/restored
 ```
 
-将示例归档名替换为真实文件名。任一步失败都保留原数据，先检查错误再决定是否重启旧服务。成功后将 `.env` 的 `DATA_PATH` 改为 `/volume1/docker/reimbursement/data/restored`，原目录保留作回滚；后续恢复应选择另一个不存在的路径。备份目录仍设为 `/volume1/docker/reimbursement/backups`。
+将示例归档名替换为真实文件名。任一步失败都保留原数据，先检查错误再决定是否重启旧服务。成功后将 `.env` 的 `DATA_PATH` 改为 `/volume1/docker/baoxiao/data/restored`，原目录保留作回滚；后续恢复应选择另一个不存在的路径。备份目录仍设为 `/volume1/docker/baoxiao/backups`。
 
 ```sh
 sudo docker compose up -d --force-recreate --wait --wait-timeout 120
@@ -121,14 +144,31 @@ sudo docker compose up -d --force-recreate --wait --wait-timeout 120
 
 ## 升级与回滚
 
-升级前先运行停服备份并记录归档名，保留旧镜像标签，例如 `docker tag reimbursement-system:latest reimbursement-system:previous`。导入新镜像后执行 `docker compose up -d --force-recreate --wait --wait-timeout 120`。确认账户、历史和 PDF 生成正常后再清理旧镜像。
+升级前先运行停服备份并记录归档名，保留旧版本镜像标签。导入新镜像后，在版本发布目录中将 `.env` 的 `APP_VERSION` 改为该交付版本，先执行 `docker compose down --remove-orphans` 停掉同名固定项目，再执行 `docker compose up -d --force-recreate --wait --wait-timeout 120`。确认账户、历史和 PDF 生成正常后再清理旧镜像。
 
-回滚时停服，把 `reimbursement-system:previous` 重新标记为 `reimbursement-system:latest`。若新版本已迁移数据库，必须按上节恢复升级前的整份备份到新目录并更新 `DATA_PATH`，再启动旧镜像；不要让旧程序直接读写已升级的数据库。
+### 从 v1.0.1 升级
+
+`v1.0.1` 使用目录推导的 Compose 项目名和服务名 `reimbursement`，`v1.0.2` 改用固定项目/服务名 `junmu-reimbursement`。第一次切换不能直接在新发布目录执行 `up`，否则旧容器可能继续占用 8800。以下前三条命令必须在仍保留 `v1.0.1` `compose.yaml` 的旧版目录中执行；若旧版由 DSM 项目界面创建或指定过自定义项目名，应在 Container Manager 中停止并删除对应旧项目。
+
+```sh
+cd /volume1/docker/baoxiao  # 旧版目录，按实际位置修改
+sudo docker compose stop reimbursement
+sudo docker compose run --rm --no-deps -T reimbursement python backup.py --data-dir /data --backup-dir /backups
+sudo docker compose run --rm --no-deps -T reimbursement python backup.py --verify /backups/reimbursement-20260912T120000Z.tar.gz
+sudo docker compose down --remove-orphans
+sudo docker ps --filter publish=8800 --format '{{.Names}} {{.Ports}}'
+cd /volume1/docker/baoxiao/releases/v1.0.2
+sudo docker compose up -d --force-recreate --wait --wait-timeout 120
+```
+
+把示例归档名替换为备份命令刚生成的真实文件名。备份或校验任一步失败都停止操作，不执行 `down`。端口检查必须没有输出；如仍有容器占用 8800，视为切换失败，停止操作并确认旧项目身份，不要强行启动新项目。固定数据和备份目录保持不变。
+
+回滚时停服，将 `.env` 的 `APP_VERSION` 改回保留的旧版本标签。若新版本已迁移数据库，必须按上节恢复升级前的整份备份到新目录并更新 `DATA_PATH`，再启动旧镜像；不要让旧程序直接读写已升级的数据库。
 
 ## 排查
 
-- 页面打不开：执行 `docker compose ps`、`docker compose logs --tail 100 reimbursement`，检查 8800 是否冲突、NAS IP、DSM 防火墙及是否处于同一局域网。
-- 容器不健康：检查 `/api/health` 和日志；Compose 版本需支持 `up --wait`。旧 DSM 插件不支持时应更新 Container Manager 后再使用自动备份脚本。
+- 页面打不开：执行 `docker compose ps`、`docker compose logs --tail 100 junmu-reimbursement`，检查 8800 是否冲突、NAS IP、DSM 防火墙及是否处于同一局域网。
+- 容器不健康：检查 `/healthz` 和日志；Compose 版本需支持 `up --wait`。旧 DSM 插件不支持时应更新 Container Manager 后再使用自动备份脚本。
 - 权限不足：核对 `.env` 的 PUID/PGID 与数据/备份目录所有者及 DSM ACL。不要使用 `chmod 777`；不要把容器改为 root 来绕过问题。
 - PDF 缺字或生成失败：检查 LibreOffice 与 Noto 中文字体，执行上面的强制容器 PDF 测试；镜像中转换路径固定为 `/usr/bin/soffice`。
 - 用户无法登录：待审批或已停用账户需管理员处理。普通用户新登录会使其旧会话失效；重置密码后需更改临时密码。

@@ -217,6 +217,7 @@ class ServerTest(unittest.TestCase):
                 },
             )
             csrf = running.client.csrf_for("/api/login")
+            self._wait_for_active(running.server, 0)
             running.server.set_request_limits(timeout_seconds=0.1, max_concurrent_requests=1)
             initial = (
                 b"POST /api/login HTTP/1.1\r\n"
@@ -571,14 +572,15 @@ class FrontendContractTest(unittest.TestCase):
         cls.css = (cls.project / "static" / "styles.css").read_text(encoding="utf-8")
 
     def test_html_has_required_controls_and_exactly_eleven_detail_rows(self):
-        for field in ("date", "department", "traveler", "reason", "days", "allowance", "screenshots", "submit", "result", "error", "detail-rows"):
+        for field in ("date", "department", "traveler", "reason", "days", "allowance", "invoice-input", "submit", "result", "error", "detail-rows"):
             self.assertRegex(self.html, rf"(?:id|name)=\"{field}\"")
         self.assertEqual(self.html.count('class="detail-row"'), 11)
         for field in ("date", "origin", "destination", "transport", "public_amount", "mileage", "toll", "lodging", "receipts"):
             self.assertIn(f' data-field="{field}"', self.html)
-        self.assertIn("生成 Excel + PDF", self.html)
-        self.assertIn('accept=".jpg,.jpeg,.png,image/jpeg,image/png"', self.html)
-        self.assertRegex(self.html, r'<label[^>]+for="screenshots"[^>]*>')
+        self.assertIn('<button id="submit" type="submit">生成 PDF</button>', self.html)
+        self.assertIn('accept=".pdf,application/pdf,.jpg,.jpeg,.png,image/jpeg,image/png"', self.html)
+        self.assertIn('id="invoice-dropzone"', self.html)
+        self.assertIn('id="invoice-select"', self.html)
         self.assertIn('id="date" name="date" type="date"', self.html)
         self.assertNotRegex(self.html, r'<input id="date"[^>]*\brequired\b')
         for row_number in range(1, 12):
@@ -590,10 +592,9 @@ class FrontendContractTest(unittest.TestCase):
         self.assertNotRegex(self.html, r'<input data-field="date"[^>]*\bvalue="')
 
     def test_javascript_collects_rows_validates_and_posts_multipart(self):
-        for token in ("FormData", "append('payload'", "append('screenshots'", "detail-rows", "11", "days", "allowance", "非负", "必填", "disabled", "xlsx_url", "pdf_url", "revokeObjectURL", "createElement('a'", "normalizeDateInput", "target", "_blank", "noopener"):
+        for token in ("FormData", "append('payload'", "append('invoices'", "detail-rows", "11", "days", "allowance", "非负", "必填", "disabled", "pdf_url", "addEventListener('drop'", "createElement('a'", "normalizeDateInput", "target", "_blank", "noopener"):
             self.assertIn(token, self.js)
         self.assertRegex(self.js, r"querySelectorAll\([^)]*detail-row")
-        self.assertRegex(self.js, r"entry\[0\]\s*===\s*['\"]pdf_url['\"]")
         self.assertNotIn("new Date", self.js)
         self.assertNotIn("result.innerHTML", self.js)
         self.assertNotIn("validDate", self.js)

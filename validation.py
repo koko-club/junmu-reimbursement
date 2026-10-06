@@ -80,6 +80,19 @@ def _detail(row: Any, index: int) -> dict:
     return normalized
 
 
+def _expense_detail(row: Any, index: int) -> dict:
+    if not isinstance(row, dict):
+        raise ValidationError(f"row {index} must be an object")
+    if not any(value not in (None, "") for value in row.values()):
+        return {}
+    project = _text(row.get("project"), f"row {index} project", required=True)
+    summary = _text(row.get("summary"), f"row {index} summary", required=True)
+    amount = _number(row.get("amount"), f"row {index} amount")
+    if Decimal(str(amount)).as_tuple().exponent < -2:
+        raise ValidationError(f"row {index} amount must have at most two decimal places")
+    return {"project": project, "summary": summary, "amount": amount}
+
+
 def validate_payload(
     raw: dict,
     *,
@@ -91,6 +104,27 @@ def validate_payload(
         raise ValidationError("payload must be an object")
     trusted_traveler = raw.get("traveler") if traveler is _UNSET else traveler
     trusted_department = raw.get("department") if department is _UNSET else department
+    form_type = raw.get("form_type", "travel")
+    if form_type not in ("travel", "expense"):
+        raise ValidationError("form_type is invalid")
+    if form_type == "expense":
+        date = _date(raw.get("date"), "date")
+        if not date:
+            raise ValidationError("date is required")
+        rows = raw.get("rows", [])
+        if not isinstance(rows, list) or len(rows) > 11:
+            raise ValidationError("rows must contain at most 11 detail rows")
+        normalized_rows = [_expense_detail(row, index + 1) for index, row in enumerate(rows)]
+        if not any(normalized_rows):
+            raise ValidationError("at least one expense row is required")
+        normalized_rows.extend({} for _ in range(11 - len(normalized_rows)))
+        return {
+            "form_type": "expense",
+            "date": date,
+            "department": _text(trusted_department, "department", required=True),
+            "traveler": _text(trusted_traveler, "traveler", required=True),
+            "rows": normalized_rows,
+        }
     result = {
         "date": _date(raw.get("date"), "date"),
         "department": _text(trusted_department, "department", required=True),
@@ -120,7 +154,28 @@ def validate_image_filename(filename: str) -> str:
     return filename
 
 
-def safe_output_stem(date_text: str, traveler: str) -> str:
+def validate_invoice_filename(filename: str) -> str:
+    """Return a safe PDF invoice filename or raise ValidationError."""
+    if not isinstance(filename, str) or not filename or "/" in filename or "\\" in filename:
+        raise ValidationError("invalid invoice filename")
+    if any(ord(char) < 32 or ord(char) == 127 for char in filename):
+        raise ValidationError("invalid invoice filename")
+    if not filename.lower().endswith(".pdf"):
+        raise ValidationError("仅支持 PDF 发票文件")
+    return filename
+
+
+def validate_invoice_upload_filename(filename: str) -> str:
+    """Accept a source PDF or a single invoice image at the upload boundary."""
+    if isinstance(filename, str) and filename.lower().endswith(".pdf"):
+        return validate_invoice_filename(filename)
+    try:
+        return validate_image_filename(filename)
+    except ValidationError:
+        raise ValidationError("仅支持 PDF、JPG 或 PNG 发票文件") from None
+
+
+def safe_output_stem(date_text: str, traveler: str, form_type: str = "travel") -> str:
     """Return a filesystem-safe, meaningful reimbursement workbook stem."""
     def clean(value: Any, fallback: str) -> str:
         value = str(value) if value is not None else ""
@@ -131,9 +186,8 @@ def safe_output_stem(date_text: str, traveler: str) -> str:
         return value or fallback
 
     prefix = f"{clean(date_text, '未知日期')}-{clean(traveler, '未命名')}"
-    available_bytes = MAX_OUTPUT_STEM_UTF8_BYTES - len(
-        _OUTPUT_STEM_SUFFIX.encode("utf-8")
-    )
+    suffix = "-费用报销单" if form_type == "expense" else _OUTPUT_STEM_SUFFIX
+    available_bytes = MAX_OUTPUT_STEM_UTF8_BYTES - len(suffix.encode("utf-8"))
     bounded_prefix: list[str] = []
     used_bytes = 0
     for character in prefix:
@@ -145,4 +199,4 @@ def safe_output_stem(date_text: str, traveler: str) -> str:
             break
         bounded_prefix.append(character)
         used_bytes += len(encoded)
-    return "".join(bounded_prefix).rstrip() + _OUTPUT_STEM_SUFFIX
+    return "".join(bounded_prefix).rstrip() + suffix

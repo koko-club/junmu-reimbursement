@@ -1,0 +1,122 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>在线报销系统</title>
+  <link rel="icon" type="image/png" href="/static/favicon.png">
+  <script src="/static/sidebar.js?v=20261001-release-notes-onboarding"></script>
+  <link rel="stylesheet" href="/static/styles.css?v=20260930-personal-center">
+  <link rel="stylesheet" href="/static/ui-tokens.css">
+  <link rel="stylesheet" href="/static/ui-components.css?v=20261001-release-notes">
+  <link rel="stylesheet" href="/static/profile.css?v=20261001-pro-payment">
+</head>
+<body class="app-body" data-csrf="__CSRF_TOKEN__">
+  <aside id="app-sidebar" class="app-sidebar" aria-label="主导航">
+    <div class="brand"><img class="brand-logo" src="/static/logo.png" alt="" aria-hidden="true"><span>君牧在线报销系统</span></div>
+    <nav><a href="/" aria-label="填写报销"><svg class="ui-icon" aria-hidden="true"><use href="/static/icons.svg#file-pen"></use></svg><span>填写报销</span></a><a href="/history" aria-label="报销记录"><svg class="ui-icon" aria-hidden="true"><use href="/static/icons.svg#history"></use></svg><span>报销记录</span></a><a href="/trash" aria-label="回收站"><svg class="ui-icon" aria-hidden="true"><use href="/static/icons.svg#trash-2"></use></svg><span>回收站</span></a><a href="/profile" aria-label="个人中心" aria-current="page"><svg class="ui-icon" aria-hidden="true"><use href="/static/icons.svg#user-round"></use></svg><span>个人中心</span></a></nav>
+    <div class="sidebar-account" aria-live="polite"><span>当前登录：</span><strong id="current-user">加载中</strong></div>
+    <div class="sidebar-version">版本：<button id="version-details-trigger" class="version-details-trigger" type="button" aria-haspopup="dialog" aria-controls="version-details-dialog" aria-label="查看版本更新详情"><span id="app-version">__APP_VERSION__</span></button></div>
+    <button id="logout" type="button" class="secondary" aria-label="退出登录"><svg class="ui-icon" aria-hidden="true"><use href="/static/icons.svg?v=20261001-collapse#log-out"></use></svg><span>退出登录</span></button>
+  </aside>
+  <button id="sidebar-toggle" class="sidebar-toggle" type="button" aria-controls="app-sidebar" aria-expanded="false">菜单</button>
+  <button id="sidebar-collapse" class="sidebar-collapse" type="button" aria-controls="app-sidebar" aria-expanded="false" aria-label="展开侧边栏"><svg class="ui-icon" aria-hidden="true"><use href="/static/icons.svg?v=20261001-double-chevron#chevrons-right"></use></svg></button>
+  <main class="page-shell profile-page">
+    <header class="page-header"><h1><svg class="ui-icon ui-icon-title" aria-hidden="true"><use href="/static/icons.svg#user-round"></use></svg><span>个人中心</span></h1><p>管理账户资料，查看自己的出差天数。</p></header>
+    <div class="profile-cards">
+      <section class="form-section profile-section" aria-labelledby="profile-heading">
+        <div class="section-heading"><h2 id="profile-heading">账户资料</h2><span id="profile-status" class="profile-status">加载中</span></div>
+        <form id="profile-form" novalidate>
+          <div class="profile-fields">
+            <label for="profile-username">账号<input id="profile-username" name="username" readonly autocomplete="username"></label>
+            <label for="profile-real-name">姓名<input id="profile-real-name" name="real_name" maxlength="100" required autocomplete="name"></label>
+            <label for="profile-department">部门<input id="profile-department" name="department" maxlength="100" required></label>
+          </div>
+          <div class="profile-actions"><p id="profile-message" class="form-message" role="status" aria-live="polite"></p><button id="profile-save" type="submit">保存资料</button></div>
+        </form>
+        <div class="profile-security"><div><strong>账户安全</strong><p>定期更新密码，保护报销记录。</p></div><button id="change-password-open" class="secondary profile-password-link" type="button" aria-haspopup="dialog" aria-controls="change-password-dialog">修改密码</button></div>
+      </section>
+      <section class="form-section license-section" aria-labelledby="license-heading">
+        <div class="license-heading"><span class="license-crown" aria-hidden="true"><svg viewBox="0 0 48 48" focusable="false"><path d="M8 34 5 15l11 9 8-14 8 14 11-9-3 19H8Z" fill="#ffc34a" stroke="#eea92e" stroke-linejoin="round" stroke-width="2"/><circle cx="5" cy="14" r="3" fill="#ffc34a"/><circle cx="24" cy="9" r="3" fill="#ffc34a"/><circle cx="43" cy="14" r="3" fill="#ffc34a"/><path d="M9 40h30" stroke="#eea92e" stroke-linecap="round" stroke-width="4"/><circle cx="24" cy="28" r="3" fill="#b8791e"/></svg></span><h2 id="license-heading">Pro 授权</h2><button id="license-buy" class="license-buy" type="button" aria-haspopup="dialog" aria-controls="license-plans-dialog">购买</button></div>
+        <label for="license-serial">我的序列号</label>
+        <div class="license-serial-row"><input id="license-serial" readonly aria-label="我的序列号"><button id="license-copy" type="button" class="secondary" aria-label="复制序列号"><svg class="license-copy-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="8" y="8" width="12" height="12" rx="2"/><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2"/></svg><span>复制</span></button></div>
+        <p id="license-expiry" class="license-expiry" aria-live="polite"></p>
+        <form id="license-import-form">
+          <label for="license-code">导入授权码</label>
+          <div class="license-import-row"><textarea id="license-code" rows="2" maxlength="1024" spellcheck="false" autocomplete="off" placeholder="粘贴收到的授权码"></textarea><button id="license-import" type="submit">验证并导入</button></div>
+          <p id="license-message" class="form-message license-message" role="status" aria-live="polite"></p>
+        </form>
+      </section>
+    </div>
+    <section id="travel-section" class="form-section travel-section" aria-labelledby="travel-heading" data-trend-locked="true" data-trend-state="loading">
+      <div class="travel-heading"><div><h2 id="travel-heading">出差天数趋势</h2><p>按行程明细中的日期所属月份，汇总已填写的出差总天数。</p></div><div class="travel-filters"><div class="history-filter-field"><select id="travel-year" aria-label="筛选年份" disabled><option value="">年份</option></select></div><div class="history-filter-field"><select id="travel-month" aria-label="筛选月份" disabled><option value="">全部月份</option><option value="1">1 月</option><option value="2">2 月</option><option value="3">3 月</option><option value="4">4 月</option><option value="5">5 月</option><option value="6">6 月</option><option value="7">7 月</option><option value="8">8 月</option><option value="9">9 月</option><option value="10">10 月</option><option value="11">11 月</option><option value="12">12 月</option></select></div></div></div>
+      <div class="travel-summary"><span id="travel-summary-label">全年出差天数</span><strong id="travel-summary-value" aria-live="polite">•••</strong></div>
+      <div id="travel-error" class="result error" role="alert" hidden></div>
+      <button id="travel-retry" type="button" class="secondary" hidden>重试加载</button>
+      <div id="travel-empty" class="empty-state" hidden>暂无可统计的差旅行程。</div>
+      <div class="travel-chart-stage">
+        <div class="travel-chart-wrap">
+          <svg id="travel-chart" viewBox="0 0 760 250" role="img" aria-label="每月出差天数曲线图" preserveAspectRatio="xMidYMid meet" hidden></svg>
+          <svg id="travel-trend-placeholder" class="travel-trend-placeholder" viewBox="0 0 760 250" aria-hidden="true" preserveAspectRatio="xMidYMid meet" fill="none"><path class="travel-placeholder-grid" d="M52 40H738 M52 86H738 M52 132H738 M52 178H738 M52 224H738"/><path class="travel-placeholder-line" d="M52 172 C120 151 158 177 215 143 S322 160 383 126 S486 145 552 110 S659 130 738 102"/></svg>
+        </div>
+        <div id="travel-loading" class="travel-loading" role="status"><span>出差数据加载中…</span></div>
+        <div id="travel-pro-overlay" class="travel-pro-overlay" role="note" hidden><div class="travel-pro-panel"><span aria-hidden="true">🔒</span><strong>Pro 专属功能</strong><span>升级后查看出差趋势</span><a class="table-action-button" href="/profile">升级 Pro</a></div></div>
+      </div>
+      <ol id="travel-month-list" class="travel-month-list" aria-label="各月出差天数" hidden></ol>
+      <ol id="travel-month-placeholder" class="travel-month-list travel-month-placeholder" aria-hidden="true"><li>1 月 ·•••</li><li>2 月 ·•••</li><li>3 月 ·•••</li><li>4 月 ·•••</li><li>5 月 ·•••</li><li>6 月 ·•••</li><li>7 月 ·•••</li><li>8 月 ·•••</li><li>9 月 ·•••</li><li>10 月 ·•••</li><li>11 月 ·•••</li><li>12 月 ·•••</li></ol>
+      <p id="travel-excluded" class="travel-excluded" aria-live="polite"></p>
+    </section>
+  </main>
+  <dialog id="license-plans-dialog" class="license-plans-dialog" aria-labelledby="license-plans-title" aria-describedby="license-plans-subtitle">
+    <button id="license-plans-close" class="license-plans-close" type="button" aria-label="关闭版本对比"><svg class="ui-icon" aria-hidden="true"><use href="/static/icons.svg#x"></use></svg></button>
+    <div class="license-plans-content">
+      <header id="license-plans-intro" class="license-plans-intro">
+        <h2 id="license-plans-title">升级Pro，解锁完整功能</h2>
+        <p id="license-plans-subtitle">升级 Pro，解锁完整功能，让报销管理更高效</p>
+      </header>
+      <div class="license-plans-stage">
+      <div id="license-plans-grid" class="license-plans-grid">
+        <section class="license-plan license-plan-basic" aria-labelledby="license-plan-basic-title">
+          <div class="license-plan-heading"><span class="license-plan-avatar" aria-hidden="true"><svg class="ui-icon"><use href="/static/icons.svg#user-round"></use></svg></span><div><h3 id="license-plan-basic-title">普通用户</h3><p>满足基础报销需求，免费使用</p></div><span id="license-plan-basic-badge" class="license-plan-badge">当前版本</span></div>
+          <div class="license-plan-features">
+            <div class="license-plan-feature"><svg class="ui-icon" aria-hidden="true"><use href="/static/icons.svg#receipt"></use></svg><div class="license-plan-feature-text"><strong>发票上传</strong><p>每张报销单最多 6 张发票</p></div><div class="license-plan-preview license-invoice-preview" aria-hidden="true"><span class="license-preview-count">6 / 6</span><div class="license-invoice-stack"><i></i><i></i><i></i><i></i><i></i><i></i><b>＋</b></div></div></div>
+            <div class="license-plan-feature"><svg class="ui-icon" aria-hidden="true"><use href="/static/icons.svg#history"></use></svg><div class="license-plan-feature-text"><strong>历史记录</strong><p>仅可查看最近 6 个月的报销记录</p></div><div class="license-plan-preview license-history-preview" aria-hidden="true"><span></span><span></span><span></span></div></div>
+            <div class="license-plan-feature"><svg class="ui-icon" aria-hidden="true"><use href="/static/icons.svg#file-text"></use></svg><div class="license-plan-feature-text"><strong>报销统计数据</strong><p>统计数据暂不可查看</p></div><div class="license-plan-preview license-locked-preview" aria-hidden="true"><span>🔒</span><small>升级 Pro 后查看</small></div></div>
+            <div class="license-plan-feature"><svg class="ui-icon" aria-hidden="true"><use href="/static/icons.svg#route"></use></svg><div class="license-plan-feature-text"><strong>出差天数趋势</strong><p>趋势图暂不可查看</p></div><div class="license-plan-preview license-locked-preview license-trend-preview" aria-hidden="true"><svg viewBox="0 0 180 54" preserveAspectRatio="none"><path d="M4 45 C28 42 28 25 50 31 S72 48 94 24 S125 29 144 16 S164 18 176 8"/></svg><span>🔒</span><small>升级 Pro 后查看</small></div></div>
+          </div>
+        </section>
+        <section class="license-plan license-plan-pro" aria-labelledby="license-plan-pro-title">
+          <div class="license-plan-heading"><span class="license-plan-crown" aria-hidden="true">♛</span><div><h3 id="license-plan-pro-title">Pro 用户</h3><p>解锁全部功能，享受完整体验</p></div><span id="license-plan-pro-badge" class="license-plan-badge">推荐选择</span></div>
+          <div class="license-plan-features">
+            <div class="license-plan-feature"><span class="license-plan-check" aria-hidden="true">✓</span><svg class="ui-icon" aria-hidden="true"><use href="/static/icons.svg#receipt"></use></svg><div class="license-plan-feature-text"><strong>发票上传</strong><p>不限发票数量，支持图片与 PDF</p></div><div class="license-plan-preview license-invoice-preview" aria-hidden="true"><span class="license-preview-count">∞ 不限数量</span><div class="license-invoice-stack"><i></i><i></i><i></i><i></i><i></i><i></i><b>＋</b></div></div></div>
+            <div class="license-plan-feature"><span class="license-plan-check" aria-hidden="true">✓</span><svg class="ui-icon" aria-hidden="true"><use href="/static/icons.svg#history"></use></svg><div class="license-plan-feature-text"><strong>历史记录</strong><p>可查看全部历史记录</p></div><div class="license-plan-preview license-history-preview" aria-hidden="true"><span></span><span></span><span></span><span></span></div></div>
+            <div class="license-plan-feature"><span class="license-plan-check" aria-hidden="true">✓</span><svg class="ui-icon" aria-hidden="true"><use href="/static/icons.svg#file-text"></use></svg><div class="license-plan-feature-text"><strong>报销统计数据</strong><p>完整查看报销笔数和总金额</p></div><div class="license-plan-preview license-stats-preview" aria-hidden="true"><span>差旅报销 <b>笔数 · 金额</b></span><span>费用报销 <b>笔数 · 金额</b></span></div></div>
+            <div class="license-plan-feature"><span class="license-plan-check" aria-hidden="true">✓</span><svg class="ui-icon" aria-hidden="true"><use href="/static/icons.svg#route"></use></svg><div class="license-plan-feature-text"><strong>出差天数趋势</strong><p>查看完整的出差天数变化趋势</p></div><div class="license-plan-preview license-trend-preview license-trend-preview-pro" aria-hidden="true"><svg viewBox="0 0 180 54" preserveAspectRatio="none"><path d="M4 44 C23 43 29 34 48 31 S70 26 91 31 S118 27 137 14 S161 11 176 17"/></svg><span class="license-trend-axis">1月　2月　3月　4月　5月　6月</span></div></div>
+          </div>
+        </section>
+      </div>
+      </div>
+      <div id="license-plans-footer" class="license-plans-footer"><button id="license-plans-upgrade" type="button"><span aria-hidden="true">♛</span><span>立即升级 Pro</span><span aria-hidden="true">→</span></button><p>复制序列号并发送给授权人，获取授权码后在本页导入；每次授权有效 365 天。</p></div>
+      <div id="license-payment" class="license-payment" role="group" aria-label="微信支付收款码" aria-hidden="true" tabindex="-1" inert>
+        <img src="/static/pro-upgrade-payment-qr.jpg" alt="微信支付收款码，金额 20 元" width="828" height="1124">
+        <div class="license-payment-actions"><button id="license-payment-back" class="secondary" type="button">返回版本对比</button><button id="license-payment-serial" type="button">查看我的序列号</button></div>
+      </div>
+    </div>
+  </dialog>
+  <dialog id="change-password-dialog" class="profile-password-dialog" aria-labelledby="change-password-title">
+    <form id="change-password-form" class="dialog-form auth-form" data-auth-form data-endpoint="/api/password/change" novalidate>
+      <h2 id="change-password-title">修改密码</h2>
+      <p class="profile-password-hint">修改成功后需要重新登录。</p>
+      <label for="current-password">当前密码</label>
+      <input id="current-password" name="current_password" type="password" autocomplete="current-password" required>
+      <label for="new-password">新密码</label>
+      <input id="new-password" name="new_password" type="password" autocomplete="new-password" required>
+      <label for="confirm-password">确认新密码</label>
+      <input id="confirm-password" name="confirm_password" type="password" autocomplete="new-password" required>
+      <p class="form-message" data-message role="status" aria-live="polite"></p>
+      <div class="dialog-actions"><button id="change-password-cancel" type="button" class="secondary">取消</button><button type="submit">保存密码</button></div>
+    </form>
+  </dialog>
+  <script src="/static/common.js?v=20261001-release-notes-onboarding" defer></script><script src="/static/auth.js?v=20260930-password-dialog" defer></script><script src="/static/profile.js?v=20261001-pro-payment" defer></script>
+</body>
+</html>

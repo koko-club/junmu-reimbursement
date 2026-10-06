@@ -16,6 +16,8 @@ from unittest import mock
 from uuid import UUID
 
 from openpyxl import load_workbook
+from pypdf import PdfReader, PdfWriter
+from pypdf.generic import DecodedStreamObject
 
 import app
 from config import AppConfig
@@ -27,6 +29,7 @@ from reimbursements import (
     ReimbursementRecord,
     ReimbursementService,
 )
+from permissions import InvoiceLimitExceeded
 from sessions import AuthenticatedUser
 
 
@@ -117,6 +120,216 @@ class ReimbursementServiceTest(unittest.TestCase):
 
     def tearDown(self):
         self.temporary.cleanup()
+
+    def test_generated_record_retains_editable_payload_and_invoice(self):
+        record = self.service.generate(self.alice, valid_payload(), [])
+        detail = self.service.edit_details(self.alice.user_id, record.id)
+        self.assertEqual(detail["payload"]["reason"], "客户拜访")
+        self.assertEqual(detail["payload"]["rows"][0]["origin"], "上海")
+        self.assertEqual(detail["invoice_layout"], 2)
+        self.assertEqual(detail["invoices"], [])
+
+    def test_expense_record_uses_expense_template_and_can_be_regenerated(self):
+        used_templates = []
+
+        def generate(template_path, work_dir, payload, image_paths):
+            used_templates.append(Path(template_path).name)
+            self.assertEqual(image_paths, [])
+            path = Path(work_dir) / (payload["output_stem"] + ".xlsx")
+            path.write_bytes(b"xlsx")
+            return GenerationResult(path=path, screenshot_count=0, receipt_count=0)
+
+        service = ReimbursementService(
+            self.database, self.config,
+            workbook_generator=generate, pdf_exporter=self.exporter,
+        )
+        payload = {
+            "form_type": "expense", "date": "2026-09-30",
+            "rows": [{"project": "办公用品", "summary": "纸张", "amount": "12.50"},
+                     {"project": "交通费", "summary": "打车", "amount": "5.05"}],
+        }
+        record = service.generate(self.alice, payload, [])
+        self.assertEqual(record.reason, "办公用品")
+        self.assertEqual(record.reimbursement_amount, "17.55")
+        self.assertTrue(record.display_name.endswith("-费用报销单.xlsx"))
+        detail = service.edit_details(self.alice.user_id, record.id)
+        self.assertEqual(detail["payload"]["form_type"], "expense")
+        self.assertEqual(detail["payload"]["rows"][1]["amount"], 5.05)
+        payload["rows"][1]["amount"] = "6.05"
+        updated = service.regenerate(self.alice, record.id, payload, [], [])
+        self.assertEqual(updated.id, record.id)
+        self.assertEqual(updated.reimbursement_amount, "18.55")
+        self.assertEqual(used_templates, ["费用报销单模板.xlsx"] * 2)
+
+    def test_regenerate_updates_same_record_and_timestamp(self):
+        record = self.service.generate(self.alice, valid_payload(), [])
+        updated = self.service.regenerate(
+            self.alice, record.id, valid_payload(reason="修改后的行程"), [], [],
+            invoice_layout=4,
+        )
+        self.assertEqual(updated.id, record.id)
+        self.assertEqual(updated.reason, "修改后的行程")
+        self.assertGreater(updated.created_at, record.created_at)
+        self.assertEqual(len(self.service.list_active(self.alice.user_id)), 1)
+        self.assertEqual(self.service.edit_details(self.alice.user_id, record.id)["invoice_layout"], 4)
+
+    def test_other_user_cannot_read_or_regenerate_record(self):
+        record = self.service.generate(self.alice, valid_payload(), [])
+        with self.assertRaises(ReimbursementNotFound):
+            self.service.edit_details(self.bob.user_id, record.id)
+        with self.assertRaises(ReimbursementNotFound):
+            self.service.regenerate(self.bob, record.id, valid_payload(), [], [])
+
+    def test_regenerate_can_remove_original_invoice(self):
+        invoice = self.root / "original.pdf"
+        writer = PdfWriter()
+        writer.add_blank_page(width=420, height=297)
+        with invoice.open("wb") as output:
+            writer.write(output)
+
+        def export_pdf_file(_xlsx, work_dir, _soffice):
+            destination = Path(work_dir) / "相同显示名.pdf"
+            writer = PdfWriter()
+            writer.add_blank_page(width=595.28, height=841.89)
+            with destination.open("wb") as output:
+                writer.write(output)
+            return destination
+
+        self.exporter.side_effect = export_pdf_file
+        record = self.service.generate(self.alice, valid_payload(), [], [invoice])
+        self.assertEqual(self.service.edit_details(self.alice.user_id, record.id)["invoices"], ["original.pdf"])
+        updated = self.service.regenerate(self.alice, record.id, valid_payload(), [], [])
+        self.assertEqual(self.service.edit_details(self.alice.user_id, record.id)["invoices"], [])
+        self.assertEqual(len(PdfReader(self.data_dir / updated.pdf_path).pages), 1)
+
+    def test_regenerate_can_keep_and_then_replace_invoice(self):
+        first = self.root / "first.pdf"
+        second = self.root / "second.pdf"
+        writer = PdfWriter()
+        writer.add_blank_page(width=420, height=297)
+        for path in (first, second):
+            with path.open("wb") as output:
+                writer.write(output)
+
+        def export_pdf_file(_xlsx, work_dir, _soffice):
+            destination = Path(work_dir) / "相同显示名.pdf"
+            pdf = PdfWriter()
+            pdf.add_blank_page(width=595.28, height=841.89)
+            with destination.open("wb") as output:
+                pdf.write(output)
+            return destination
+
+        self.exporter.side_effect = export_pdf_file
+        record = self.service.generate(self.alice, valid_payload(), [], [first])
+        self.service.regenerate(self.alice, record.id, valid_payload(), [0], [])
+        self.assertEqual(self.service.edit_details(self.alice.user_id, record.id)["invoices"], ["first.pdf"])
+        self.service.regenerate(self.alice, record.id, valid_payload(), [], [second])
+        self.assertEqual(self.service.edit_details(self.alice.user_id, record.id)["invoices"], ["second.pdf"])
+        self.assertEqual(len(self.service.list_active(self.alice.user_id)), 1)
+
+    def test_regenerate_counts_retained_pdf_pages_and_releases_removed_quota(self):
+        def export_pdf_file(_xlsx, work_dir, _soffice):
+            destination = Path(work_dir) / "相同显示名.pdf"
+            writer = PdfWriter()
+            writer.add_blank_page(width=595.28, height=841.89)
+            with destination.open("wb") as output:
+                writer.write(output)
+            return destination
+
+        self.exporter.side_effect = export_pdf_file
+        existing = self.root / "existing.pdf"
+        extra = self.root / "extra.pdf"
+        for path, pages in ((existing, 6), (extra, 1)):
+            writer = PdfWriter()
+            for _ in range(pages):
+                writer.add_blank_page(width=420, height=297)
+            with path.open("wb") as output:
+                writer.write(output)
+        record = self.service.generate(self.alice, valid_payload(), [], [existing])
+        self.assertEqual(self.service.edit_details(self.alice.user_id, record.id)["invoice_counts"], [6])
+        with self.assertRaises(InvoiceLimitExceeded):
+            self.service.regenerate(self.alice, record.id, valid_payload(), [0], [extra], invoice_limit=6)
+        self.assertEqual(self.service.edit_details(self.alice.user_id, record.id)["invoice_counts"], [6])
+        self.service.regenerate(self.alice, record.id, valid_payload(), [], [extra], invoice_limit=6)
+        self.assertEqual(self.service.edit_details(self.alice.user_id, record.id)["invoice_counts"], [1])
+
+    def test_regeneration_failure_keeps_original_file_and_metadata(self):
+        record = self.service.generate(self.alice, valid_payload(), [])
+        original_pdf = (self.data_dir / record.pdf_path).read_bytes()
+        self.exporter.side_effect = OSError("export failed")
+        with self.assertRaises(ReimbursementGenerationError):
+            self.service.regenerate(self.alice, record.id, valid_payload(reason="改动"), [], [])
+        preserved = self.service.list_active(self.alice.user_id)[0]
+        self.assertEqual(preserved.reason, record.reason)
+        self.assertEqual((self.data_dir / preserved.pdf_path).read_bytes(), original_pdf)
+
+    def test_legacy_record_reads_editable_fields_from_workbook(self):
+        from openpyxl import Workbook
+        record = self.service.generate(self.alice, valid_payload(), [])
+        workbook = Workbook()
+        sheet = workbook.active
+        sheet["A3"] = "报销日期：2026/09/08"
+        sheet["B4"] = "技术部"
+        sheet["B5"] = "张三"
+        sheet["E5"] = "旧记录事由"
+        sheet["J7"] = 2
+        sheet["K7"] = "=J7*50"
+        sheet["B9"] = "上海"
+        sheet["C9"] = "杭州"
+        workbook.save(self.data_dir / record.xlsx_path)
+        with self.database.transaction(immediate=True) as connection:
+            connection.execute("UPDATE reimbursements SET payload_json = NULL WHERE id = ?", (record.id,))
+        detail = self.service.edit_details(self.alice.user_id, record.id)
+        self.assertEqual(detail["payload"]["reason"], "旧记录事由")
+        self.assertEqual(detail["payload"]["rows"][0]["destination"], "杭州")
+        self.assertTrue(detail["legacy_invoices_unavailable"])
+
+    def test_generate_places_pdf_invoice_in_saved_report(self):
+        invoice = self.root / "invoice.pdf"
+        with invoice.open("wb") as output:
+            writer = PdfWriter()
+            page = writer.add_blank_page(width=420, height=297)
+            stream = DecodedStreamObject()
+            stream.set_data(b"0 0 m 420 297 l S\n")
+            page.replace_contents(stream)
+            writer.write(output)
+
+        def export_pdf_file(_xlsx, work_dir, _soffice):
+            destination = Path(work_dir) / "相同显示名.pdf"
+            with destination.open("wb") as output:
+                writer = PdfWriter()
+                writer.add_blank_page(width=595.28, height=841.89)
+                writer.write(output)
+            return destination
+
+        self.exporter.side_effect = export_pdf_file
+        record = self.service.generate(self.alice, valid_payload(), [], [invoice])
+        saved = self.data_dir / record.pdf_path
+        pages = PdfReader(saved).pages
+        self.assertEqual(len(pages), 1)
+        self.assertIn(b"420 297 l", pages[0].get_contents().get_data())
+
+    def test_generate_uses_selected_four_up_invoice_layout(self):
+        invoice = self.root / "two-invoices.pdf"
+        writer = PdfWriter()
+        for _ in range(2):
+            writer.add_blank_page(width=420, height=297)
+        with invoice.open("wb") as output:
+            writer.write(output)
+
+        def export_pdf_file(_xlsx, work_dir, _soffice):
+            destination = Path(work_dir) / "相同显示名.pdf"
+            writer = PdfWriter()
+            writer.add_blank_page(width=595.28, height=841.89)
+            with destination.open("wb") as output:
+                writer.write(output)
+            return destination
+
+        self.exporter.side_effect = export_pdf_file
+        record = self.service.generate(
+            self.alice, valid_payload(), [], [invoice], invoice_layout=4
+        )
+        self.assertEqual(len(PdfReader(self.data_dir / record.pdf_path).pages), 1)
 
     def test_quarantine_auth_key_requires_exactly_32_bytes(self):
         invalid_secrets = (
@@ -212,6 +425,60 @@ class ReimbursementServiceTest(unittest.TestCase):
             )
         return xlsx, pdf
 
+    def test_travel_days_by_month_uses_distinct_itinerary_dates_and_owner_scope(self):
+        def add_record(suffix, owner, payload, deleted_at=None):
+            record_id = f"81000000-0000-4000-8000-{suffix:012d}"
+            self._insert_record(owner, record_id, created_at="2026-11-01T00:00:00+00:00",
+                                deleted_at=deleted_at)
+            with self.database.transaction(immediate=True) as connection:
+                connection.execute("UPDATE reimbursements SET payload_json = ? WHERE id = ?",
+                                   (json.dumps(payload), record_id))
+
+        add_record(1, self.alice.user_id, {"days": 6, "rows": [
+            {"date": "2026-09-10"}, {"date": "2026-09-10"},
+            {"date": "2026-09-11"}, {"date": "2026-10-01"}]})
+        add_record(2, self.alice.user_id, {"days": 2, "rows": [{"date": ""}]})
+        add_record(3, self.alice.user_id, {"form_type": "expense", "rows": []})
+        add_record(4, self.alice.user_id, {"days": 9, "rows": [{"date": "2026-09-10"}]},
+                   deleted_at="2026-11-02T00:00:00+00:00")
+        add_record(5, self.bob.user_id, {"days": 8, "rows": [{"date": "2026-09-10"}]})
+
+        result = self.service.travel_days_by_month(self.alice.user_id)
+
+        self.assertEqual(result["months"], [
+            {"year": 2026, "month": 9, "days": 4.0},
+            {"year": 2026, "month": 10, "days": 2.0},
+        ])
+        self.assertEqual(result["excluded_records"], 1)
+
+    def test_travel_days_by_month_reads_legacy_excel_date_cells(self):
+        from openpyxl import Workbook
+        record_id = "81000000-0000-4000-8000-000000000099"
+        xlsx, _pdf = self._insert_record(
+            self.alice.user_id, record_id, created_at="2026-11-01T00:00:00+00:00"
+        )
+        workbook = Workbook()
+        sheet = workbook.active
+        sheet["J7"] = 2
+        sheet["A9"] = datetime(2026, 9, 10)
+        sheet["A10"] = datetime(2026, 9, 11)
+        workbook.save(xlsx)
+
+        result = self.service.travel_days_by_month(self.alice.user_id)
+
+        self.assertEqual(result["months"], [{"year": 2026, "month": 9, "days": 2.0}])
+        self.assertEqual(result["excluded_records"], 0)
+
+    def test_travel_days_by_month_skips_unreadable_legacy_workbook(self):
+        self._insert_record(
+            self.alice.user_id, "81000000-0000-4000-8000-000000000098",
+            created_at="2026-11-01T00:00:00+00:00",
+        )
+
+        result = self.service.travel_days_by_month(self.alice.user_id)
+
+        self.assertEqual(result, {"months": [], "excluded_records": 1})
+
     def test_active_stats_groups_local_generated_dates_and_excludes_trash(self):
         self._insert_record(
             self.alice.user_id,
@@ -253,6 +520,35 @@ class ReimbursementServiceTest(unittest.TestCase):
         self.assertEqual(
             stats,
             {"month_count": 1, "year_count": 3, "year_amount": "600.00"},
+        )
+
+    def test_active_stats_separates_expense_from_travel_and_legacy_records(self):
+        records = (
+            ("80000000-0000-4000-8000-000000000011", None, "10.00"),
+            ("80000000-0000-4000-8000-000000000012", '{"form_type":"travel"}', "20.00"),
+            ("80000000-0000-4000-8000-000000000013", '{"form_type":"expense"}', "30.00"),
+            ("80000000-0000-4000-8000-000000000014", '{"form_type":"expense"}', "40.00"),
+        )
+        for record_id, payload_json, amount in records:
+            self._insert_record(
+                self.alice.user_id, record_id,
+                created_at="2026-09-08T16:30:00+00:00",
+                reimbursement_amount=amount,
+            )
+            with self.database.transaction(immediate=True) as connection:
+                connection.execute(
+                    "UPDATE reimbursements SET payload_json = ? WHERE id = ?",
+                    (payload_json, record_id),
+                )
+        now = datetime(2026, 9, 9, 1, tzinfo=timezone.utc)
+
+        self.assertEqual(
+            self.service.active_stats(self.alice.user_id, now=now, form_type="travel"),
+            {"month_count": 2, "year_count": 2, "year_amount": "30.00"},
+        )
+        self.assertEqual(
+            self.service.active_stats(self.alice.user_id, now=now, form_type="expense"),
+            {"month_count": 2, "year_count": 2, "year_amount": "70.00"},
         )
 
     def test_generate_uses_trusted_profile_records_owner_and_moves_private_files(self):
@@ -2229,7 +2525,7 @@ class ReimbursementServiceTest(unittest.TestCase):
                 "SELECT * FROM reimbursements WHERE id = ?", (str(record_uuid),)
             ).fetchone()
         self.assertIsNotNone(row)
-        self.assertEqual(tuple(row), (*prior_values, None, None, None))
+        self.assertEqual(tuple(row), (*prior_values, None, None, None, None, 2, "[]"))
         self.assertFalse(final_dir.exists())
 
 

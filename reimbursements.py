@@ -4,26 +4,33 @@ from __future__ import annotations
 
 from contextlib import closing
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 import hashlib
 import hmac
+import json
 import logging
 import os
 from pathlib import Path
 import secrets
+import shutil
 import stat
+import tempfile
 import threading
 from typing import BinaryIO, Callable
 from uuid import UUID, uuid4
 from zoneinfo import ZoneInfo
+from zipfile import BadZipFile
+from openpyxl import load_workbook
 
 from config import AppConfig
 from database import Database
 from generator import generate_workbook
+from invoice_pdf import append_invoice_pages, validate_invoice_pdf
+from permissions import InvoiceLimitExceeded, history_visible
 from office import export_pdf, find_soffice
 from sessions import AuthenticatedUser
-from validation import safe_output_stem, validate_image_filename, validate_payload
+from validation import safe_output_stem, validate_image_filename, validate_invoice_filename, validate_payload
 
 
 _LOGGER = logging.getLogger(__name__)
@@ -63,6 +70,12 @@ class ReimbursementStorageError(RuntimeError):
 
 def _history_amount_text(payload: dict) -> str:
     """Return the form total using the same inputs as the workbook J20 formula."""
+    if payload.get("form_type") == "expense":
+        total = sum(
+            (Decimal(str(row.get("amount", 0) or 0)) for row in payload.get("rows", ()) if isinstance(row, dict)),
+            Decimal("0"),
+        )
+        return format(total.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP), ".2f")
     total = Decimal(str(payload.get("days", 0))) * Decimal(str(payload.get("allowance", 0)))
     for row in payload.get("rows", ()):
         if not isinstance(row, dict):
@@ -110,6 +123,9 @@ class ReimbursementRecord:
     deleted_at: str | None
     reason: str | None = None
     reimbursement_amount: str | None = None
+    payload_json: str | None = None
+    invoice_layout: int = 2
+    invoice_names_json: str = "[]"
 
 
 @dataclass
@@ -172,6 +188,10 @@ class ReimbursementService:
         user: AuthenticatedUser,
         raw_payload: dict,
         screenshots: list[Path],
+        invoices: list[Path] | None = None,
+        *,
+        invoice_layout: int = 2,
+        invoice_names: list[str] | None = None,
     ) -> ReimbursementRecord:
         record_id = "unassigned"
         work_dir: Path | None = None
@@ -193,10 +213,20 @@ class ReimbursementService:
                 traveler=user.real_name,
                 department=user.department,
             )
-            output_stem = safe_output_stem(payload["date"], payload["traveler"])
+            form_type = payload.get("form_type", "travel")
+            output_stem = safe_output_stem(payload["date"], payload["traveler"], form_type)
             self._validated_display_name(f"{output_stem}.xlsx")
             payload["output_stem"] = output_stem
             image_paths = self._validated_screenshots(screenshots)
+            invoice_paths = self._validated_invoices(invoices or [])
+            if invoice_layout not in (2, 4):
+                raise ValueError("发票排版方式无效")
+            names = invoice_names if invoice_names is not None else [
+                path.name.split("-", 1)[-1] for path in invoice_paths
+            ]
+            if len(names) != len(invoice_paths):
+                raise ValueError("发票名称数量无效")
+            names = [validate_invoice_filename(name) for name in names]
             data_dir = Path(self._config.data_dir).resolve()
             data_fd = self._open_data_root(data_dir)
             open_fds.append(data_fd)
@@ -210,9 +240,18 @@ class ReimbursementService:
             open_fds.append(work_fd)
             work_dir = data_dir / "tmp" / record_id
 
+            if invoice_paths:
+                invoice_store = work_dir / "invoices"
+                invoice_store.mkdir()
+                for index, source in enumerate(invoice_paths):
+                    shutil.copyfile(source, invoice_store / f"{index:04d}.pdf")
+
             with self._generation_slots:
+                template_path = Path(self._config.template_path)
+                if form_type == "expense":
+                    template_path = template_path.with_name("费用报销单模板.xlsx")
                 generation_result = self._generator(
-                    Path(self._config.template_path),
+                    template_path,
                     work_dir,
                     payload,
                     image_paths,
@@ -238,6 +277,12 @@ class ReimbursementService:
                 pdf_result = self._pdf_exporter(
                     generated_xlsx_path, work_dir, soffice_path
                 )
+                if invoice_paths:
+                    pdf_to_merge, _, preliminary_fd, _ = self._open_validated_output(
+                        pdf_result, work_dir, work_fd, ".pdf"
+                    )
+                    os.close(preliminary_fd)
+                    append_invoice_pages(pdf_to_merge, invoice_paths, layout=invoice_layout)
                 self._verify_output_identity(
                     work_fd,
                     xlsx_work_relative,
@@ -326,8 +371,12 @@ class ReimbursementService:
                 pdf_path=pdf_relative,
                 created_at=created_at,
                 deleted_at=None,
-                reason=payload["reason"],
+                reason=(next((row["project"] for row in payload["rows"] if row.get("project")), "费用报销单")
+                        if form_type == "expense" else payload["reason"]),
                 reimbursement_amount=_history_amount_text(payload),
+                payload_json=json.dumps(payload, ensure_ascii=False),
+                invoice_layout=invoice_layout,
+                invoice_names_json=json.dumps(names, ensure_ascii=False),
             )
             self._insert(record)
             return record
@@ -366,15 +415,218 @@ class ReimbursementService:
                 except OSError:
                     pass
 
-    def list_active(self, user_id: int) -> list[ReimbursementRecord]:
-        return self._list(user_id, deleted=False)
+    def list_active(self, user_id: int, *, created_after: datetime | None = None) -> list[ReimbursementRecord]:
+        return self._list(user_id, deleted=False, created_after=created_after)
+
+    def record_created_at(self, user_id: int, record_id: str) -> str:
+        """Look up an owned record's generation time, including records in trash."""
+        self._require_owner_id(user_id)
+        self._require_record_id(record_id)
+        with closing(self._database.connect()) as connection:
+            row = connection.execute(
+                "SELECT created_at FROM reimbursements WHERE id = ? AND user_id = ?",
+                (record_id, user_id),
+            ).fetchone()
+        if row is None:
+            raise ReimbursementNotFound("报销记录不存在")
+        return row["created_at"]
+
+    def edit_details(self, user_id: int, record_id: str) -> dict:
+        """Return the owner-visible form values and retained source invoices."""
+        record = self._active_record(user_id, record_id)
+        if record.payload_json:
+            payload = json.loads(record.payload_json)
+        else:
+            with self.owned_file(user_id, record_id, "xlsx") as owned:
+                workbook = load_workbook(owned.stream, read_only=True, data_only=False)
+                try:
+                    sheet = workbook.worksheets[0]
+                    date = str(sheet["A3"].value or "").removeprefix("报销日期：").replace("/", "-")
+                    allowance_formula = str(sheet["K7"].value or "")
+                    allowance = allowance_formula.split("*", 1)[-1] if "*" in allowance_formula else "50"
+                    fields = {"A": "date", "B": "origin", "C": "destination", "D": "transport",
+                              "E": "public_amount", "F": "mileage", "H": "toll", "I": "lodging", "K": "receipts"}
+                    rows = []
+                    for number in range(9, 20):
+                        rows.append({field: value for column, field in fields.items()
+                                     if (value := sheet[f"{column}{number}"].value) is not None})
+                    payload = {
+                        "date": date, "department": str(sheet["B4"].value or ""),
+                        "traveler": str(sheet["B5"].value or ""),
+                        "reason": str(sheet["E5"].value or ""),
+                        "days": sheet["J7"].value or 0, "allowance": allowance,
+                        "rows": rows,
+                    }
+                finally:
+                    workbook.close()
+        names = json.loads(record.invoice_names_json)
+        invoice_counts = []
+        if record.payload_json and names:
+            source_dir = self._invoice_source_dir(record)
+            invoice_counts = [
+                validate_invoice_pdf(source_dir / "invoices" / f"{index:04d}.pdf")
+                for index in range(len(names))
+            ]
+        return {
+            "payload": payload,
+            "invoice_layout": record.invoice_layout,
+            "invoices": names,
+            "invoice_counts": invoice_counts,
+            "legacy_invoices_unavailable": record.payload_json is None,
+        }
+
+    def _invoice_source_dir(self, record: ReimbursementRecord) -> Path:
+        base = Path(self._config.data_dir).resolve() / "users" / str(record.user_id) / record.id
+        current_parts = Path(record.xlsx_path).parts
+        if (current_parts[:3] != ("users", str(record.user_id), record.id)
+                or ".." in current_parts or Path(record.xlsx_path).is_absolute()):
+            raise ReimbursementNotFound("报销记录不存在")
+        relative_directory = current_parts[3:-1]
+        if (relative_directory and (len(relative_directory) != 2 or relative_directory[0] != "revisions")) or (
+            Path(record.pdf_path).parent != Path(record.xlsx_path).parent
+        ):
+            raise ReimbursementNotFound("报销记录不存在")
+        source_dir = base.joinpath(*relative_directory)
+        if not source_dir.resolve().is_relative_to(base.resolve()):
+            raise ReimbursementNotFound("报销记录不存在")
+        return source_dir
+
+    def _active_record(self, user_id: int, record_id: str) -> ReimbursementRecord:
+        self._require_owner_id(user_id)
+        self._require_record_id(record_id)
+        with closing(self._database.connect()) as connection:
+            row = connection.execute(
+                "SELECT * FROM reimbursements WHERE id = ? AND user_id = ? AND deleted_at IS NULL",
+                (record_id, user_id),
+            ).fetchone()
+        if row is None:
+            raise ReimbursementNotFound("报销记录不存在")
+        return self._record_from_row(row)
+
+    def regenerate(
+        self, user: AuthenticatedUser, record_id: str, raw_payload: dict,
+        keep_invoices: list[int], new_invoices: list[Path], *,
+        invoice_layout: int = 2,
+        invoice_limit: int | None = None,
+    ) -> ReimbursementRecord:
+        """Generate a revision, then atomically point the original record at it."""
+        self._require_generation_user(user)
+        with _PURGE_SERIALIZER:
+            original = self._active_record(user.user_id, record_id)
+            original_type = json.loads(original.payload_json).get("form_type", "travel") if original.payload_json else "travel"
+            if raw_payload.get("form_type", "travel") != original_type:
+                raise ValueError("报销单类型不能更改")
+            names = json.loads(original.invoice_names_json)
+            if not isinstance(keep_invoices, list) or any(
+                type(index) is not int or index < 0 or index >= len(names)
+                for index in keep_invoices
+            ) or len(set(keep_invoices)) != len(keep_invoices):
+                raise ValueError("保留发票列表无效")
+            base = Path(self._config.data_dir).resolve() / "users" / str(user.user_id) / record_id
+            source_dir = self._invoice_source_dir(original)
+            with tempfile.TemporaryDirectory(prefix="reimbursement-edit-") as temporary:
+                retained = []
+                for output_index, source_index in enumerate(keep_invoices):
+                    source = source_dir / "invoices" / f"{source_index:04d}.pdf"
+                    destination = Path(temporary) / f"{output_index:04d}-{names[source_index]}"
+                    descriptor = os.open(source, _FILE_OPEN_FLAGS)
+                    try:
+                        metadata = os.fstat(descriptor)
+                        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+                            raise ValueError("发票文件无效")
+                        with os.fdopen(descriptor, "rb", closefd=False) as input_file, destination.open("xb") as output_file:
+                            shutil.copyfileobj(input_file, output_file)
+                    finally:
+                        os.close(descriptor)
+                    retained.append(destination)
+                all_invoices = retained + list(new_invoices)
+                if invoice_limit is not None:
+                    invoice_count = 0
+                    for invoice in all_invoices:
+                        invoice_count += validate_invoice_pdf(invoice)
+                        if invoice_count > invoice_limit:
+                            raise InvoiceLimitExceeded()
+                all_names = [names[index] for index in keep_invoices] + [
+                    path.name.split("-", 1)[-1] for path in new_invoices
+                ]
+                revision = self.generate(
+                    user, raw_payload, [], all_invoices,
+                    invoice_layout=invoice_layout, invoice_names=all_names,
+                )
+            revision_dir = Path(self._config.data_dir).resolve() / "users" / str(user.user_id) / revision.id
+            destination = base / "revisions" / revision.id
+            prefix = f"users/{user.user_id}/{record_id}/revisions/{revision.id}/"
+            destination.parent.mkdir(exist_ok=True)
+            moved = False
+            try:
+                with self._database.transaction(immediate=True) as connection:
+                    if connection.execute(
+                        "SELECT 1 FROM reimbursements WHERE id = ? AND user_id = ? AND deleted_at IS NULL",
+                        (record_id, user.user_id),
+                    ).fetchone() is None:
+                        raise ReimbursementNotFound("报销记录不存在")
+                    os.rename(revision_dir, destination)
+                    moved = True
+                    updated = connection.execute(
+                        """UPDATE reimbursements SET reimbursement_date = ?, display_name = ?,
+                        xlsx_path = ?, pdf_path = ?, created_at = ?, reason = ?,
+                        reimbursement_amount = ?, payload_json = ?, invoice_layout = ?,
+                        invoice_names_json = ?
+                        WHERE id = ? AND user_id = ? AND deleted_at IS NULL""",
+                        (revision.reimbursement_date, revision.display_name,
+                         prefix + Path(revision.xlsx_path).name, prefix + Path(revision.pdf_path).name,
+                         revision.created_at, revision.reason, revision.reimbursement_amount,
+                         revision.payload_json, revision.invoice_layout, revision.invoice_names_json,
+                         record_id, user.user_id),
+                    )
+                    if updated.rowcount != 1:
+                        raise ReimbursementNotFound("报销记录不存在")
+                    connection.execute("DELETE FROM reimbursements WHERE id = ? AND user_id = ?", (revision.id, user.user_id))
+            except Exception:
+                with closing(self._database.connect()) as connection:
+                    current = connection.execute(
+                        "SELECT xlsx_path FROM reimbursements WHERE id = ? AND user_id = ?",
+                        (record_id, user.user_id),
+                    ).fetchone()
+                if current is not None and str(current["xlsx_path"]).startswith(prefix):
+                    return self._active_record(user.user_id, record_id)
+                if moved:
+                    os.rename(destination, revision_dir)
+                try:
+                    with self._database.transaction(immediate=True) as connection:
+                        connection.execute(
+                            "DELETE FROM reimbursements WHERE id = ? AND user_id = ?",
+                            (revision.id, user.user_id),
+                        )
+                    shutil.rmtree(revision_dir)
+                except Exception as cleanup_error:
+                    _LOGGER.error(
+                        "reimbursement revision cleanup failed record_id=%s exception=%s",
+                        revision.id, type(cleanup_error).__name__,
+                    )
+                raise
+            try:
+                if source_dir != base:
+                    shutil.rmtree(source_dir)
+                else:
+                    for name in (Path(original.xlsx_path).name, Path(original.pdf_path).name):
+                        (base / name).unlink(missing_ok=True)
+                    shutil.rmtree(base / "invoices", ignore_errors=True)
+            except OSError as cleanup_error:
+                _LOGGER.error(
+                    "reimbursement old revision cleanup failed record_id=%s exception=%s",
+                    record_id, type(cleanup_error).__name__,
+                )
+            return self._active_record(user.user_id, record_id)
 
     def active_stats(
         self,
         user_id: int,
         now: datetime | None = None,
+        form_type: str | None = None,
+        created_after: datetime | None = None,
     ) -> dict[str, int | str]:
-        """Aggregate active records by their generated date for the current user."""
+        """Aggregate active records by generation date and optional form type."""
         self._require_owner_id(user_id)
         current_local = self._utc_time(now).astimezone(_REPORT_TIMEZONE)
         month_key = (current_local.year, current_local.month)
@@ -383,11 +635,24 @@ class ReimbursementService:
         year_amount = Decimal("0")
         with closing(self._database.connect()) as connection:
             rows = connection.execute(
-                "SELECT created_at, reimbursement_amount FROM reimbursements "
+                "SELECT created_at, reimbursement_amount, payload_json FROM reimbursements "
                 "WHERE user_id = ? AND deleted_at IS NULL",
                 (user_id,),
             ).fetchall()
         for row in rows:
+            if not history_visible(row["created_at"], created_after):
+                continue
+            if form_type is not None:
+                record_type = "travel"
+                if row["payload_json"]:
+                    try:
+                        payload = json.loads(row["payload_json"])
+                        if isinstance(payload, dict) and payload.get("form_type") == "expense":
+                            record_type = "expense"
+                    except (TypeError, ValueError):
+                        pass
+                if record_type != form_type:
+                    continue
             try:
                 created_at = datetime.fromisoformat(row["created_at"])
                 if created_at.tzinfo is None:
@@ -413,8 +678,72 @@ class ReimbursementService:
             ),
         }
 
-    def list_trash(self, user_id: int) -> list[ReimbursementRecord]:
-        return self._list(user_id, deleted=True)
+    def travel_days_by_month(self, user_id: int, *, created_after: datetime | None = None) -> dict:
+        """Apportion each active trip's stated days across its itinerary months."""
+        self._require_owner_id(user_id)
+        with closing(self._database.connect()) as connection:
+            records = connection.execute(
+                "SELECT id, created_at, payload_json FROM reimbursements "
+                "WHERE user_id = ? AND deleted_at IS NULL", (user_id,)
+            ).fetchall()
+        totals: dict[tuple[int, int], Decimal] = {}
+        excluded = 0
+        for record in records:
+            if not history_visible(record["created_at"], created_after):
+                continue
+            try:
+                payload = (
+                    json.loads(record["payload_json"])
+                    if record["payload_json"] else
+                    self.edit_details(user_id, record["id"])["payload"]
+                )
+                if not isinstance(payload, dict):
+                    raise ValueError("invalid stored payload")
+                if payload.get("form_type", "travel") == "expense":
+                    continue
+                days = Decimal(str(payload["days"]))
+                if not days.is_finite() or days < 0:
+                    raise ValueError("invalid stored days")
+                distinct_dates = set()
+                for row in payload.get("rows", []):
+                    if not isinstance(row, dict) or not row.get("date"):
+                        continue
+                    try:
+                        date_text = str(row["date"]).split(" ", 1)[0].replace("/", "-")
+                        distinct_dates.add(date.fromisoformat(date_text))
+                    except ValueError:
+                        continue
+                if not distinct_dates:
+                    excluded += 1
+                    continue
+            except (OSError, ValueError, TypeError, KeyError, InvalidOperation, BadZipFile,
+                    ReimbursementNotFound):
+                excluded += 1
+                continue
+            counts: dict[tuple[int, int], int] = {}
+            for itinerary_date in distinct_dates:
+                key = (itinerary_date.year, itinerary_date.month)
+                counts[key] = counts.get(key, 0) + 1
+            remaining = days
+            ordered_months = sorted(counts)
+            for key in ordered_months[:-1]:
+                portion = (days * counts[key] / len(distinct_dates)).quantize(
+                    Decimal("0.000001"), rounding=ROUND_HALF_UP
+                )
+                totals[key] = totals.get(key, Decimal("0")) + portion
+                remaining -= portion
+            last = ordered_months[-1]
+            totals[last] = totals.get(last, Decimal("0")) + remaining
+        return {
+            "months": [
+                {"year": year, "month": month, "days": round(float(days), 6)}
+                for (year, month), days in sorted(totals.items())
+            ],
+            "excluded_records": excluded,
+        }
+
+    def list_trash(self, user_id: int, *, created_after: datetime | None = None) -> list[ReimbursementRecord]:
+        return self._list(user_id, deleted=True, created_after=created_after)
 
     def trash(
         self,
@@ -687,7 +1016,9 @@ class ReimbursementService:
                 except OSError:
                     pass
 
-    def _list(self, user_id: int, *, deleted: bool) -> list[ReimbursementRecord]:
+    def _list(
+        self, user_id: int, *, deleted: bool, created_after: datetime | None = None,
+    ) -> list[ReimbursementRecord]:
         self._require_owner_id(user_id)
         deleted_clause = "deleted_at IS NOT NULL" if deleted else "deleted_at IS NULL"
         with closing(self._database.connect()) as connection:
@@ -697,7 +1028,8 @@ class ReimbursementService:
                 + " ORDER BY created_at DESC, id DESC",
                 (user_id,),
             ).fetchall()
-        return [self._record_from_row(row) for row in rows]
+        return [self._record_from_row(row) for row in rows
+                if history_visible(row["created_at"], created_after)]
 
     @staticmethod
     def _require_owner_id(user_id: object) -> None:
@@ -1662,6 +1994,11 @@ class ReimbursementService:
                 if "reimbursement_amount" in row.keys()
                 else None
             ),
+            payload_json=row["payload_json"] if "payload_json" in row.keys() else None,
+            invoice_layout=row["invoice_layout"] if "invoice_layout" in row.keys() else 2,
+            invoice_names_json=(
+                row["invoice_names_json"] if "invoice_names_json" in row.keys() else "[]"
+            ),
         )
 
     @staticmethod
@@ -1687,6 +2024,23 @@ class ReimbursementService:
             metadata = path.lstat()
             if path.is_symlink() or not stat.S_ISREG(metadata.st_mode):
                 raise ValueError("screenshot must be a regular file")
+            result.append(path)
+        return result
+
+    @staticmethod
+    def _validated_invoices(invoices: object) -> list[Path]:
+        if not isinstance(invoices, (list, tuple)):
+            raise ValueError("invoices must be a sequence")
+        result: list[Path] = []
+        for value in invoices:
+            if not isinstance(value, (str, os.PathLike)):
+                raise ValueError("invoice path required")
+            path = Path(value)
+            validate_invoice_filename(path.name)
+            metadata = path.lstat()
+            if path.is_symlink() or not stat.S_ISREG(metadata.st_mode):
+                raise ValueError("invoice must be a regular file")
+            validate_invoice_pdf(path)
             result.append(path)
         return result
 
@@ -1899,9 +2253,13 @@ class ReimbursementService:
                     """INSERT INTO reimbursements(
                         id, user_id, reimbursement_date, display_name,
                         xlsx_path, pdf_path, created_at, deleted_at,
-                        reason, reimbursement_amount
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                    self._record_values(record),
+                        reason, reimbursement_amount, payload_json,
+                        invoice_layout, invoice_names_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    self._record_values(record) + (
+                        record.payload_json, record.invoice_layout,
+                        record.invoice_names_json,
+                    ),
                 )
                 statement_applied = True
         except Exception as error:
@@ -1912,9 +2270,12 @@ class ReimbursementService:
             "id = ? AND user_id = ? AND reimbursement_date IS ? AND "
             "display_name = ? AND xlsx_path = ? AND pdf_path = ? AND "
             "created_at = ? AND deleted_at IS ? AND reason IS ? AND "
-            "reimbursement_amount IS ?"
+            "reimbursement_amount IS ? AND payload_json IS ? AND "
+            "invoice_layout = ? AND invoice_names_json = ?"
         )
-        values = self._record_values(record)
+        values = self._record_values(record) + (
+            record.payload_json, record.invoice_layout, record.invoice_names_json,
+        )
         try:
             with self._database.transaction(immediate=True) as connection:
                 connection.execute(

@@ -3,40 +3,75 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title data-page-title>报销记录</title>
-  <link rel="stylesheet" href="/static/styles.css?v=20260909-account">
+  <title data-page-title>在线报销系统</title>
+  <link rel="icon" type="image/png" href="/static/favicon.png">
+  <script src="/static/sidebar.js?v=20261001-release-notes-onboarding"></script>
+  <link rel="stylesheet" href="/static/styles.css?v=20261001-all-history-centered-columns">
+  <link rel="stylesheet" href="/static/ui-tokens.css">
+  <link rel="stylesheet" href="/static/ui-components.css?v=20261001-stat-digit-reel">
 </head>
-<body class="app-body" data-csrf="__CSRF_TOKEN__" data-scope="active" data-view="active">
+<body class="app-body history-body" data-csrf="__CSRF_TOKEN__" data-scope="active" data-view="active">
   <aside id="app-sidebar" class="app-sidebar" aria-label="主导航">
     <div class="brand"><img class="brand-logo" src="/static/logo.png" alt="" aria-hidden="true"><span>君牧在线报销系统</span></div>
-    <nav><a href="/"><svg class="ui-icon" aria-hidden="true"><use href="/static/icons.svg#file-pen"></use></svg><span>填写报销</span></a><a href="/history" data-nav-active="active" data-view="active"><svg class="ui-icon" aria-hidden="true"><use href="/static/icons.svg#history"></use></svg><span>报销记录</span></a><a href="/trash" data-nav-active="trash" data-view="trash"><svg class="ui-icon" aria-hidden="true"><use href="/static/icons.svg#trash-2"></use></svg><span>回收站</span></a></nav>
+    <nav><a href="/" aria-label="填写报销"><svg class="ui-icon" aria-hidden="true"><use href="/static/icons.svg#file-pen"></use></svg><span>填写报销</span></a><a href="/history" aria-label="报销记录" data-nav-active="active" data-view="active"><svg class="ui-icon" aria-hidden="true"><use href="/static/icons.svg#history"></use></svg><span>报销记录</span></a><a href="/trash" aria-label="回收站" data-nav-active="trash" data-view="trash"><svg class="ui-icon" aria-hidden="true"><use href="/static/icons.svg#trash-2"></use></svg><span>回收站</span></a><a href="/profile" aria-label="个人中心"><svg class="ui-icon" aria-hidden="true"><use href="/static/icons.svg#user-round"></use></svg><span>个人中心</span></a></nav>
     <div class="sidebar-account" aria-live="polite"><span>当前登录：</span><strong id="current-user">加载中</strong></div>
-    <button id="logout" type="button" class="secondary">退出登录</button>
+    <div class="sidebar-version">版本：<button id="version-details-trigger" class="version-details-trigger" type="button" aria-haspopup="dialog" aria-controls="version-details-dialog" aria-label="查看版本更新详情"><span id="app-version">__APP_VERSION__</span></button></div>
+    <button id="logout" type="button" class="secondary" aria-label="退出登录"><svg class="ui-icon" aria-hidden="true"><use href="/static/icons.svg?v=20261001-collapse#log-out"></use></svg><span>退出登录</span></button>
   </aside>
   <button id="sidebar-toggle" class="sidebar-toggle" type="button" aria-controls="app-sidebar" aria-expanded="false">菜单</button>
+  <button id="sidebar-collapse" class="sidebar-collapse" type="button" aria-controls="app-sidebar" aria-expanded="false" aria-label="展开侧边栏"><svg class="ui-icon" aria-hidden="true"><use href="/static/icons.svg?v=20261001-double-chevron#chevrons-right"></use></svg></button>
   <main class="page-shell history-page">
     <header class="page-header"><h1 data-heading><svg class="ui-icon ui-icon-title" aria-hidden="true"><use href="/static/icons.svg#history"></use></svg><span data-heading-label>报销记录</span></h1><p>查看你生成的报销文件。</p></header>
-    <section class="form-section" aria-labelledby="records-heading">
-      <div class="section-heading"><h2 id="records-heading">报销文件</h2><span id="record-count" aria-live="polite"></span></div>
+    <div id="history-type-switcher" class="reimbursement-type-switcher history-type-switcher" role="tablist" aria-label="报销记录类别">
+      <button id="travel-history-trigger" type="button" role="tab" aria-selected="true" aria-controls="history-record-panel"><svg class="ui-icon" aria-hidden="true"><use href="/static/icons.svg#route"></use></svg><span>差旅报销记录</span></button>
+      <button id="expense-history-trigger" type="button" role="tab" aria-selected="false" aria-controls="history-record-panel" tabindex="-1"><svg class="ui-icon" aria-hidden="true"><use href="/static/icons.svg#receipt"></use></svg><span>费用报销记录</span></button>
+    </div>
+    <section class="stats-grid history-stats" aria-label="当前报销记录统计" data-stats-locked="true">
+      <article class="stat-card"><span class="stat-label">报销笔数</span><div class="history-stat-value-wrap"><strong id="history-stat-count" class="stat-value" aria-live="polite">•••</strong></div></article>
+      <article class="stat-card"><span class="stat-label">报销总金额</span><div class="history-stat-value-wrap"><strong id="history-stat-amount" class="stat-value" aria-live="polite">•••</strong></div></article>
+      <div class="stats-pro-overlay" role="note"><a class="table-action-button" href="/profile">升级 Pro 后查看</a></div>
+    </section>
+    <section id="history-record-panel" class="form-section" role="tabpanel" aria-labelledby="travel-history-trigger">
+      <div class="section-heading"><h2 id="records-heading">差旅报销记录</h2><span id="record-count" aria-live="polite"></span></div>
+      <p id="history-retention-hint" class="history-retention-hint" hidden>当前展示近6个月记录，升级Pro后展示全部。</p>
       <div id="history-error" class="result error" role="alert" aria-live="assertive"></div>
+      <div id="history-filters" class="history-filters" hidden>
+        <div class="history-filter-field"><select id="history-year" aria-label="按生成年份筛选"><option value="">全部年份</option></select></div>
+        <div class="history-filter-field"><select id="history-month" aria-label="按生成月份筛选">
+          <option value="">全部月份</option><option value="1">1 月</option><option value="2">2 月</option><option value="3">3 月</option><option value="4">4 月</option><option value="5">5 月</option><option value="6">6 月</option><option value="7">7 月</option><option value="8">8 月</option><option value="9">9 月</option><option value="10">10 月</option><option value="11">11 月</option><option value="12">12 月</option>
+        </select></div>
+      </div>
       <div id="history-empty" class="empty-state" hidden>暂无记录</div>
       <div class="table-wrap">
         <table class="history-table" aria-describedby="records-heading">
-          <colgroup class="history-colgroup"><col class="history-col-reason"><col class="history-col-date"><col class="history-col-amount"><col class="history-col-created"><col class="history-col-status"><col class="history-col-actions"></colgroup>
-          <thead><tr><th>出差事由</th><th>报销日期</th><th>报销金额</th><th>生成时间</th><th>状态</th><th>操作</th></tr></thead>
+          <colgroup class="history-colgroup"><col class="history-col-index"><col class="history-col-reason"><col class="history-col-date"><col class="history-col-amount"><col class="history-col-created"><col class="history-col-status"><col class="history-col-actions"></colgroup>
+          <thead><tr><th class="history-col-index">序号</th><th>报销事项</th><th>报销日期</th><th>报销金额</th><th>生成时间</th><th>状态</th><th>操作</th></tr></thead>
           <tbody id="history-rows"></tbody>
         </table>
       </div>
+      <nav id="history-pagination" class="history-pagination" aria-label="报销记录分页" hidden>
+        <button id="history-previous-page" class="pagination-button secondary" type="button" aria-label="上一页" title="上一页" disabled>
+          <svg class="ui-icon" aria-hidden="true"><use href="/static/icons.svg#chevron-left"></use></svg>
+        </button>
+        <span id="history-page-status" class="history-page-status" aria-live="polite"></span>
+        <button id="history-next-page" class="pagination-button secondary" type="button" aria-label="下一页" title="下一页" disabled>
+          <svg class="ui-icon" aria-hidden="true"><use href="/static/icons.svg#chevron-right"></use></svg>
+        </button>
+      </nav>
     </section>
+    <dialog id="edit-dialog" class="reimbursement-edit-dialog" aria-labelledby="edit-dialog-title">
+      <div class="reimbursement-edit-heading"><h2 id="edit-dialog-title">再次编辑报销</h2><button id="edit-close" type="button" class="secondary">关闭</button></div>
+      <iframe id="edit-frame" title="再次编辑报销表单"></iframe>
+    </dialog>
     <dialog id="purge-dialog" aria-labelledby="purge-title">
       <form method="dialog" class="dialog-form" data-purge-form>
         <h2 id="purge-title">永久删除报销记录</h2>
         <p>删除后文件将无法恢复。</p>
         <p id="purge-name" class="dialog-value"></p>
-        <div class="dialog-actions"><button type="submit" value="cancel" class="secondary">取消</button><button type="submit" value="confirm" data-confirm-purge>永久删除</button></div>
+        <div class="dialog-actions"><button type="submit" value="cancel" class="secondary">取消</button><button type="submit" value="confirm" class="danger" data-confirm-purge>永久删除</button></div>
       </form>
     </dialog>
   </main>
-  <script src="/static/common.js?v=20260909-account" defer></script><script src="/static/history.js" defer></script>
+  <script src="/static/common.js?v=20261001-release-notes-onboarding" defer></script><script src="/static/history.js?v=20261001-stat-digit-reel" defer></script>
 </body>
 </html>

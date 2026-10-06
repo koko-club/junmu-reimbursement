@@ -6,7 +6,9 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import logging
+from pathlib import Path
 import secrets
+import shutil
 import sqlite3
 import threading
 from typing import Callable, Iterator
@@ -26,6 +28,12 @@ class UserError(Exception):
 
 class ValidationError(UserError):
     pass
+
+
+class RegistrationValidationError(ValidationError):
+    def __init__(self, field: str, message: str):
+        super().__init__(message)
+        self.field = field
 
 
 class SetupClosed(UserError):
@@ -58,6 +66,12 @@ class UserNotFound(UserError):
 
 class UserOperationBusy(UserError):
     pass
+
+
+class UserDeletionStorageError(UserError):
+    def __init__(self, message: str, *, account_deleted: bool = False):
+        super().__init__(message)
+        self.account_deleted = account_deleted
 
 
 def canonicalize_username(value: object) -> tuple[str, str]:
@@ -114,11 +128,13 @@ class UserService:
         database: Database,
         password_hasher: PasswordHasher,
         revoke_sessions: Callable[[int], None] | None = None,
+        data_dir: Path | None = None,
     ):
         self._database = database
         self._password_hasher = password_hasher
         self._dummy_password_material = password_hasher.dummy_material()
         self._revoke_sessions = revoke_sessions or (lambda _user_id: None)
+        self._data_dir = Path(data_dir) if data_dir is not None else None
 
     def setup_complete(self) -> bool:
         with self._database.transaction() as connection:
@@ -147,6 +163,7 @@ class UserService:
                     (
                         username, username_key, material.digest, material.salt, material.params,
                         real_name, department, "admin", "active", 0, now, None, now,
+                        secrets.token_hex(16),
                     ),
                 )
             except sqlite3.IntegrityError as error:
@@ -159,10 +176,24 @@ class UserService:
     def register(
         self, username: str, password: str, real_name: str, department: str
     ) -> User:
-        username, username_key = canonicalize_username(username)
-        real_name = self._profile_value(real_name, "real name")
-        department = self._profile_value(department, "department")
-        material = self._password_hasher.hash(password)
+        try:
+            username, username_key = canonicalize_username(username)
+        except ValidationError as error:
+            if isinstance(username, str) and not 3 <= len(username.strip()) <= 50:
+                message = "账号需为3到50个字符"
+            else:
+                message = "账号包含无效字符"
+            raise RegistrationValidationError("username", message) from error
+        real_name = self._registration_profile_value(real_name, "real_name", "姓名")
+        department = self._registration_profile_value(department, "department", "部门")
+        if not isinstance(password, str) or len(password) < 6:
+            raise RegistrationValidationError("password", "密码至少需要6位")
+        if len(password) > 128:
+            raise RegistrationValidationError("password", "密码不能超过128位")
+        try:
+            material = self._password_hasher.hash(password)
+        except UnicodeEncodeError as error:
+            raise RegistrationValidationError("password", "密码包含无效字符") from error
         now = _utc_now()
         with self._database.transaction(immediate=True) as connection:
             setting = connection.execute(
@@ -176,6 +207,7 @@ class UserService:
                     (
                         username, username_key, material.digest, material.salt, material.params,
                         real_name, department, "user", "pending", 0, now, None, now,
+                        secrets.token_hex(16),
                     ),
                 )
             except sqlite3.IntegrityError as error:
@@ -201,7 +233,7 @@ class UserService:
                 salt=bytes(row["password_salt"]),
                 params=row["password_params"],
             )
-        password_is_valid = isinstance(password, str) and 8 <= len(password) <= 128
+        password_is_valid = isinstance(password, str) and 6 <= len(password) <= 128
         candidate = password if password_is_valid else "invalid-password-placeholder"
         password_matches = self._password_hasher.verify(candidate, material)
         if (
@@ -252,6 +284,57 @@ class UserService:
             self._require_user_in_state(connection, user_id, "pending")
             connection.execute("DELETE FROM users WHERE id = ?", (user_id,))
 
+    def delete_user(self, admin_id: int, user_id: int, admin_password: str) -> None:
+        """Remove an approved account, its records and its private file directory."""
+        if self._data_dir is None:
+            raise UserDeletionStorageError("user file storage is unavailable")
+        with self._security_operation_lock(user_id):
+            users_dir = self._data_dir / "users"
+            owner_dir = users_dir / str(user_id)
+            staged_dir: Path | None = None
+            try:
+                with self._database.transaction(immediate=True) as connection:
+                    admin = self._require_admin(connection, admin_id)
+                    material = PasswordMaterial(
+                        digest=bytes(admin["password_hash"]),
+                        salt=bytes(admin["password_salt"]),
+                        params=admin["password_params"],
+                    )
+                    if not self._password_hasher.verify(admin_password, material):
+                        raise AuthenticationFailed("administrator password is incorrect")
+                    target = self._user_row(connection, user_id)
+                    if target is None:
+                        raise UserNotFound("user not found")
+                    if target["role"] != "user":
+                        raise PermissionDenied("administrator account cannot be deleted")
+                    if target["status"] not in ("active", "disabled"):
+                        raise InvalidState("approved user required")
+                    if users_dir.is_symlink() or owner_dir.is_symlink():
+                        raise UserDeletionStorageError("unsafe user file directory")
+                    if owner_dir.exists() and not owner_dir.is_dir():
+                        raise UserDeletionStorageError("invalid user file directory")
+                    if owner_dir.exists():
+                        staged_dir = users_dir / f".deleting-{user_id}-{secrets.token_hex(16)}"
+                        owner_dir.rename(staged_dir)
+                    connection.execute("DELETE FROM reimbursements WHERE user_id = ?", (user_id,))
+                    connection.execute("DELETE FROM users WHERE id = ?", (user_id,))
+            except Exception:
+                if staged_dir is not None and staged_dir.exists():
+                    try:
+                        staged_dir.rename(owner_dir)
+                    except OSError:
+                        _LOGGER.error("could not restore user files after deletion failed user_id=%s", user_id)
+                        raise UserDeletionStorageError("could not restore user files") from None
+                raise
+            if staged_dir is not None:
+                try:
+                    shutil.rmtree(staged_dir)
+                except OSError:
+                    _LOGGER.error("could not remove staged user files user_id=%s", user_id)
+                    raise UserDeletionStorageError(
+                        "user deleted but file cleanup failed", account_deleted=True
+                    ) from None
+
     def update_profile(
         self, admin_id: int, user_id: int, real_name: str, department: str
     ) -> User:
@@ -267,6 +350,20 @@ class UserService:
             connection.execute(
                 "UPDATE users SET real_name = ?, department = ?, updated_at = ? WHERE id = ?",
                 (real_name, department, now, user_id),
+            )
+            return self._get_in(connection, user_id)
+
+    def update_own_profile(self, user_id: int, real_name: str, department: str) -> User:
+        """Let an active ordinary user update future-facing form identity."""
+        real_name = self._profile_value(real_name, "real name")
+        department = self._profile_value(department, "department")
+        with self._database.transaction(immediate=True) as connection:
+            current = self._get_in(connection, user_id)
+            if current.role != "user" or current.status != "active":
+                raise PermissionDenied("active user required")
+            connection.execute(
+                "UPDATE users SET real_name = ?, department = ?, updated_at = ? WHERE id = ?",
+                (real_name, department, _utc_now(), user_id),
             )
             return self._get_in(connection, user_id)
 
@@ -439,6 +536,24 @@ class UserService:
             _LOGGER.error("could not restore password after failed revocation for user_id=%s", user_id)
 
     @staticmethod
+    def _registration_profile_value(value: object, field: str, label: str) -> str:
+        if not isinstance(value, str) or not value.strip():
+            raise RegistrationValidationError(field, f"{label}不能为空")
+        value = value.strip()
+        if len(value) > 100:
+            raise RegistrationValidationError(field, f"{label}不能超过100个字符")
+        if value.startswith(_PROFILE_FORMULA_PREFIXES):
+            raise RegistrationValidationError(field, f"{label}不能以=、+、-、@开头")
+        if not all(
+            unicodedata.name(character, "").startswith(
+                ("CJK UNIFIED IDEOGRAPH-", "CJK COMPATIBILITY IDEOGRAPH-")
+            )
+            for character in value
+        ):
+            raise RegistrationValidationError(field, f"{label}必须使用中文汉字")
+        return value
+
+    @staticmethod
     def _profile_value(value: object, label: str) -> str:
         if not isinstance(value, str):
             raise ValidationError(f"{label} must be a string")
@@ -494,8 +609,8 @@ _INSERT_USER = """
     INSERT INTO users(
         username, username_key, password_hash, password_salt, password_params,
         real_name, department, role, status, must_change_password,
-        created_at, approved_at, updated_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        created_at, approved_at, updated_at, license_serial
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 """
 
 

@@ -45,12 +45,27 @@ class UserServiceTest(unittest.TestCase):
         self.temporary.cleanup()
 
     def setup_admin(self, username="admin"):
-        return self.service.setup_admin(username, "correct horse battery staple", "Administrator", "Finance")
+        return self.service.setup_admin(username, "correct horse battery staple", "Administrator", "财务部")
 
     def register_and_approve(self, username="alex"):
         admin = self.setup_admin()
-        pending = self.service.register(username, "correct horse battery staple", "Alex", "Engineering")
+        pending = self.service.register(username, "correct horse battery staple", "张三", "技术部")
         return admin, self.service.approve(admin.id, pending.id)
+
+    def test_user_can_update_only_own_name_and_department(self):
+        admin, alice = self.register_and_approve()
+        bob = self.service.register("bob", "correct horse battery staple", "李四", "财务部")
+        bob = self.service.approve(admin.id, bob.id)
+
+        changed = self.service.update_own_profile(alice.id, " 新姓名 ", " 新部门 ")
+
+        self.assertEqual((changed.username, changed.real_name, changed.department),
+                         ("alex", "新姓名", "新部门"))
+        self.assertEqual((self.service.get(bob.id).real_name, self.service.get(bob.id).department),
+                         ("李四", "财务部"))
+        with self.assertRaises(ValidationError):
+            self.service.update_own_profile(alice.id, "=formula", "新部门")
+        self.assertEqual(self.service.get(alice.id).real_name, "新姓名")
 
     def test_setup_is_atomic_concurrent_and_permanently_closed(self):
         other = UserService(self.database, PasswordHasher(n=1024, r=8, p=1))
@@ -69,7 +84,7 @@ class UserServiceTest(unittest.TestCase):
     def test_registration_requires_completed_setup(self):
         self.assertFalse(self.service.setup_complete())
         with self.assertRaises(SetupRequired):
-            self.service.register("alex", "correct horse battery staple", "Alex", "Engineering")
+            self.service.register("alex", "correct horse battery staple", "张三", "技术部")
 
     def test_setup_admin_is_active_without_an_approval_timestamp(self):
         admin = self.setup_admin()
@@ -79,15 +94,15 @@ class UserServiceTest(unittest.TestCase):
 
     def test_usernames_are_trimmed_nfkc_casefolded_and_unique(self):
         self.setup_admin()
-        user = self.service.register("  A\uff2c\uff25X  ", "correct horse battery staple", "Alex", "Engineering")
+        user = self.service.register("  A\uff2c\uff25X  ", "correct horse battery staple", "张三", "技术部")
 
         self.assertEqual(user.username, "A\uff2c\uff25X")
         with self.assertRaises(UsernameTaken):
-            self.service.register("alex", "correct horse battery staple", "Other", "Engineering")
+            self.service.register("alex", "correct horse battery staple", "王五", "技术部")
         for username in ("ab", "x" * 51, "   ", None):
             with self.subTest(username=username):
                 with self.assertRaises(ValidationError):
-                    self.service.register(username, "correct horse battery staple", "Alex", "Engineering")
+                    self.service.register(username, "correct horse battery staple", "张三", "技术部")
 
     def test_canonicalize_username_rejects_unencodable_surrogates(self):
         self.assertEqual(
@@ -101,14 +116,14 @@ class UserServiceTest(unittest.TestCase):
 
     def test_profile_fields_are_required_bounded_and_formula_safe(self):
         self.setup_admin()
-        for name, department in (("", "Engineering"), ("Alex", "\t"), ("=formula", "Engineering"), ("Alex", "+formula"), ("x" * 101, "Engineering")):
+        for name, department in (("", "技术部"), ("张三", "\t"), ("=formula", "技术部"), ("张三", "+formula"), ("x" * 101, "技术部")):
             with self.subTest(name=name, department=department):
                 with self.assertRaises(ValidationError):
                     self.service.register("user" + str(len(name)), "correct horse battery staple", name, department)
 
     def test_pending_users_can_be_approved_or_rejected_and_rejection_releases_name(self):
         admin = self.setup_admin()
-        pending = self.service.register("alex", "correct horse battery staple", " Alex ", " Engineering ")
+        pending = self.service.register("alex", "correct horse battery staple", " 张三 ", " 技术部 ")
 
         self.assertEqual([user.id for user in self.service.list_pending(admin.id)], [pending.id])
         approved = self.service.approve(admin.id, pending.id)
@@ -117,14 +132,14 @@ class UserServiceTest(unittest.TestCase):
         self.assertEqual(self.service.list_pending(admin.id), [])
         self.assertEqual([user.id for user in self.service.list_approved_users(admin.id)], [pending.id])
 
-        rejected = self.service.register("reuse", "correct horse battery staple", "Reuse", "Engineering")
+        rejected = self.service.register("reuse", "correct horse battery staple", "赵六", "技术部")
         self.service.reject(admin.id, rejected.id)
-        replacement = self.service.register("reuse", "correct horse battery staple", "Reuse", "Engineering")
+        replacement = self.service.register("reuse", "correct horse battery staple", "赵六", "技术部")
         self.assertEqual(replacement.username, "reuse")
 
     def test_admin_permission_and_target_state_matrix(self):
         admin = self.setup_admin()
-        pending = self.service.register("alex", "correct horse battery staple", "Alex", "Engineering")
+        pending = self.service.register("alex", "correct horse battery staple", "张三", "技术部")
         with self.assertRaises(PermissionDenied):
             self.service.list_pending(pending.id)
         with self.assertRaises(PermissionDenied):
@@ -150,6 +165,24 @@ class UserServiceTest(unittest.TestCase):
         with self.assertRaises(InvalidState):
             self.service.set_enabled(admin.id, admin.id, False)
 
+    def test_failed_user_delete_restores_files_and_database_rows(self):
+        admin, user = self.register_and_approve()
+        data_dir = Path(self.temporary.name) / "data"
+        owner_dir = data_dir / "users" / str(user.id)
+        owner_dir.mkdir(parents=True)
+        (owner_dir / "receipt.pdf").write_bytes(b"private")
+        service = UserService(
+            self.database, PasswordHasher(n=1024, r=8, p=1), data_dir=data_dir
+        )
+        with self.database.transaction(immediate=True) as connection:
+            connection.execute("""CREATE TRIGGER deny_delete BEFORE DELETE ON users
+                BEGIN SELECT RAISE(FAIL, 'blocked'); END""")
+        with self.assertRaises(sqlite3.IntegrityError):
+            service.delete_user(admin.id, user.id, "correct horse battery staple")
+        self.assertEqual(self.service.get(user.id).id, user.id)
+        self.assertEqual((owner_dir / "receipt.pdf").read_bytes(), b"private")
+        self.assertEqual(list((data_dir / "users").glob(".deleting-*")), [])
+
     def test_profile_updates_only_approved_users_and_enable_transitions_revoke(self):
         admin, user = self.register_and_approve()
         updated = self.service.update_profile(admin.id, user.id, " Alex Updated ", " Sales ")
@@ -161,11 +194,11 @@ class UserServiceTest(unittest.TestCase):
         self.assertEqual(active.status, "active")
         self.assertEqual(self.revocations, [user.id])
         self.assertEqual([item.status for item in self.service.list_approved_users(admin.id)], ["active"])
-        pending = self.service.register("pending", "correct horse battery staple", "Pending", "Engineering")
+        pending = self.service.register("pending", "correct horse battery staple", "待审人", "技术部")
         with self.assertRaises(InvalidState):
             self.service.update_profile(admin.id, pending.id, "Name", "Department")
         with self.assertRaises(TypeError):
-            self.service.update_profile(user.id, "Self update", "Engineering")
+            self.service.update_profile(user.id, "Self update", "技术部")
 
     def test_authentication_returns_only_active_users_with_no_password_material(self):
         admin, user = self.register_and_approve()
@@ -180,7 +213,7 @@ class UserServiceTest(unittest.TestCase):
 
     def test_pending_user_is_rejected_even_with_the_correct_password(self):
         self.setup_admin()
-        self.service.register("pending", "correct horse battery staple", "Pending", "Engineering")
+        self.service.register("pending", "correct horse battery staple", "待审人", "技术部")
 
         with self.assertRaises(AuthenticationFailed):
             self.service.authenticate("pending", "correct horse battery staple")
@@ -188,10 +221,10 @@ class UserServiceTest(unittest.TestCase):
     def test_authentication_runs_one_verify_for_unknown_inactive_and_invalid_inputs(self):
         admin = self.setup_admin()
         self.service.register(
-            "pending", "correct horse battery staple", "Pending", "Engineering"
+            "pending", "correct horse battery staple", "待审人", "技术部"
         )
         disabled = self.service.register(
-            "disabled", "correct horse battery staple", "Disabled", "Engineering"
+            "disabled", "correct horse battery staple", "停用人", "技术部"
         )
         self.service.approve(admin.id, disabled.id)
         self.service.set_enabled(admin.id, disabled.id, False)
@@ -255,7 +288,7 @@ class UserServiceTest(unittest.TestCase):
 
     def test_sensitive_actions_require_approved_user_and_roll_back_when_revocation_fails(self):
         admin, user = self.register_and_approve()
-        pending = self.service.register("pending", "correct horse battery staple", "Pending", "Engineering")
+        pending = self.service.register("pending", "correct horse battery staple", "待审人", "技术部")
         with self.assertRaises(InvalidState):
             self.service.reset_password(admin.id, pending.id)
         with self.assertRaises(AuthenticationFailed):
@@ -491,7 +524,7 @@ class UserServiceTest(unittest.TestCase):
 
     def test_security_operations_share_a_nonreentrant_lock_per_database_and_user(self):
         admin, first_user = self.register_and_approve("first")
-        pending = self.service.register("second", "correct horse battery staple", "Second", "Engineering")
+        pending = self.service.register("second", "correct horse battery staple", "次用户", "技术部")
         second_user = self.service.approve(admin.id, pending.id)
         revocation_started = threading.Event()
         release_revocation = threading.Event()
@@ -529,8 +562,8 @@ class UserServiceTest(unittest.TestCase):
 
     def test_get_raises_for_unknown_user_and_lists_have_stable_order(self):
         admin = self.setup_admin()
-        first = self.service.register("first", "correct horse battery staple", "First", "Engineering")
-        second = self.service.register("second", "correct horse battery staple", "Second", "Engineering")
+        first = self.service.register("first", "correct horse battery staple", "初用户", "技术部")
+        second = self.service.register("second", "correct horse battery staple", "次用户", "技术部")
         self.assertEqual([user.id for user in self.service.list_pending(admin.id)], [first.id, second.id])
         with self.assertRaises(UserNotFound):
             self.service.get(99999)
@@ -538,7 +571,7 @@ class UserServiceTest(unittest.TestCase):
     @staticmethod
     def _capture_setup(service):
         try:
-            return service.setup_admin("admin", "correct horse battery staple", "Administrator", "Finance")
+            return service.setup_admin("admin", "correct horse battery staple", "Administrator", "财务部")
         except BaseException as error:
             return error
 

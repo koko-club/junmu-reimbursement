@@ -58,7 +58,7 @@ class DatabaseTest(unittest.TestCase):
                 "SELECT value FROM app_settings WHERE key = 'setup_complete'"
             ).fetchone()
 
-        self.assertEqual([row["version"] for row in versions], [1, 2, 3, 4])
+        self.assertEqual([row["version"] for row in versions], [1, 2, 3, 4, 5, 6, 7])
         self.assertTrue(versions[0]["applied_at"])
         self.assertEqual(setting["value"], "false")
 
@@ -77,6 +77,13 @@ class DatabaseTest(unittest.TestCase):
             connection.execute(
                 "INSERT INTO schema_migrations(version, applied_at) VALUES (1, '2026-09-07T00:00:00+00:00')"
             )
+            connection.execute(
+                """INSERT INTO users(username, username_key, password_hash, password_salt,
+                   password_params, real_name, department, role, status, must_change_password,
+                   created_at, updated_at)
+                   VALUES ('legacy', 'legacy', X'00', X'00', '{}', '旧用户', '财务部',
+                           'user', 'active', 0, '2026-09-07', '2026-09-07')"""
+            )
             connection.commit()
         finally:
             connection.close()
@@ -89,9 +96,14 @@ class DatabaseTest(unittest.TestCase):
             versions = [row["version"] for row in connection.execute(
                 "SELECT version FROM schema_migrations ORDER BY version"
             )]
+            legacy = connection.execute(
+                "SELECT license_serial, release_notes_seen_version FROM users WHERE username = 'legacy'"
+            ).fetchone()
         self.assertEqual(columns["status_version"]["dflt_value"], "0")
         self.assertEqual(columns["password_version"]["dflt_value"], "0")
-        self.assertEqual(versions, [1, 2, 3, 4])
+        self.assertEqual(versions, [1, 2, 3, 4, 5, 6, 7])
+        self.assertRegex(legacy["license_serial"], r"^[0-9a-f]{32}$")
+        self.assertIsNone(legacy["release_notes_seen_version"])
 
     def test_migrate_upgrades_existing_v2_database_with_nullable_purge_claim(self):
         connection = self.db.connect()
@@ -137,9 +149,12 @@ class DatabaseTest(unittest.TestCase):
         self.assertIn("purge_claim", columns)
         self.assertEqual(columns["purge_claim"]["type"], "TEXT")
         self.assertIsNone(columns["purge_claim"]["dflt_value"])
-        self.assertEqual(versions, [1, 2, 3, 4])
+        self.assertEqual(versions, [1, 2, 3, 4, 5, 6, 7])
         self.assertEqual(columns["reason"]["type"], "TEXT")
         self.assertEqual(columns["reimbursement_amount"]["type"], "TEXT")
+        self.assertEqual(columns["payload_json"]["type"], "TEXT")
+        self.assertEqual(columns["invoice_layout"]["dflt_value"], "2")
+        self.assertEqual(columns["invoice_names_json"]["dflt_value"], "'[]'")
 
     def test_purge_claim_accepts_only_null_or_canonical_64_hex(self):
         self.db.migrate()

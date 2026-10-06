@@ -3,28 +3,37 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>差旅报销单</title>
-  <link rel="stylesheet" href="/static/styles.css?v=20260909-mileage-dialog">
+  <title>在线报销系统</title>
+  <link rel="icon" type="image/png" href="/static/favicon.png">
+  <script>if (new URLSearchParams(location.search).get('edit')) document.documentElement.classList.add('edit-mode');</script>
+  <script src="/static/sidebar.js?v=20261001-release-notes-onboarding"></script>
+  <link rel="stylesheet" href="/static/styles.css?v=20261001-edit-mode-first-paint">
+  <link rel="stylesheet" href="/static/ui-tokens.css">
+  <link rel="stylesheet" href="/static/ui-components.css?v=20261001-invoice-upload-small">
+  <link rel="stylesheet" href="/static/calendar.css">
 </head>
 <body class="app-body">
   <aside id="app-sidebar" class="app-sidebar" aria-label="主导航">
     <div class="brand"><img class="brand-logo" src="/static/logo.png" alt="" aria-hidden="true"><span>君牧在线报销系统</span></div>
-    <nav><a href="/" aria-current="page"><svg class="ui-icon" aria-hidden="true"><use href="/static/icons.svg#file-pen"></use></svg><span>填写报销</span></a><a href="/history"><svg class="ui-icon" aria-hidden="true"><use href="/static/icons.svg#history"></use></svg><span>报销记录</span></a><a href="/trash"><svg class="ui-icon" aria-hidden="true"><use href="/static/icons.svg#trash-2"></use></svg><span>回收站</span></a></nav>
+    <nav><a href="/" aria-label="填写报销" aria-current="page"><svg class="ui-icon" aria-hidden="true"><use href="/static/icons.svg#file-pen"></use></svg><span>填写报销</span></a><a href="/history" aria-label="报销记录"><svg class="ui-icon" aria-hidden="true"><use href="/static/icons.svg#history"></use></svg><span>报销记录</span></a><a href="/trash" aria-label="回收站"><svg class="ui-icon" aria-hidden="true"><use href="/static/icons.svg#trash-2"></use></svg><span>回收站</span></a><a href="/profile" aria-label="个人中心"><svg class="ui-icon" aria-hidden="true"><use href="/static/icons.svg#user-round"></use></svg><span>个人中心</span></a></nav>
     <div class="sidebar-account" aria-live="polite"><span>当前登录：</span><strong id="current-user">加载中</strong></div>
-    <button id="logout" type="button" class="secondary">退出登录</button>
+    <div class="sidebar-version">版本：<button id="version-details-trigger" class="version-details-trigger" type="button" aria-haspopup="dialog" aria-controls="version-details-dialog" aria-label="查看版本更新详情"><span id="app-version">__APP_VERSION__</span></button></div>
+    <button id="logout" type="button" class="secondary" aria-label="退出登录"><svg class="ui-icon" aria-hidden="true"><use href="/static/icons.svg?v=20261001-collapse#log-out"></use></svg><span>退出登录</span></button>
   </aside>
   <button id="sidebar-toggle" class="sidebar-toggle" type="button" aria-controls="app-sidebar" aria-expanded="false">菜单</button>
+  <button id="sidebar-collapse" class="sidebar-collapse" type="button" aria-controls="app-sidebar" aria-expanded="false" aria-label="展开侧边栏"><svg class="ui-icon" aria-hidden="true"><use href="/static/icons.svg?v=20261001-double-chevron#chevrons-right"></use></svg></button>
   <main class="page-shell">
-    <header class="page-header">
-      <h1><svg class="ui-icon ui-icon-title" aria-hidden="true"><use href="/static/icons.svg#file-text"></use></svg><span>差旅报销单</span></h1>
-      <p>填写报销信息与行程明细，生成可下载的 Excel 和 PDF。</p>
-    </header>
+    <div class="reimbursement-type-switcher" role="tablist" aria-label="报销栏目">
+      <button id="travel-reimbursement-trigger" type="button" role="tab" aria-selected="true"><svg class="ui-icon" aria-hidden="true"><use href="/static/icons.svg#route"></use></svg><span>差旅报销单</span></button>
+      <button id="expense-reimbursement-trigger" type="button" role="tab" aria-selected="false" aria-controls="expense-fields"><svg class="ui-icon" aria-hidden="true"><use href="/static/icons.svg#receipt"></use></svg><span>费用报销单</span></button>
+    </div>
     <form id="reimbursement-form" novalidate autocomplete="off">
       <section class="stats-grid" aria-label="报销统计">
-        <article class="stat-card"><span class="stat-label">本月报销</span><strong id="month-count" class="stat-value" aria-live="polite">0 笔</strong></article>
-        <article class="stat-card"><span class="stat-label">本年报销</span><strong id="year-count" class="stat-value" aria-live="polite">0 笔</strong></article>
-        <article class="stat-card"><span class="stat-label">年报销金额</span><strong id="year-amount" class="stat-value" aria-live="polite">¥0.00</strong></article>
+        <article class="stat-card"><span class="stat-label">本月报销</span><strong id="month-count" class="stat-value" aria-live="polite">•••</strong></article>
+        <article class="stat-card"><span class="stat-label">本年报销</span><strong id="year-count" class="stat-value" aria-live="polite">•••</strong></article>
+        <article class="stat-card"><span class="stat-label">年报销金额</span><strong id="year-amount" class="stat-value" aria-live="polite">•••</strong></article>
       </section>
+      <div id="travel-fields" role="tabpanel" aria-labelledby="travel-reimbursement-trigger">
       <section class="form-section" aria-labelledby="basic-heading">
         <h2 id="basic-heading"><svg class="ui-icon" aria-hidden="true"><use href="/static/icons.svg#info"></use></svg><span>基本信息</span></h2>
         <div class="basic-grid">
@@ -41,6 +50,7 @@
         <div class="section-heading"><h2 id="detail-heading"><svg class="ui-icon" aria-hidden="true"><use href="/static/icons.svg#route"></use></svg><span>行程明细</span></h2></div>
         <div class="table-wrap">
           <table class="detail-table">
+            <colgroup class="detail-colgroup"><col class="detail-col-index"><col class="detail-col-date"><col><col><col><col><col><col><col><col></colgroup>
             <thead><tr><th>序号</th><th>日期</th><th>起点</th><th>终点</th><th>公共交通工具</th><th>公共交通金额</th><th>自驾里程（KM）</th><th>通行费</th><th>住宿费</th><th>单据数</th></tr></thead>
             <tbody id="detail-rows">
               <tr class="detail-row"><th scope="row">1</th><td><input data-field="date" name="row-1-date" type="date"></td><td><input data-field="origin" name="row-1-origin"></td><td><input data-field="destination" name="row-1-destination"></td><td><input data-field="transport" name="row-1-transport"></td><td><input data-field="public_amount" name="row-1-public_amount" type="number" min="0" step="any"></td><td><input data-field="mileage" name="row-1-mileage" type="number" min="0" step="any"></td><td><input data-field="toll" name="row-1-toll" type="number" min="0" step="any"></td><td><input data-field="lodging" name="row-1-lodging" type="number" min="0" step="any"></td><td><input data-field="receipts" name="row-1-receipts" type="number" min="0" step="1"></td></tr>
@@ -59,29 +69,76 @@
         </div>
       </section>
 
+      </div>
+      <div id="expense-fields" role="tabpanel" aria-labelledby="expense-reimbursement-trigger" hidden>
+        <section class="form-section" aria-labelledby="expense-basic-heading">
+          <h2 id="expense-basic-heading"><svg class="ui-icon" aria-hidden="true"><use href="/static/icons.svg#info"></use></svg><span>基本信息</span></h2>
+          <div class="basic-grid">
+            <label>报销日期<input id="expense-date" name="expense-date" type="date"></label>
+            <label>部门<input id="expense-department" readonly></label>
+            <label>报销人<input id="expense-traveler" readonly></label>
+          </div>
+        </section>
+        <section class="form-section" aria-labelledby="expense-detail-heading">
+          <h2 id="expense-detail-heading"><svg class="ui-icon" aria-hidden="true"><use href="/static/icons.svg#receipt"></use></svg><span>费用明细</span></h2>
+          <div class="table-wrap">
+            <table class="detail-table expense-table">
+              <colgroup><col class="detail-col-index"><col><col><col class="expense-amount-col"></colgroup>
+              <thead><tr><th>序号</th><th>报销项目</th><th>摘要</th><th>金额（元）</th></tr></thead>
+              <tbody id="expense-rows">
+                <tr class="expense-row"><th scope="row">1</th><td><input data-field="project" name="expense-1-project" aria-label="第 1 行报销项目"></td><td><input data-field="summary" name="expense-1-summary" aria-label="第 1 行摘要"></td><td><input data-field="amount" name="expense-1-amount" type="number" min="0" step="0.01" aria-label="第 1 行金额"></td></tr>
+                <tr class="expense-row"><th scope="row">2</th><td><input data-field="project" name="expense-2-project" aria-label="第 2 行报销项目"></td><td><input data-field="summary" name="expense-2-summary" aria-label="第 2 行摘要"></td><td><input data-field="amount" name="expense-2-amount" type="number" min="0" step="0.01" aria-label="第 2 行金额"></td></tr>
+                <tr class="expense-row"><th scope="row">3</th><td><input data-field="project" name="expense-3-project" aria-label="第 3 行报销项目"></td><td><input data-field="summary" name="expense-3-summary" aria-label="第 3 行摘要"></td><td><input data-field="amount" name="expense-3-amount" type="number" min="0" step="0.01" aria-label="第 3 行金额"></td></tr>
+                <tr class="expense-row"><th scope="row">4</th><td><input data-field="project" name="expense-4-project" aria-label="第 4 行报销项目"></td><td><input data-field="summary" name="expense-4-summary" aria-label="第 4 行摘要"></td><td><input data-field="amount" name="expense-4-amount" type="number" min="0" step="0.01" aria-label="第 4 行金额"></td></tr>
+                <tr class="expense-row"><th scope="row">5</th><td><input data-field="project" name="expense-5-project" aria-label="第 5 行报销项目"></td><td><input data-field="summary" name="expense-5-summary" aria-label="第 5 行摘要"></td><td><input data-field="amount" name="expense-5-amount" type="number" min="0" step="0.01" aria-label="第 5 行金额"></td></tr>
+                <tr class="expense-row"><th scope="row">6</th><td><input data-field="project" name="expense-6-project" aria-label="第 6 行报销项目"></td><td><input data-field="summary" name="expense-6-summary" aria-label="第 6 行摘要"></td><td><input data-field="amount" name="expense-6-amount" type="number" min="0" step="0.01" aria-label="第 6 行金额"></td></tr>
+                <tr class="expense-row"><th scope="row">7</th><td><input data-field="project" name="expense-7-project" aria-label="第 7 行报销项目"></td><td><input data-field="summary" name="expense-7-summary" aria-label="第 7 行摘要"></td><td><input data-field="amount" name="expense-7-amount" type="number" min="0" step="0.01" aria-label="第 7 行金额"></td></tr>
+                <tr class="expense-row"><th scope="row">8</th><td><input data-field="project" name="expense-8-project" aria-label="第 8 行报销项目"></td><td><input data-field="summary" name="expense-8-summary" aria-label="第 8 行摘要"></td><td><input data-field="amount" name="expense-8-amount" type="number" min="0" step="0.01" aria-label="第 8 行金额"></td></tr>
+                <tr class="expense-row"><th scope="row">9</th><td><input data-field="project" name="expense-9-project" aria-label="第 9 行报销项目"></td><td><input data-field="summary" name="expense-9-summary" aria-label="第 9 行摘要"></td><td><input data-field="amount" name="expense-9-amount" type="number" min="0" step="0.01" aria-label="第 9 行金额"></td></tr>
+                <tr class="expense-row"><th scope="row">10</th><td><input data-field="project" name="expense-10-project" aria-label="第 10 行报销项目"></td><td><input data-field="summary" name="expense-10-summary" aria-label="第 10 行摘要"></td><td><input data-field="amount" name="expense-10-amount" type="number" min="0" step="0.01" aria-label="第 10 行金额"></td></tr>
+                <tr class="expense-row"><th scope="row">11</th><td><input data-field="project" name="expense-11-project" aria-label="第 11 行报销项目"></td><td><input data-field="summary" name="expense-11-summary" aria-label="第 11 行摘要"></td><td><input data-field="amount" name="expense-11-amount" type="number" min="0" step="0.01" aria-label="第 11 行金额"></td></tr>
+              </tbody>
+            </table>
+          </div>
+          <div class="expense-totals" aria-live="polite"><div><span>合计</span><strong id="expense-total">¥0.00</strong></div><div><span>合计（大写）</span><strong id="expense-total-upper">零元整</strong></div></div>
+        </section>
+      </div>
       <section class="form-section upload-section" aria-labelledby="upload-heading">
-        <h2 id="upload-heading"><svg class="ui-icon" aria-hidden="true"><use href="/static/icons.svg#image"></use></svg><span>里程截图</span></h2>
-        <button id="mileage-development-trigger" class="mileage-development-trigger secondary" type="button" aria-haspopup="dialog" aria-controls="mileage-development-dialog">选取文件</button>
-        <!-- Original mileage screenshot picker is intentionally retained for future reactivation.
-        <label for="screenshots" class="file-label">选择里程截图</label>
-        <input id="screenshots" name="screenshots" type="file" accept=".jpg,.jpeg,.png,image/jpeg,image/png" multiple>
-        -->
-        <div id="preview-list" class="preview-list" aria-live="polite"></div>
+        <div class="invoice-upload-content">
+          <div class="invoice-upload-main">
+            <h2 id="upload-heading"><svg class="ui-icon" aria-hidden="true"><use href="/static/icons.svg#file-text"></use></svg><span>上传发票</span></h2>
+            <div class="invoice-layout-options" role="radiogroup" aria-label="发票排版">
+              <span class="invoice-layout-title">发票排版</span>
+              <label class="invoice-layout-choice"><input type="radio" name="invoice-layout" value="2" checked><span>每页2份</span></label>
+              <label class="invoice-layout-choice"><input type="radio" name="invoice-layout" value="4"><span>每页4份</span></label>
+            </div>
+            <div id="invoice-dropzone" class="invoice-dropzone" tabindex="0" aria-label="拖入发票 PDF 或图片，或按回车选取文件">
+              <svg class="ui-icon invoice-dropzone-icon" aria-hidden="true"><use href="/static/icons.svg#file-text"></use></svg>
+              <span>将 PDF 或图片发票拖到此处，或</span>
+              <button id="invoice-select" class="secondary" type="button"><svg class="ui-icon" aria-hidden="true"><use href="/static/icons.svg?v=20261001-invoice-upload#upload"></use></svg><span>上传文件</span></button>
+              <span class="invoice-upload-note">支持 PDF、JPG、PNG；按选择顺序合并，每页或每张图片放 1 张发票</span>
+            </div>
+          </div>
+          <div class="invoice-preview-panel">
+            <ol id="preview-list" class="preview-list" aria-live="polite" aria-label="已选择的发票文件"></ol>
+          </div>
+        </div>
+        <input id="invoice-input" name="invoices" type="file" accept=".pdf,application/pdf,.jpg,.jpeg,.png,image/jpeg,image/png" multiple hidden>
+        <p id="invoice-usage" class="invoice-upload-note" aria-live="polite"></p>
       </section>
       <div id="error" class="result error" role="alert" aria-live="assertive"></div>
+      <a id="invoice-upgrade" class="table-action-button" href="/profile" hidden>升级 Pro</a>
       <div id="result" class="result" role="status" aria-live="polite"></div>
-      <div class="actions"><button id="submit" type="submit">生成 Excel + PDF</button><button id="clear" type="reset" class="secondary">清空</button></div>
+      <div class="actions"><button id="submit" type="submit">生成 PDF</button><button id="clear" type="reset" class="secondary">清空</button></div>
     </form>
-    <dialog id="mileage-development-dialog" class="mileage-development-dialog" aria-labelledby="mileage-development-message">
-      <div class="mileage-development-content">
-        <button id="mileage-development-close" class="mileage-development-close" type="button" aria-label="关闭">
-          <svg class="ui-icon" aria-hidden="true"><use href="/static/icons.svg#x"></use></svg>
-        </button>
-        <img src="/static/mileage-development-qr.jpg" alt="微信支付二维码">
-        <p id="mileage-development-message">功能开发中，扫码助力开发。</p>
-      </div>
+    <dialog id="regenerate-confirm-dialog" aria-labelledby="regenerate-confirm-title">
+      <form method="dialog" class="dialog-form">
+        <h2 id="regenerate-confirm-title">重新生成 PDF</h2>
+        <p>重新生成会覆盖原文件</p>
+        <div class="dialog-actions"><button type="submit" value="confirm">确认</button><button type="submit" value="cancel" class="secondary">取消</button></div>
+      </form>
     </dialog>
   </main>
-  <script src="/static/common.js?v=20260909-account" defer></script><script src="/static/app.js?v=20260909-mileage-dialog" defer></script>
+  <script src="/static/common.js?v=20261001-release-notes-onboarding" defer></script><script src="/static/app.js?v=20261001-invoice-hover-reveal" defer></script><script src="/static/calendar.js" defer></script>
 </body>
 </html>

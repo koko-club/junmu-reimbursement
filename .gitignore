@@ -7,5 +7,10 @@ generated/
 dist/
 backups/
 .env
+.env.*
+!.env.example
 .superpowers/
 .worktrees/
+output/
+**/issuer-private.pem
+**/*private-key*.pem

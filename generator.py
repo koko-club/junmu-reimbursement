@@ -11,6 +11,7 @@ from typing import Any
 
 from openpyxl import load_workbook
 from openpyxl.drawing.image import Image as SpreadsheetImage
+from openpyxl.styles import Border
 from openpyxl.worksheet.page import PageMargins
 from PIL import Image as PillowImage
 
@@ -64,12 +65,10 @@ def populate_main_sheet(ws, payload: dict) -> None:
     ws["K7"] = f"=J7*{allowance}"
 
     rows = payload.get("rows") or []
-    screenshot_count = int(payload.get("screenshot_count", 0) or 0)
     receipt_count = payload.get("receipt_count")
     if receipt_count is None:
         receipt_count = sum((row.get("receipts", 0) or 0) for row in rows if isinstance(row, dict))
     ws["L5"] = "附\n单\n据\n\n张"
-    ws["A25"] = f"详见后附里程截图，共 {screenshot_count} 张"
 
     for row_number in range(9, 20):
         row = rows[row_number - 9] if row_number - 9 < len(rows) and isinstance(rows[row_number - 9], dict) else {}
@@ -96,6 +95,25 @@ def populate_main_sheet(ws, payload: dict) -> None:
             f'=IF(F{row_number}*1 + E{row_number} + H{row_number} + I{row_number} = 0, '
             f'"", F{row_number}*1 + E{row_number} + H{row_number} + I{row_number})'
         )
+
+
+def populate_expense_sheet(ws, payload: dict) -> None:
+    """Fill the eleven expense lines while preserving the supplied form layout."""
+    ws["A3"] = "报销日期：" + str(payload.get("date", "")).replace("-", "/")
+    ws["B4"] = payload.get("department") or None
+    ws["H22"] = "报销人：" + str(payload.get("traveler") or "")
+    rows = payload.get("rows") or []
+    for number in range(7, 18):
+        row = rows[number - 7] if number - 7 < len(rows) else {}
+        ws[f"A{number}"] = row.get("project") or None
+        ws[f"D{number}"] = row.get("summary") or None
+        ws[f"H{number}"] = row.get("amount") if row.get("amount") not in (None, "") else None
+    ws["H18"] = "=SUM(H7:H17)"
+    ws["C20"] = (
+        '=SUBSTITUTE(SUBSTITUTE(TEXT(TRUNC(FIXED(H18)),"[dbnum2]G/通用格式元;负[dbnum2]G/通用格式元;"'
+        '&IF(H18>-0.5%,,"负"))&TEXT(RIGHT(FIXED(H18),2),"[dbnum2]0角0分;;"'
+        '&IF(ABS(H18)>1%,"整",)),"零角",IF(ABS(H18)<1,,"零")),"零分","整")'
+    )
 
 
 def _configure_print(ws, print_area: str | None = None) -> None:
@@ -131,13 +149,14 @@ def add_screenshot_sheet(wb, image_path: Path, index: int, total: int) -> None:
 
 def _trim_to_form(ws) -> None:
     original_last_row = ws.max_row
-    # Remove merged ranges that belong to the repeated sections before deleting
-    # their cells; unmerge_cells cannot process already-deleted placeholders.
+    # Remove the mileage paste area and repeated sections, including their
+    # merged placeholders, before deleting their cells.
     for merged in list(ws.merged_cells.ranges):
-        if merged.min_row > 62 or merged.max_row > 62:
+        if merged.min_row > 23 or merged.max_row > 23:
             ws.merged_cells.ranges.remove(merged)
-    if original_last_row > 62:
-        ws.delete_rows(63, original_last_row - 62)
+    if original_last_row > 23:
+        ws.delete_rows(24, original_last_row - 23)
+    ws["L23"].border = Border()
 
 
 def _set_calculation_mode(wb) -> None:
@@ -168,27 +187,34 @@ def generate_workbook(
     committed = False
     try:
         wb = load_workbook(template_path)
-        if "1月" not in wb.sheetnames:
-            raise ValueError("template does not contain the 1月 worksheet")
-        main = wb["1月"]
+        expense = payload.get("form_type") == "expense"
+        sheet_name = "差旅报销单" if expense else "1月"
+        if sheet_name not in wb.sheetnames:
+            raise ValueError(f"template does not contain the {sheet_name} worksheet")
+        main = wb[sheet_name]
         for sheet in list(wb.worksheets):
             if sheet is not main:
                 wb.remove(sheet)
-        main.title = "差旅报销单"
-        _trim_to_form(main)
-        _configure_print(main, "A1:L62")
+        main.title = "费用报销单" if expense else "差旅报销单"
+        if not expense:
+            _trim_to_form(main)
+        _configure_print(main, "A1:M23" if expense else "A1:L23")
         normalized = dict(payload)
         normalized["screenshot_count"] = len(image_paths)
-        populate_main_sheet(main, normalized)
-        for index, image_path in enumerate(image_paths, 1):
-            add_screenshot_sheet(wb, Path(image_path), index, len(image_paths))
+        if expense:
+            populate_expense_sheet(main, normalized)
+        else:
+            populate_main_sheet(main, normalized)
+            for index, image_path in enumerate(image_paths, 1):
+                add_screenshot_sheet(wb, Path(image_path), index, len(image_paths))
         _set_calculation_mode(wb)
 
         receipt_count = normalized.get("receipt_count")
         if receipt_count is None:
             receipt_count = sum((row.get("receipts", 0) or 0) for row in normalized.get("rows", []) if isinstance(row, dict))
         computed_stem = safe_output_stem(
-            normalized.get("date", ""), normalized.get("traveler", "")
+            normalized.get("date", ""), normalized.get("traveler", ""),
+            normalized.get("form_type", "travel"),
         )
         requested_stem = normalized.get("output_stem")
         stem = requested_stem if requested_stem == computed_stem else computed_stem

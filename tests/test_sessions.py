@@ -40,7 +40,7 @@ class SessionServiceTest(unittest.TestCase):
 
     def _register_and_approve(self, username):
         pending = self.users.register(
-            username, "correct horse battery staple", username.title(), "Engineering"
+            username, "correct horse battery staple", "张三", "技术部"
         )
         return self.users.approve(self.admin.id, pending.id)
 
@@ -73,7 +73,7 @@ class SessionServiceTest(unittest.TestCase):
 
     def test_issue_rejects_non_active_accounts(self):
         pending = self.users.register(
-            "pending", "correct horse battery staple", "Pending", "Engineering"
+            "pending", "correct horse battery staple", "待审人", "技术部"
         )
         self.users.set_enabled(self.admin.id, self.user.id, False)
 
@@ -206,7 +206,7 @@ class UserServiceSessionIntegrationTest(unittest.TestCase):
             "admin", "correct horse battery staple", "Administrator", "Finance"
         )
         pending = self.users.register(
-            "alex", "correct horse battery staple", "Alex", "Engineering"
+            "alex", "correct horse battery staple", "张三", "技术部"
         )
         self.user = self.users.approve(self.admin.id, pending.id)
 

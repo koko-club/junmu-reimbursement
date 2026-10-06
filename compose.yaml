@@ -1,6 +1,9 @@
+name: junmu-reimbursement
+
 services:
-  reimbursement:
-    image: reimbursement-system:latest
+  junmu-reimbursement:
+    image: junmu-reimbursement:${APP_VERSION:?APP_VERSION is required}
+    container_name: junmu-reimbursement-${APP_VERSION:?APP_VERSION is required}
     platform: linux/amd64
     user: "${PUID:-1000}:${PGID:-1000}"
     environment:
@@ -13,11 +16,11 @@ services:
     ports:
       - "8800:8800"
     volumes:
-      - "${DATA_PATH:-./data}:/data"
-      - "${BACKUP_PATH:-./backups}:/backups"
+      - "${DATA_PATH:?DATA_PATH is required}:/data"
+      - "${BACKUP_PATH:?BACKUP_PATH is required}:/backups"
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8800/api/health', timeout=5).read()"]
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8800/healthz', timeout=5).read()"]
       interval: 30s
       timeout: 10s
       start_period: 30s

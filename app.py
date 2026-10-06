@@ -18,6 +18,7 @@ from reimbursements import ReimbursementService
 from security import AnonymousCsrfSigner, PasswordHasher, load_or_create_secret
 from sessions import SessionService
 from users import UserService
+from license_service import LicenseService
 from web import RequestState, WebApplication
 
 
@@ -261,7 +262,9 @@ def create_server(
         database,
         password_hasher,
         revoke_sessions=session_service.revoke_user,
+        data_dir=config.data_dir,
     )
+    license_service = LicenseService(database)
     reimbursement_service = ReimbursementService(database, config, app_secret=secret)
     application = WebApplication(
         config,
@@ -269,6 +272,7 @@ def create_server(
         session_service,
         AnonymousCsrfSigner(secret),
         reimbursement_service,
+        license_service=license_service,
     )
 
     class Handler(BaseHTTPRequestHandler):
@@ -370,6 +374,15 @@ def create_server(
                 return self.rfile.read(length)
             finally:
                 self._deadline_reader.finish_deadline(deadline_token)
+
+        def iter_request_body(self, length: int):
+            remaining = length
+            while remaining:
+                chunk = self.rfile.read(min(65536, remaining))
+                if not chunk:
+                    raise ValueError("请求体不完整")
+                remaining -= len(chunk)
+                yield chunk
 
         def _read_request_line(self, limit: int) -> bytes:
             consumed = bytearray()

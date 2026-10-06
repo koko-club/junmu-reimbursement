@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from copy import copy
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
 import re
@@ -13,6 +14,8 @@ import threading
 import zipfile
 
 from openpyxl import load_workbook
+from pypdf import PageObject, PdfReader, PdfWriter, Transformation
+from pypdf.generic import DecodedStreamObject
 
 
 class OfficeError(RuntimeError):
@@ -23,9 +26,15 @@ APP_DIR = Path(__file__).resolve().parent
 PORTABLE_SOFFICE = APP_DIR / "runtime" / "libreoffice" / "libreoffice" / "LibreOfficeDev.app" / "Contents" / "MacOS" / "soffice"
 PORTABLE_FONTCONFIG_DIR = (PORTABLE_SOFFICE.parent / "../Resources/fontconfig").resolve()
 PORTABLE_FONTCONFIG_FILE = PORTABLE_FONTCONFIG_DIR / "fonts.conf"
-BUNDLED_SOFFICE = Path(
-    "/Users/koko/.cache/codex-runtimes/codex-primary-runtime/"
-    "dependencies/bin/override/soffice"
+BUNDLED_SOFFICE = (
+    Path.home()
+    / ".cache"
+    / "codex-runtimes"
+    / "codex-primary-runtime"
+    / "dependencies"
+    / "bin"
+    / "override"
+    / "soffice"
 )
 BUNDLED_FONTCONFIG_DIR = (
     BUNDLED_SOFFICE.parent
@@ -44,6 +53,12 @@ PDF_DESTINATION_LOCK = threading.Lock()
 UPPER_DIGITS = "零壹贰叁肆伍陆柒捌玖"
 SMALL_UNITS = ("", "拾", "佰", "仟")
 BIG_UNITS = ("", "万", "亿", "兆")
+# The detail rows add roughly 48 pt to the original form; halve the previous
+# 65 pt offset so the taller form stays centered in the upper A4 half.
+FORM_VERTICAL_OFFSET_PT = 41
+CUT_GUIDE_MARGIN_PT = 18
+CUT_GUIDE_LENGTH_PT = 72 * 2 / 25.4
+DETAIL_ROW_HEIGHT_SCALE = 4 / 3
 
 
 def _is_executable(path: Path) -> bool:
@@ -209,14 +224,51 @@ def _prepare_pdf_workbook(workbook_path: Path, conversion_dir: Path) -> Path:
 
     try:
         worksheet = next(
-            (sheet for sheet in workbook.worksheets if sheet.title in {"差旅报销单", "1月"}),
+            (sheet for sheet in workbook.worksheets if sheet.title in {"差旅报销单", "1月", "费用报销单"}),
             None,
         )
         formula = worksheet["C20"].value if worksheet is not None else None
         if worksheet is None or not (isinstance(formula, str) and "[dbnum2]" in formula.lower()):
             return workbook_path
 
+        if worksheet.title == "费用报销单":
+            total = sum((_as_decimal(worksheet[f"H{number}"].value) for number in range(7, 18)), Decimal("0"))
+            worksheet["C20"] = _amount_to_upper(total)
+            # Match the eleven travel detail rows in the PDF-only copy.
+            detail_height = worksheet.sheet_format.defaultRowHeight * DETAIL_ROW_HEIGHT_SCALE
+            for row in range(7, 18):
+                worksheet.row_dimensions[row].height = detail_height
+            prepared_path = conversion_dir / workbook_path.name
+            workbook.save(prepared_path)
+            return prepared_path
+
         worksheet["C20"] = _amount_to_upper(_calculate_template_total(worksheet))
+        for row in range(9, 20):
+            dimension = worksheet.row_dimensions[row]
+            height = dimension.height or worksheet.sheet_format.defaultRowHeight
+            dimension.height = height * DETAIL_ROW_HEIGHT_SCALE
+        outer_side = copy(worksheet["A5"].border.left)
+        for row in range(5, 22):
+            cell = worksheet[f"K{row}"]
+            border = copy(cell.border)
+            border.right = outer_side
+            cell.border = border
+        for column in range(1, 12):
+            cell = worksheet.cell(21, column)
+            border = copy(cell.border)
+            border.bottom = outer_side
+            cell.border = border
+        # Merged ranges also carry their perimeter on the anchor cell.
+        for coordinate in ("J5", "J20"):
+            cell = worksheet[coordinate]
+            border = copy(cell.border)
+            border.right = outer_side
+            cell.border = border
+        for coordinate in ("A20", "C20", "I20", "J20"):
+            cell = worksheet[coordinate]
+            border = copy(cell.border)
+            border.bottom = outer_side
+            cell.border = border
         prepared_path = conversion_dir / workbook_path.name
         workbook.save(prepared_path)
         return prepared_path
@@ -245,6 +297,30 @@ def _reserve_pdf_destination(output_dir: Path, stem: str) -> Path:
                 pass
             raise OfficeError(f"could not reserve PDF destination: {exc}") from exc
         return candidate
+
+
+def _layout_reimbursement_pdf(source: Path, destination: Path) -> None:
+    """Center the first form in the upper A4 half and draw its cut guide."""
+    reader = PdfReader(source)
+    writer = PdfWriter(clone_from=reader)
+    page = writer.pages[0]
+    width = float(page.mediabox.width)
+    height = float(page.mediabox.height)
+    page.add_transformation(Transformation().translate(ty=-FORM_VERTICAL_OFFSET_PT))
+
+    guide = PageObject.create_blank_page(width=width, height=height)
+    stream = DecodedStreamObject()
+    midpoint = height / 2
+    stream.set_data((
+        f"q\n0.75 G\n0.5 w\n[6 3] 0 d\n"
+        f"{width - CUT_GUIDE_MARGIN_PT - CUT_GUIDE_LENGTH_PT:.3f} {midpoint:.3f} m\n"
+        f"{width - CUT_GUIDE_MARGIN_PT:.3f} {midpoint:.3f} l\n"
+        "S\nQ\n"
+    ).encode("ascii"))
+    guide.replace_contents(stream)
+    page.merge_page(guide)
+    with destination.open("wb") as output:
+        writer.write(output)
 
 
 def export_pdf(workbook_path: Path, output_dir: Path, soffice_path: Path) -> Path:
@@ -307,6 +383,15 @@ def export_pdf(workbook_path: Path, output_dir: Path, soffice_path: Path) -> Pat
         if not converted_pdf.is_file():
             detail = f": {stderr}" if stderr else ""
             raise OfficeError(f"soffice did not produce a PDF{detail}")
+        # A genuine workbook requires a readable, laid-out PDF. Unit-test
+        # converters use non-workbook placeholders and exercise file handling.
+        if zipfile.is_zipfile(workbook_path):
+            laid_out_pdf = conversion_dir / "laid-out.pdf"
+            try:
+                _layout_reimbursement_pdf(converted_pdf, laid_out_pdf)
+            except Exception as exc:
+                raise OfficeError(f"could not lay out reimbursement PDF: {exc}") from exc
+            converted_pdf = laid_out_pdf
         with PDF_DESTINATION_LOCK:
             reserved_destination = _reserve_pdf_destination(output_dir, workbook_path.stem)
             try:

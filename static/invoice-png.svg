@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" role="img" aria-label="PNG">
+  <path d="M5 1.5h9.5L20 7v14a1.5 1.5 0 0 1-1.5 1.5h-13A1.5 1.5 0 0 1 4 21V3a1.5 1.5 0 0 1 1-1.5z" fill="#46A77A"/>
+  <path d="M14.5 1.5V7H20" fill="#A6DABE"/>
+  <rect x="5.8" y="12" width="12.4" height="7.4" rx="1" fill="#FFFFFF"/>
+  <text x="12" y="17.5" fill="#2E885B" font-family="Arial, sans-serif" font-size="6" font-weight="700" text-anchor="middle">PNG</text>
+</svg>

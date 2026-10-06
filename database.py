@@ -6,6 +6,7 @@ from contextlib import ExitStack, contextmanager
 from datetime import datetime, timezone
 import logging
 from pathlib import Path
+import secrets
 import sqlite3
 from typing import Callable, Iterator
 
@@ -259,6 +260,60 @@ class Database:
                 connection.execute(
                     "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
                     (4, datetime.now(timezone.utc).isoformat()),
+                )
+            version = connection.execute(
+                "SELECT 1 FROM schema_migrations WHERE version = 5"
+            ).fetchone()
+            if version is None:
+                columns = {row["name"] for row in connection.execute("PRAGMA table_info(reimbursements)")}
+                for name, declaration in (
+                    ("payload_json", "TEXT"),
+                    ("invoice_layout", "INTEGER NOT NULL DEFAULT 2"),
+                    ("invoice_names_json", "TEXT NOT NULL DEFAULT '[]'"),
+                ):
+                    if name not in columns:
+                        connection.execute(f"ALTER TABLE reimbursements ADD COLUMN {name} {declaration}")
+                connection.execute(
+                    "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
+                    (5, datetime.now(timezone.utc).isoformat()),
+                )
+            version = connection.execute(
+                "SELECT 1 FROM schema_migrations WHERE version = 6"
+            ).fetchone()
+            if version is None:
+                columns = {row["name"] for row in connection.execute("PRAGMA table_info(users)")}
+                for name, declaration in (
+                    ("license_serial", "TEXT"),
+                    ("license_code", "TEXT"),
+                    ("license_last_seen_at", "TEXT"),
+                ):
+                    if name not in columns:
+                        connection.execute(f"ALTER TABLE users ADD COLUMN {name} {declaration}")
+                for row in connection.execute("SELECT id FROM users WHERE license_serial IS NULL"):
+                    connection.execute(
+                        "UPDATE users SET license_serial = ? WHERE id = ?",
+                        (secrets.token_hex(16), row["id"]),
+                    )
+                connection.execute(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS users_license_serial ON users(license_serial)"
+                )
+                connection.execute(
+                    "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
+                    (6, datetime.now(timezone.utc).isoformat()),
+                )
+            version = connection.execute(
+                "SELECT 1 FROM schema_migrations WHERE version = 7"
+            ).fetchone()
+            if version is None:
+                user_columns = {row["name"] for row in connection.execute("PRAGMA table_info(users)")}
+                session_columns = {row["name"] for row in connection.execute("PRAGMA table_info(sessions)")}
+                if "release_notes_seen_version" not in user_columns:
+                    connection.execute("ALTER TABLE users ADD COLUMN release_notes_seen_version TEXT")
+                if "release_notes_pending_version" not in session_columns:
+                    connection.execute("ALTER TABLE sessions ADD COLUMN release_notes_pending_version TEXT")
+                connection.execute(
+                    "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
+                    (7, datetime.now(timezone.utc).isoformat()),
                 )
             connection.commit()
         except Exception:

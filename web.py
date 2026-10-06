@@ -2,10 +2,9 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
-from email import policy
-from email.parser import BytesParser
+from email.message import Message
 import hashlib
 from http import cookies
 from http.server import BaseHTTPRequestHandler
@@ -24,6 +23,14 @@ from urllib.parse import parse_qs, quote, unquote, urlsplit
 from uuid import UUID
 
 from config import AppConfig
+from license import InvalidLicense
+from license_service import ClockRollback, LicenseService
+from invoice_pdf import prepare_invoice_uploads
+from permissions import (
+    HISTORY_LIMIT_MESSAGE, InvoiceLimitExceeded, history_cutoff, history_visible,
+    permissions_for_license,
+)
+from multipart_upload import UploadParts, parse_multipart_upload
 from reimbursements import (
     ReimbursementGenerationError,
     ReimbursementNotFound,
@@ -37,10 +44,12 @@ from users import (
     AuthenticationFailed,
     InvalidState,
     PermissionDenied,
+    RegistrationValidationError,
     SetupClosed,
     UserError,
     UserNotFound,
     UserOperationBusy,
+    UserDeletionStorageError,
     UserService,
     UsernameTaken,
     ValidationError,
@@ -48,12 +57,13 @@ from users import (
 )
 from validation import (
     ValidationError as ReimbursementValidationError,
-    validate_image_filename,
     validate_payload,
 )
 
 
 _LOGGER = logging.getLogger(__name__)
+VERSION_PATH = Path(__file__).resolve().parent / "VERSION"
+SITE_NAME = "在线报销系统"
 _COOKIE_NAME = "reimbursement_session"
 _COOKIE_MAX_AGE = 7 * 24 * 60 * 60
 RATE_LIMIT_ATTEMPTS = 5
@@ -61,6 +71,7 @@ RATE_LIMIT_WINDOW_SECONDS = 15 * 60
 RATE_LIMIT_MAX_KEYS = 4096
 LOGIN_IP_RATE_LIMIT_ATTEMPTS = 10
 LOGIN_GLOBAL_RATE_LIMIT_ATTEMPTS = 100
+LOGIN_LOCK_SECONDS = 60
 _INVALID_LOGIN_USERNAME_KEY = ("invalid", "<invalid>")
 _REIMBURSEMENT_PREFIX = "/api/reimbursements/"
 _ADMIN_PREFIX = "/api/admin/"
@@ -71,6 +82,16 @@ _STATIC_EXTENSIONS = {
     ".css", ".js", ".html", ".ico", ".png", ".jpg", ".jpeg", ".svg", ".webp",
     ".woff", ".woff2", ".ttf",
 }
+
+
+def _load_app_version() -> str:
+    try:
+        version = VERSION_PATH.read_text(encoding="utf-8").strip()
+    except (OSError, UnicodeError) as error:
+        raise RuntimeError("application version unavailable") from error
+    if not version:
+        raise RuntimeError("application version unavailable")
+    return version
 
 
 @dataclass(frozen=True)
@@ -199,6 +220,66 @@ class AttemptRateLimiter:
             self._attempts.pop(key, None)
 
 
+class LoginFailureLimiter:
+    """Lock an account/IP pair for 60 seconds after five failed logins."""
+
+    def __init__(
+        self,
+        clock: Callable[[], float] = time.monotonic,
+        max_keys: int = RATE_LIMIT_MAX_KEYS,
+    ):
+        self._clock = clock
+        self._max_keys = max_keys
+        self._lock = threading.Lock()
+        self._failures: dict[Hashable, list[float]] = {}
+        self._locked_until: dict[Hashable, float] = {}
+
+    def _prune(self, now: float) -> None:
+        for key, until in list(self._locked_until.items()):
+            if until <= now:
+                del self._locked_until[key]
+        cutoff = now - RATE_LIMIT_WINDOW_SECONDS
+        for key, timestamps in list(self._failures.items()):
+            retained = [timestamp for timestamp in timestamps if timestamp > cutoff]
+            if retained:
+                self._failures[key] = retained
+            else:
+                del self._failures[key]
+
+    def remaining(self, key: Hashable) -> int | None:
+        with self._lock:
+            now = self._clock()
+            self._prune(now)
+            until = self._locked_until.get(key)
+            if until is not None:
+                return max(1, math.ceil(until - now))
+            if key not in self._failures and len(self._failures) + len(self._locked_until) >= self._max_keys:
+                return LOGIN_LOCK_SECONDS
+            return None
+
+    def record_failure(self, key: Hashable) -> int | None:
+        with self._lock:
+            now = self._clock()
+            self._prune(now)
+            until = self._locked_until.get(key)
+            if until is not None:
+                return max(1, math.ceil(until - now))
+            if key not in self._failures and len(self._failures) + len(self._locked_until) >= self._max_keys:
+                return LOGIN_LOCK_SECONDS
+            failures = self._failures.setdefault(key, [])
+            failures.append(now)
+            if len(failures) < RATE_LIMIT_ATTEMPTS:
+                return None
+            del self._failures[key]
+            self._locked_until[key] = now + LOGIN_LOCK_SECONDS
+            return LOGIN_LOCK_SECONDS
+
+    def clear(self, key: Hashable) -> None:
+        with self._lock:
+            self._failures.pop(key, None)
+            self._locked_until.pop(key, None)
+
+
 class WebApplication:
     """Apply ordered access guards and dispatch the fixed authentication routes."""
 
@@ -210,13 +291,20 @@ class WebApplication:
         anonymous_csrf: AnonymousCsrfSigner,
         reimbursement_service: ReimbursementService,
         rate_limiter: AttemptRateLimiter | None = None,
+        license_service: LicenseService | None = None,
     ):
         self.config = config
         self.user_service = user_service
         self.session_service = session_service
         self.anonymous_csrf = anonymous_csrf
         self.reimbursement_service = reimbursement_service
+        self.license_service = license_service
         self.rate_limiter = rate_limiter or AttemptRateLimiter()
+        self.login_failure_limiter = LoginFailureLimiter()
+        try:
+            self.app_version: str | None = _load_app_version()
+        except RuntimeError:
+            self.app_version = None
         self._upload_slots = threading.BoundedSemaphore(
             config.max_concurrent_generations
         )
@@ -228,11 +316,17 @@ class WebApplication:
             "/api/session": Route(
                 "_session", authentication=True, allow_forced_password_change=True
             ),
+            "/profile": Route("_profile_page", authentication=True, roles=("user",)),
+            "/api/license": Route("_license_status", authentication=True, roles=("user",)),
+            "/api/permissions": Route("_permissions_status", authentication=True, roles=("user",)),
             "/api/reimbursements": Route(
                 "_reimbursement_list", authentication=True, roles=("user",)
             ),
             "/api/reimbursements/stats": Route(
                 "_reimbursement_stats", authentication=True, roles=("user",)
+            ),
+            "/api/travel-days": Route(
+                "_travel_days", authentication=True, roles=("user",)
             ),
             "/history": Route("_history_page", authentication=True, roles=("user",)),
             "/trash": Route("_trash_page", authentication=True, roles=("user",)),
@@ -258,6 +352,18 @@ class WebApplication:
             "/api/logout": Route(
                 "_logout", authentication=True, allow_forced_password_change=True,
                 csrf="session",
+            ),
+            "/api/release-notes/seen": Route(
+                "_release_notes_seen", authentication=True, csrf="session",
+            ),
+            "/api/profile": Route(
+                "_update_own_profile", authentication=True, roles=("user",), csrf="session",
+            ),
+            "/api/license/import": Route(
+                "_license_import", authentication=True, roles=("user",), csrf="session",
+            ),
+            "/api/invoices/inspect": Route(
+                "_invoice_inspect", authentication=True, roles=("user",), csrf="session",
             ),
             "/api/reimbursements/generate": Route(
                 "_reimbursement_generate", authentication=True, roles=("user",),
@@ -443,6 +549,10 @@ class WebApplication:
             return None
         if method == "GET" and parts[1] in {"xlsx", "pdf"}:
             return Route("_reimbursement_download", authentication=True)
+        if method == "GET" and parts[1] == "edit":
+            return Route("_reimbursement_edit_detail", authentication=True, roles=("user",))
+        if method == "POST" and parts[1] == "regenerate":
+            return Route("_reimbursement_regenerate", authentication=True, roles=("user",), csrf="session")
         if method == "POST" and parts[1] in {"trash", "restore", "purge"}:
             return Route(
                 "_reimbursement_lifecycle", authentication=True, roles=("user",),
@@ -460,7 +570,7 @@ class WebApplication:
         section, identifier, action = parts
         actions = {
             "registrations": {"approve", "reject"},
-            "users": {"profile", "status", "reset-password"},
+            "users": {"profile", "status", "reset-password", "delete"},
         }
         if action not in actions.get(section, ()):
             return None
@@ -519,12 +629,12 @@ class WebApplication:
         assert user is not None
         self._template_page(handler, "change-password.html", user.csrf_token)
 
+    def _profile_page(self, handler, user, _token) -> None:
+        assert user is not None
+        self._template_page(handler, "profile.html", user.csrf_token)
+
     def _root(self, handler, _user, _token) -> None:
-        index_path = self.config.templates_dir / "index.html"
-        if not index_path.is_file():
-            self._json(handler, 500, {"error": "页面模板不可用"})
-            return
-        self._file(handler, index_path, "text/html; charset=utf-8", no_store=True)
+        self._template_page(handler, "index.html", "")
 
     def _history_page(self, handler, user, _token) -> None:
         assert user is not None
@@ -561,6 +671,7 @@ class WebApplication:
             return
         expected_fields = {
             "profile": {"real_name", "department"}, "status": {"enabled"},
+            "delete": {"password"},
         }.get(action, set())
         if set(payload) != expected_fields:
             self._json(handler, 400, {"error": "请求字段不符合要求，请检查提交内容"})
@@ -570,6 +681,9 @@ class WebApplication:
             return
         if action == "status" and type(payload["enabled"]) is not bool:
             self._json(handler, 400, {"error": "启用状态必须为布尔值"})
+            return
+        if action == "delete" and (not isinstance(payload["password"], str) or not payload["password"]):
+            self._json(handler, 400, {"error": "请输入管理员密码"})
             return
         if action == "profile":
             try:
@@ -595,6 +709,22 @@ class WebApplication:
                 )
             elif action == "status":
                 result = self.user_service.set_enabled(user.user_id, user_id, payload["enabled"])
+            elif action == "delete":
+                limit_key = ("admin-delete", user.user_id, self._client_ip(handler))
+                remaining = self.login_failure_limiter.remaining(limit_key)
+                if remaining is not None:
+                    self._json(handler, 429, {"error": f"验证失败次数过多，请在 {remaining} 秒后重试"},
+                               headers={"Retry-After": str(remaining)})
+                    return
+                try:
+                    self.user_service.delete_user(user.user_id, user_id, payload["password"])
+                except AuthenticationFailed:
+                    self.login_failure_limiter.record_failure(limit_key)
+                    self._json(handler, 403, {"error": "管理员密码错误"})
+                    return
+                self.login_failure_limiter.clear(limit_key)
+                self._json(handler, 200, {"message": "用户及其全部数据已删除"})
+                return
             else:
                 temporary_password = self.user_service.reset_password(user.user_id, user_id)
                 self._json(handler, 200, {"temporary_password": temporary_password})
@@ -613,6 +743,10 @@ class WebApplication:
             status, message = 409, "用户当前状态不支持此操作，请刷新列表"
         elif isinstance(error, UserOperationBusy):
             status, message = 409, "该用户正在进行其他操作，请稍后重试"
+        elif isinstance(error, UserDeletionStorageError):
+            status = 500
+            message = ("用户已删除，但文件清理失败，请检查服务器数据目录"
+                       if error.account_deleted else "用户文件清理失败，用户未删除")
         else:
             status, message = 400, "用户信息不符合要求，请检查姓名和部门"
         self._json(handler, status, {"error": message})
@@ -659,10 +793,13 @@ class WebApplication:
             username_key,
             client_ip,
         )
+        remaining = self.login_failure_limiter.remaining(account_limit_key)
+        if remaining is not None:
+            self._login_locked(handler, remaining)
+            return
         if self._rate_limited_many(
             handler,
             (
-                (account_limit_key, RATE_LIMIT_ATTEMPTS),
                 (("login-ip", client_ip), LOGIN_IP_RATE_LIMIT_ATTEMPTS),
                 (("login-global",), LOGIN_GLOBAL_RATE_LIMIT_ATTEMPTS),
             ),
@@ -671,11 +808,17 @@ class WebApplication:
         try:
             authenticated_user = self.user_service.authenticate(username, password)
             self._request_state(handler).user_id = authenticated_user.id
-            issued = self.session_service.issue(authenticated_user)
+            issued = self.session_service.issue(
+                authenticated_user, release_notes_version=self.app_version
+            )
         except (AuthenticationFailed, ValueError):
-            self._login_failed(handler)
+            remaining = self.login_failure_limiter.record_failure(account_limit_key)
+            if remaining is not None:
+                self._login_locked(handler, remaining)
+            else:
+                self._login_failed(handler)
             return
-        self.rate_limiter.clear(account_limit_key)
+        self.login_failure_limiter.clear(account_limit_key)
         self._json(
             handler,
             200,
@@ -689,14 +832,19 @@ class WebApplication:
             return
         values = self._required_strings(payload, "username", "password", "real_name", "department")
         if values is None:
-            self._json(handler, 400, {"error": "请完整填写注册信息"})
+            labels = {"username": "账号", "password": "密码", "real_name": "姓名", "department": "部门"}
+            field = next(name for name in labels if not isinstance(payload.get(name), str))
+            self._json(handler, 400, {"error": f"{labels[field]}不能为空", "field": field})
             return
         if self._rate_limited(handler, ("register", self._client_ip(handler))):
             return
         try:
             self.user_service.register(*values)
         except UsernameTaken:
-            self._json(handler, 409, {"error": "用户名已存在"})
+            self._json(handler, 409, {"error": "用户名已存在", "field": "username"})
+            return
+        except RegistrationValidationError as error:
+            self._json(handler, 400, {"error": str(error), "field": error.field})
             return
         except (UserError, ValueError):
             self._json(handler, 400, {"error": "注册信息不符合要求"})
@@ -705,21 +853,124 @@ class WebApplication:
 
     def _session(self, handler, user, _token) -> None:
         assert user is not None
-        self._json(
-            handler,
-            200,
-            {
-                "user": {
-                    "id": user.user_id,
-                    "username": user.username,
-                    "real_name": user.real_name,
-                    "department": user.department,
-                    "role": user.role,
-                    "must_change_password": user.must_change_password,
-                },
-                "csrf_token": user.csrf_token,
+        response = {
+            "user": {
+                "id": user.user_id,
+                "username": user.username,
+                "real_name": user.real_name,
+                "department": user.department,
+                "role": user.role,
+                "status": "active",
+                "must_change_password": user.must_change_password,
             },
-        )
+            "csrf_token": user.csrf_token,
+        }
+        if user.release_notes_version:
+            response["release_notes_version"] = user.release_notes_version
+        self._json(handler, 200, response)
+
+    def _release_notes_seen(self, handler, _user, token) -> None:
+        payload = self._json_body(handler)
+        if payload is None:
+            return
+        version = payload.get("version")
+        if version != self.app_version:
+            self._json(handler, 400, {"error": "版本信息不匹配"})
+            return
+        self.session_service.acknowledge_release_notes(token, version)
+        self._json(handler, 200, {"message": "已查看版本更新"})
+
+    def _license_status(self, handler, user, _token) -> None:
+        assert user is not None and self.license_service is not None
+        self._json(handler, 200, asdict(self.license_service.status(user.user_id)))
+
+    def _permissions_status(self, handler, user, _token) -> None:
+        assert user is not None and self.license_service is not None
+        state = self.license_service.status(user.user_id)
+        access = permissions_for_license(state)
+        self._json(handler, 200, {
+            "invoice_limit": access.invoice_limit,
+            "history_retention_months": access.history_retention_months,
+            "reimbursement_stats": access.reimbursement_stats,
+            "travel_trend": access.travel_trend,
+            "license_expires_at": state.expires_at,
+            "server_now": datetime.now(timezone.utc).isoformat(),
+        })
+
+    def _history_cutoff(self, user) -> datetime | None:
+        assert self.license_service is not None
+        access = permissions_for_license(self.license_service.status(user.user_id))
+        return history_cutoff(access.history_retention_months)
+
+    def _allow_history_record(self, handler, user, record_id: str) -> bool:
+        cutoff = self._history_cutoff(user)
+        if cutoff is None:
+            return True
+        try:
+            created_at = self.reimbursement_service.record_created_at(user.user_id, record_id)
+        except ReimbursementNotFound:
+            self._record_not_found(handler)
+            return False
+        if not history_visible(created_at, cutoff):
+            self._json(handler, 403, {
+                "error": HISTORY_LIMIT_MESSAGE,
+                "upgrade_url": "/profile",
+            })
+            return False
+        return True
+
+    def _invoice_inspect(self, handler, user, _token) -> None:
+        assert user is not None
+        with tempfile.TemporaryDirectory(prefix="invoice-inspect-") as temporary:
+            upload = self._multipart_body(handler, Path(temporary))
+            if upload is None:
+                return
+            try:
+                _prepared, counts = prepare_invoice_uploads(upload.invoices)
+            except ValueError as error:
+                self._json(handler, 400, {"error": str(error)})
+                return
+        self._json(handler, 200, {"counts": counts})
+
+    def _license_import(self, handler, user, _token) -> None:
+        assert user is not None and self.license_service is not None
+        payload = self._json_body(handler)
+        if payload is None:
+            return
+        if set(payload) != {"code"} or not isinstance(payload["code"], str):
+            self._json(handler, 400, {"error": "请填写授权码"})
+            return
+        try:
+            state = self.license_service.import_code(user.user_id, payload["code"].strip())
+        except ClockRollback:
+            self._json(handler, 409, {"error": "服务器时间发生回退，请校准服务器时间后重试"})
+            return
+        except InvalidLicense:
+            self._json(handler, 400, {"error": "授权码无效、已过期或不属于当前账号"})
+            return
+        self._json(handler, 200, asdict(state))
+
+    def _update_own_profile(self, handler, user, _token) -> None:
+        assert user is not None
+        payload = self._json_body(handler)
+        if payload is None:
+            return
+        if set(payload) != {"real_name", "department"} or self._required_strings(
+            payload, "real_name", "department"
+        ) is None:
+            self._json(handler, 400, {"error": "请填写姓名和部门"})
+            return
+        try:
+            updated = self.user_service.update_own_profile(
+                user.user_id, payload["real_name"], payload["department"]
+            )
+        except (UserError, ValueError):
+            self._json(handler, 400, {"error": "姓名或部门不符合要求"})
+            return
+        self._json(handler, 200, {"user": {
+            "username": updated.username, "real_name": updated.real_name,
+            "department": updated.department, "status": updated.status,
+        }})
 
     def _change_password(self, handler, user, _token) -> None:
         assert user is not None
@@ -760,10 +1011,12 @@ class WebApplication:
             self._json(handler, 400, {"error": "报销记录范围无效"})
             return
         scope = parameters["scope"][0]
+        cutoff = self._history_cutoff(user)
+        history_args = {"created_after": cutoff} if cutoff is not None else {}
         if scope == "active":
-            records = self.reimbursement_service.list_active(user.user_id)
+            records = self.reimbursement_service.list_active(user.user_id, **history_args)
         elif scope == "trash":
-            records = self.reimbursement_service.list_trash(user.user_id)
+            records = self.reimbursement_service.list_trash(user.user_id, **history_args)
         else:
             self._json(handler, 400, {"error": "报销记录范围无效"})
             return
@@ -774,8 +1027,56 @@ class WebApplication:
         )
 
     def _reimbursement_stats(self, handler, user, _token) -> None:
+        assert user is not None and self.license_service is not None
+        parameters = parse_qs(urlsplit(handler.path).query, keep_blank_values=True)
+        if not parameters:
+            form_type = None
+        elif set(parameters) == {"form_type"} and len(parameters["form_type"]) == 1 \
+                and parameters["form_type"][0] in ("travel", "expense"):
+            form_type = parameters["form_type"][0]
+        else:
+            self._json(handler, 400, {"error": "报销单类型无效"})
+            return
+        access = permissions_for_license(self.license_service.status(user.user_id))
+        if form_type is None and not access.reimbursement_stats:
+            self._json(handler, 403, {
+                "error": "Pro 专属统计，升级 Pro 后查看。",
+                "upgrade_url": "/profile",
+            })
+            return
+        stats = self.reimbursement_service.active_stats(
+            user.user_id, **({"form_type": form_type} if form_type is not None else {})
+        )
+        self._json(handler, 200, stats)
+
+    def _travel_days(self, handler, user, _token) -> None:
+        assert user is not None and self.license_service is not None
+        access = permissions_for_license(self.license_service.status(user.user_id))
+        if not access.travel_trend:
+            self._json(handler, 403, {
+                "error": "Pro 专属功能，升级后查看出差趋势。",
+                "upgrade_url": "/profile",
+            })
+            return
+        self._json(
+            handler, 200,
+            self.reimbursement_service.travel_days_by_month(user.user_id),
+        )
+
+    def _reimbursement_edit_detail(self, handler, user, _token) -> None:
         assert user is not None
-        self._json(handler, 200, self.reimbursement_service.active_stats(user.user_id))
+        parts = self._reimbursement_parts(handler)
+        if parts is None or parts[1] != "edit":
+            self._record_not_found(handler)
+            return
+        if not self._allow_history_record(handler, user, parts[0]):
+            return
+        try:
+            self._json(handler, 200, self.reimbursement_service.edit_details(user.user_id, parts[0]))
+        except ReimbursementNotFound:
+            self._record_not_found(handler)
+        except (OSError, ValueError, UnicodeError):
+            self._json(handler, 500, {"error": "报销记录暂时无法编辑"})
 
     def _reimbursement_download(self, handler, user, _token) -> None:
         assert user is not None
@@ -784,6 +1085,8 @@ class WebApplication:
             self._record_not_found(handler)
             return
         record_id, kind = parts
+        if not self._allow_history_record(handler, user, record_id):
+            return
         try:
             owned_file = self.reimbursement_service.owned_file(
                 user.user_id, record_id, kind
@@ -833,6 +1136,8 @@ class WebApplication:
             self._record_not_found(handler)
             return
         record_id, action = parts
+        if not self._allow_history_record(handler, user, record_id):
+            return
         payload = self._json_body(handler)
         if payload is None:
             return
@@ -868,39 +1173,62 @@ class WebApplication:
         with self._upload_slots:
             self._reimbursement_generate_admitted(handler, user)
 
-    def _reimbursement_generate_admitted(self, handler, user) -> None:
-        body = self._multipart_body(handler)
-        if body is None:
+    def _reimbursement_regenerate(self, handler, user, _token) -> None:
+        assert user is not None
+        parts = self._reimbursement_parts(handler)
+        if parts is None or parts[1] != "regenerate":
+            self._record_not_found(handler)
             return
-        content_type = handler.headers.get("Content-Type", "")
-        try:
-            message = BytesParser(policy=policy.default).parsebytes(
-                (f"Content-Type: {content_type}\r\nMIME-Version: 1.0\r\n\r\n").encode(
-                    "utf-8"
+        record_id = parts[0]
+        if not self._allow_history_record(handler, user, record_id):
+            return
+        with self._upload_slots, tempfile.TemporaryDirectory(prefix="reimbursement-edit-upload-") as temporary:
+            upload = self._multipart_body(handler, Path(temporary))
+            if upload is None:
+                return
+            try:
+                if upload.payload_raw is None:
+                    raise ReimbursementValidationError("payload part is required")
+                payload = json.loads(upload.payload_raw.decode("utf-8"))
+                if not isinstance(payload, dict):
+                    raise ReimbursementValidationError("payload must be an object")
+                keep_invoices = payload.pop("keep_invoices", [])
+                validate_payload(payload, traveler=user.real_name, department=user.department)
+                layout_raw = upload.layout_raw if upload.layout_raw is not None else b"2"
+                if layout_raw not in (b"2", b"4"):
+                    raise ReimbursementValidationError("发票排版方式无效")
+                invoices, _invoice_counts = prepare_invoice_uploads(upload.invoices)
+                access = permissions_for_license(self.license_service.status(user.user_id))
+                record = self.reimbursement_service.regenerate(
+                    user, record_id, payload, keep_invoices, invoices,
+                    invoice_layout=int(layout_raw), invoice_limit=access.invoice_limit,
                 )
-                + body
-            )
-            if not message.is_multipart():
-                raise ValueError("invalid multipart body")
-            payload_raw: bytes | None = None
-            screenshots: list[tuple[str, bytes]] = []
-            for part in message.iter_parts():
-                name = part.get_param("name", header="content-disposition")
-                if name == "payload" and payload_raw is None:
-                    payload_raw = part.get_payload(decode=True) or b""
-                elif name == "screenshots":
-                    filename = part.get_filename()
-                    if filename:
-                        screenshots.append(
-                            (
-                                validate_image_filename(filename),
-                                part.get_payload(decode=True) or b"",
-                            )
-                        )
-            if payload_raw is None:
+            except InvoiceLimitExceeded as error:
+                self._json(handler, 403, {"error": str(error), "upgrade_url": "/profile"})
+                return
+            except (ReimbursementValidationError, ValueError, UnicodeError, json.JSONDecodeError) as error:
+                self._json(handler, 400, {"error": str(error) or "报销请求格式错误"})
+                return
+            except ReimbursementNotFound:
+                self._record_not_found(handler)
+                return
+            except ReimbursementGenerationError as error:
+                self._json(handler, 500, {"error": str(error)})
+                return
+        self._json(handler, 200, {"record": self._record_payload(record),
+                                  "xlsx_url": f"/api/reimbursements/{record_id}/xlsx",
+                                  "pdf_url": f"/api/reimbursements/{record_id}/pdf"})
+
+    def _reimbursement_generate_admitted(self, handler, user) -> None:
+        upload_directory = tempfile.TemporaryDirectory(prefix="reimbursement-upload-")
+        try:
+            parts = self._multipart_body(handler, Path(upload_directory.name))
+            if parts is None:
+                return
+            if parts.payload_raw is None:
                 raise ReimbursementValidationError("payload part is required")
             try:
-                raw_payload = json.loads(payload_raw.decode("utf-8"))
+                raw_payload = json.loads(parts.payload_raw.decode("utf-8"))
             except (UnicodeDecodeError, json.JSONDecodeError):
                 raise ReimbursementValidationError("invalid JSON payload") from None
             validate_payload(
@@ -908,32 +1236,45 @@ class WebApplication:
                 traveler=user.real_name,
                 department=user.department,
             )
+            layout_raw = parts.layout_raw if parts.layout_raw is not None else b"2"
+            if layout_raw not in (b"2", b"4"):
+                raise ReimbursementValidationError("发票排版方式无效")
+            invoice_layout = int(layout_raw)
+            invoices, invoice_counts = prepare_invoice_uploads(parts.invoices)
+            access = permissions_for_license(self.license_service.status(user.user_id))
+            if access.invoice_limit is not None and sum(invoice_counts) > access.invoice_limit:
+                raise InvoiceLimitExceeded()
+            if invoices:
+                if invoice_layout == 4:
+                    record = self.reimbursement_service.generate(
+                        user, raw_payload, parts.screenshots, invoices,
+                        invoice_layout=4,
+                    )
+                else:
+                    record = self.reimbursement_service.generate(
+                        user, raw_payload, parts.screenshots, invoices
+                    )
+            else:
+                record = self.reimbursement_service.generate(
+                    user, raw_payload, parts.screenshots
+                )
+        except InvoiceLimitExceeded as error:
+            self._json(handler, 403, {"error": str(error), "upgrade_url": "/profile"})
+            return
         except (ReimbursementValidationError, ValueError, UnicodeError) as error:
             self._json(handler, 400, {"error": str(error) or "报销请求格式错误"})
             return
-
-        try:
-            upload_directory = tempfile.TemporaryDirectory(prefix="reimbursement-upload-")
-            try:
-                image_paths = []
-                for index, (filename, data) in enumerate(screenshots):
-                    image_path = Path(upload_directory.name) / f"{index:04d}-{filename}"
-                    image_path.write_bytes(data)
-                    image_paths.append(image_path)
-                record = self.reimbursement_service.generate(
-                    user, raw_payload, image_paths
-                )
-            finally:
-                try:
-                    upload_directory.cleanup()
-                except Exception as cleanup_error:
-                    _LOGGER.error(
-                        "reimbursement upload cleanup failed exception=%s",
-                        type(cleanup_error).__name__,
-                    )
         except ReimbursementGenerationError as error:
             self._json(handler, 500, {"error": str(error)})
             return
+        finally:
+            try:
+                upload_directory.cleanup()
+            except Exception as cleanup_error:
+                _LOGGER.error(
+                    "reimbursement upload cleanup failed exception=%s",
+                    type(cleanup_error).__name__,
+                )
 
         record_payload = self._record_payload(record)
         self._json(
@@ -948,7 +1289,7 @@ class WebApplication:
             },
         )
 
-    def _multipart_body(self, handler: BaseHTTPRequestHandler) -> bytes | None:
+    def _multipart_body(self, handler: BaseHTTPRequestHandler, directory: Path) -> UploadParts | None:
         length_headers = handler.headers.get_all("Content-Length", failobj=[])
         length_header = length_headers[0] if len(length_headers) == 1 else None
         if (
@@ -961,16 +1302,21 @@ class WebApplication:
             self._json(handler, 400, {"error": "请求体长度无效"})
             return None
         length = int(length_header, 10)
-        if length > self.config.max_body_bytes:
-            handler.close_connection = True
-            self._json(handler, 413, {"error": "请求体过大"})
-            return None
         content_type = handler.headers.get("Content-Type", "")
         if content_type.split(";", 1)[0].strip().lower() != "multipart/form-data":
             self._json(handler, 415, {"error": "仅支持 multipart/form-data"})
             return None
+        header = Message()
+        header["Content-Type"] = content_type
+        boundary = header.get_boundary()
+        if boundary is None:
+            handler.close_connection = True
+            self._json(handler, 400, {"error": "multipart boundary 缺失"})
+            return None
         try:
-            body = handler.read_request_body(length)
+            return parse_multipart_upload(
+                handler.iter_request_body(length), boundary.encode("ascii"), directory
+            )
         except TimeoutError:
             handler.close_connection = True
             self._json(
@@ -980,16 +1326,15 @@ class WebApplication:
                 headers={"Connection": "close"},
             )
             return None
-        if len(body) != length:
+        except (ValueError, UnicodeEncodeError) as error:
             handler.close_connection = True
             self._json(
                 handler,
                 400,
-                {"error": "请求体不完整"},
+                {"error": str(error) or "请求体格式错误"},
                 headers={"Connection": "close"},
             )
             return None
-        return body
 
     @staticmethod
     def _reimbursement_parts(handler: BaseHTTPRequestHandler) -> tuple[str, str] | None:
@@ -1010,8 +1355,17 @@ class WebApplication:
     @staticmethod
     def _record_payload(record: ReimbursementRecord) -> dict:
         root = f"/api/reimbursements/{record.id}"
+        form_type = "travel"
+        if record.payload_json:
+            try:
+                source = json.loads(record.payload_json)
+                if isinstance(source, dict) and source.get("form_type") == "expense":
+                    form_type = "expense"
+            except (TypeError, ValueError):
+                pass
         payload = {
             "id": record.id,
+            "form_type": form_type,
             "reimbursement_date": record.reimbursement_date,
             "display_name": record.display_name,
             "reason": record.reason,
@@ -1042,7 +1396,7 @@ class WebApplication:
         self._template_page(handler, template, csrf_token)
 
     def _template_page(self, handler, name: str, csrf_token: str, *, scope: str | None = None) -> None:
-        allowed = {"setup.html", "login.html", "register.html", "change-password.html", "history.html", "admin.html"}
+        allowed = {"setup.html", "login.html", "register.html", "change-password.html", "index.html", "history.html", "admin.html", "profile.html"}
         if name not in allowed:
             self._json(handler, 500, {"error": "页面模板不可用"})
             return
@@ -1052,6 +1406,10 @@ class WebApplication:
         except (OSError, UnicodeError):
             self._json(handler, 500, {"error": "页面模板不可用"})
             return
+        if self.app_version is None:
+            self._json(handler, 500, {"error": "页面模板不可用"})
+            return
+        markup = markup.replace("__APP_VERSION__", html.escape(self.app_version))
         markup = markup.replace(
             'data-csrf="__CSRF_TOKEN__"',
             f'data-csrf="{html.escape(csrf_token, quote=True)}"',
@@ -1066,7 +1424,8 @@ class WebApplication:
         csrf_attribute = "" if csrf_token is None else f' data-csrf="{html.escape(csrf_token)}"'
         markup = (
             "<!doctype html><html lang=\"zh-CN\"><head><meta charset=\"utf-8\">"
-            f"<title>{html.escape(title)}</title></head>"
+            f"<title>{html.escape(SITE_NAME)}</title>"
+            '<link rel="icon" type="image/png" href="/static/favicon.png"></head>'
             f"<body{csrf_attribute}><main><h1>{html.escape(title)}</h1></main></body></html>"
         )
         return markup.encode("utf-8")
@@ -1175,6 +1534,13 @@ class WebApplication:
 
     def _login_failed(self, handler: BaseHTTPRequestHandler) -> None:
         self._json(handler, 401, {"error": "用户名或密码错误"})
+
+    def _login_locked(self, handler: BaseHTTPRequestHandler, remaining: int) -> None:
+        self._json(
+            handler, 429,
+            {"error": f"登录失败 5 次，已锁定 {remaining} 秒", "lock_seconds": remaining},
+            headers={"Retry-After": str(remaining)},
+        )
 
     def _rate_limited(self, handler: BaseHTTPRequestHandler, key: Hashable) -> bool:
         retry_after = self.rate_limiter.reserve(key)

@@ -6,7 +6,7 @@ APP_DIR = Path(__file__).resolve().parents[1]
 if str(APP_DIR) not in sys.path:
     sys.path.insert(0, str(APP_DIR))
 
-from validation import ValidationError, safe_output_stem, validate_image_filename, validate_payload
+from validation import ValidationError, safe_output_stem, validate_image_filename, validate_invoice_filename, validate_payload
 
 
 def payload(**overrides):
@@ -35,6 +35,12 @@ def payload(**overrides):
 
 
 class ValidationTest(unittest.TestCase):
+    def test_invoice_filename_accepts_pdf_only_without_path_components(self):
+        self.assertEqual(validate_invoice_filename("发票.PDF"), "发票.PDF")
+        for filename in ("invoice.png", "../invoice.pdf", "folder/invoice.pdf", "a\\b.pdf", "bad\n.pdf"):
+            with self.subTest(filename=filename), self.assertRaises(ValidationError):
+                validate_invoice_filename(filename)
+
     def test_formula_leading_text_is_rejected(self):
         for field in ("department", "traveler", "reason"):
             with self.subTest(field=field), self.assertRaises(ValidationError):

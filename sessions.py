@@ -31,6 +31,7 @@ class AuthenticatedUser:
     role: str
     must_change_password: bool
     csrf_token: str
+    release_notes_version: str | None = None
 
 
 class SessionService:
@@ -43,13 +44,17 @@ class SessionService:
         self._clock = clock or (lambda: datetime.now(timezone.utc))
 
     def issue(
-        self, authenticated_user: object, now: datetime | None = None
+        self, authenticated_user: object, now: datetime | None = None,
+        *, release_notes_version: str | None = None,
     ) -> IssuedSession:
         """Issue a session from a current authentication snapshot."""
-        return self.issue_authenticated(authenticated_user, now)
+        return self.issue_authenticated(
+            authenticated_user, now, release_notes_version=release_notes_version
+        )
 
     def issue_authenticated(
-        self, authenticated_user: object, now: datetime | None = None
+        self, authenticated_user: object, now: datetime | None = None,
+        *, release_notes_version: str | None = None,
     ) -> IssuedSession:
         """Issue only when the authentication snapshot remains current."""
         if (
@@ -64,6 +69,7 @@ class SessionService:
             authenticated_user.password_version,
             authenticated_user.status_version,
             now,
+            release_notes_version,
         )
 
     def _issue(
@@ -72,6 +78,7 @@ class SessionService:
         password_version: int,
         status_version: int,
         now: datetime | None,
+        release_notes_version: str | None,
     ) -> IssuedSession:
         if not _valid_user_id(user_id):
             raise ValueError("active user required")
@@ -79,23 +86,29 @@ class SessionService:
         expires_at = issued_at + _SESSION_LIFETIME
         with self._database.transaction(immediate=True) as connection:
             user = connection.execute(
-                """SELECT id FROM users
+                """SELECT id, must_change_password, release_notes_seen_version FROM users
                 WHERE id = ? AND status = 'active'
                 AND password_version = ? AND status_version = ?""",
                 (user_id, password_version, status_version),
             ).fetchone()
             if user is None:
                 raise ValueError("authentication is no longer valid")
+            pending_version = (
+                release_notes_version
+                if release_notes_version and not user["must_change_password"]
+                and user["release_notes_seen_version"] != release_notes_version
+                else None
+            )
             token = secrets.token_urlsafe(32)
             csrf_token = secrets.token_urlsafe(32)
             token_hash = _token_hash(token)
             connection.execute("DELETE FROM sessions WHERE user_id = ?", (user_id,))
             connection.execute(
-                """INSERT INTO sessions(token_hash, user_id, csrf_token, created_at, expires_at)
-                VALUES (?, ?, ?, ?, ?)""",
+                """INSERT INTO sessions(token_hash, user_id, csrf_token, created_at, expires_at,
+                release_notes_pending_version) VALUES (?, ?, ?, ?, ?, ?)""",
                 (
                     token_hash, user_id, csrf_token, issued_at.isoformat(),
-                    expires_at.isoformat(),
+                    expires_at.isoformat(), pending_version,
                 ),
             )
         return IssuedSession(token=token, csrf_token=csrf_token, expires_at=expires_at)
@@ -110,6 +123,7 @@ class SessionService:
         with self._database.transaction(immediate=True) as connection:
             row = connection.execute(
                 """SELECT sessions.user_id, sessions.csrf_token, sessions.expires_at,
+                    sessions.release_notes_pending_version,
                     users.username, users.real_name, users.department, users.role,
                     users.status, users.must_change_password
                 FROM sessions JOIN users ON users.id = sessions.user_id
@@ -135,7 +149,30 @@ class SessionService:
                 role=row["role"],
                 must_change_password=bool(row["must_change_password"]),
                 csrf_token=row["csrf_token"],
+                release_notes_version=row["release_notes_pending_version"],
             )
+
+    def acknowledge_release_notes(self, token: object, version: str) -> bool:
+        token_hash = _safe_token_hash(token)
+        if token_hash is None or not isinstance(version, str) or not version:
+            return False
+        with self._database.transaction(immediate=True) as connection:
+            session = connection.execute(
+                """SELECT user_id FROM sessions WHERE token_hash = ?
+                AND release_notes_pending_version = ?""",
+                (token_hash, version),
+            ).fetchone()
+            if session is None:
+                return False
+            connection.execute(
+                "UPDATE users SET release_notes_seen_version = ? WHERE id = ?",
+                (version, session["user_id"]),
+            )
+            connection.execute(
+                "UPDATE sessions SET release_notes_pending_version = NULL WHERE token_hash = ?",
+                (token_hash,),
+            )
+            return True
 
     @staticmethod
     def verify_csrf(user: object, submitted: object) -> bool:

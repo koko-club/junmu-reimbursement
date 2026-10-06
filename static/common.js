@@ -12,7 +12,7 @@
     const response = await fetch(path, request);
     let data = {};
     try { data = await response.json(); } catch (_) { data = {}; }
-    if (response.status === 401) {
+    if (response.status === 401 && path !== '/api/login') {
       window.location.assign('/login');
       throw new Error(data.error || '登录已失效');
     }
@@ -20,7 +20,20 @@
       window.location.assign(data.next);
       throw new Error(data.error || '请先完成必要操作');
     }
-    if (!response.ok) throw new Error(data.error || '请求失败，请稍后重试');
+    if (!response.ok) {
+      const error = new Error(data.error || '请求失败，请稍后重试');
+      if (typeof data.field === 'string') error.field = data.field;
+      if (typeof data.upgrade_url === 'string') error.upgradeUrl = data.upgrade_url;
+      if (path === '/api/login' && response.status === 429) {
+        if (Number.isFinite(data.lock_seconds) && data.lock_seconds > 0) {
+          error.lockSeconds = data.lock_seconds;
+        } else {
+          const retryAfter = Number(response.headers.get('Retry-After'));
+          if (Number.isFinite(retryAfter) && retryAfter > 0) error.retryAfter = retryAfter;
+        }
+      }
+      throw error;
+    }
     return data;
   };
 
@@ -45,6 +58,19 @@
       const user = data && data.user;
       const displayName = user && user.username;
       if (displayName) currentUser.textContent = displayName;
+      if (data && typeof data.release_notes_version === 'string') {
+        const version = data.release_notes_version;
+        function showPendingReleaseNotes() {
+          if (typeof window.showVersionDetails !== 'function' || !window.showVersionDetails(version)) return;
+          window.apiFetch('/api/release-notes/seen', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': data.csrf_token },
+            body: JSON.stringify({ version: version })
+          }).catch(function () {});
+        }
+        if (typeof window.showVersionDetails === 'function') showPendingReleaseNotes();
+        else document.addEventListener('DOMContentLoaded', showPendingReleaseNotes, { once: true });
+      }
     }).catch(function () {});
   }
 }());

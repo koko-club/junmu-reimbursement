@@ -139,6 +139,27 @@ class WebAuthenticationTest(unittest.TestCase):
         pending = next(user for user in self.running.users.list_pending(admin.id) if user.username == username)
         return self.running.users.approve(admin.id, pending.id)
 
+    def test_personal_profile_update_is_self_scoped_and_csrf_protected(self):
+        self.setup_admin()
+        self.register()
+        self.approve_user()
+        user_client = self.running.new_client()
+        payload = {"real_name": "李明", "department": "市场部"}
+        self.assertEqual(self.client.post_json("/api/profile", payload, csrf=False).status, 401)
+        self.assertEqual(user_client.post_json(
+            "/api/login", {"username": "alice", "password": USER_PASSWORD}
+        ).status, 200)
+        self.assertEqual(user_client.post_json("/api/profile", payload, csrf=False).status, 403)
+        self.assertEqual(user_client.post_json(
+            "/api/profile", {**payload, "username": "other"}
+        ).status, 400)
+        response = user_client.post_json("/api/profile", payload)
+        self.assertEqual(response.status, 200, response.text)
+        self.assertEqual(response.json()["user"]["username"], "alice")
+        self.assertEqual(response.json()["user"]["real_name"], "李明")
+        self.assertEqual(response.json()["user"]["status"], "active")
+        self.assertEqual(user_client.get("/api/session").json()["user"]["department"], "市场部")
+
     def test_rendered_pages_expose_site_metadata_and_favicon(self):
         title_pattern = re.compile(
             r"<title(?:\s+data-page-title)?[^>]*>在线报销系统</title>"
@@ -153,6 +174,10 @@ class WebAuthenticationTest(unittest.TestCase):
         self.assertEqual(favicon_response.status, 200)
         self.assertEqual(favicon_response.headers["Content-Type"], "image/png")
         self.assertEqual(favicon_response.body[:8], b"\x89PNG\r\n\x1a\n")
+        self.assertEqual(
+            hashlib.sha256(favicon_response.body).hexdigest(),
+            "0e11960647ac87168036ad7ad78e8e7a10aaf40b659d7fa5d7fe7f1d9f7c6015",
+        )
 
         self.assertEqual(self.setup_admin().status, 201)
         for path in ("/login", "/register"):
@@ -184,7 +209,7 @@ class WebAuthenticationTest(unittest.TestCase):
             ).status,
             200,
         )
-        for path in ("/", "/history", "/trash"):
+        for path in ("/", "/history", "/trash", "/profile"):
             with self.subTest(path=path):
                 response = user_client.get(path)
                 self.assertEqual(response.status, 200)
@@ -329,13 +354,16 @@ class WebAuthenticationTest(unittest.TestCase):
             },
         )
         token = self.client.csrf_for("/api/login")
-        for _ in range(5):
+        for _ in range(4):
             self.assertEqual(
                 self.client.post_json(
                     "/api/login", {"username": None, "password": USER_PASSWORD}, csrf=token
                 ).status,
                 401,
             )
+        self.assertEqual(self.client.post_json(
+            "/api/login", {"username": None, "password": USER_PASSWORD}, csrf=token
+        ).status, 429)
         self.assertEqual(
             self.client.post_json(
                 "/api/login",
@@ -370,14 +398,14 @@ class WebAuthenticationTest(unittest.TestCase):
                     "/api/register",
                     {
                         "username": f"user{index}", "password": USER_PASSWORD,
-                        "real_name": "A", "department": "D",
+                        "real_name": "张三", "department": "技术部",
                     },
                     csrf=token,
                 )
                 self.assertEqual(response.status, 201)
             limited = self.client.post_json(
                 "/api/register",
-                {"username": "user5", "password": USER_PASSWORD, "real_name": "A", "department": "D"},
+                {"username": "user5", "password": USER_PASSWORD, "real_name": "张三", "department": "技术部"},
                 csrf=token,
             )
         self.assertEqual(limited.status, 429)
@@ -393,7 +421,7 @@ class WebAuthenticationTest(unittest.TestCase):
         self.setup_admin()
         hasher = self.running.users._password_hasher
         with mock.patch.object(hasher, "verify", wraps=hasher.verify) as verify:
-            for username in (" ADMIN ", "admin", "ＡＤＭＩＮ", "Admin", "admin"):
+            for username in (" ADMIN ", "admin", "ＡＤＭＩＮ", "Admin"):
                 response = self.client.post_json(
                     "/api/login", {"username": username, "password": "wrong-password"}
                 )
@@ -401,13 +429,52 @@ class WebAuthenticationTest(unittest.TestCase):
             limited = self.client.post_json(
                 "/api/login", {"username": "admin", "password": "wrong-password"}
             )
+            still_limited = self.client.post_json(
+                "/api/login", {"username": "admin", "password": "wrong-password"}
+            )
             other_key = self.client.post_json(
                 "/api/login", {"username": "someone-else", "password": "wrong-password"}
             )
         self.assertEqual(limited.status, 429)
+        self.assertEqual(still_limited.status, 429)
         self.assertGreaterEqual(int(limited.headers["Retry-After"]), 1)
         self.assertEqual(other_key.status, 401)
         self.assertEqual(verify.call_count, 6)
+
+    def test_fifth_failed_login_locks_account_for_sixty_seconds(self):
+        self.setup_admin()
+        now = [100.0]
+        application = self.running.server.application
+        application.login_failure_limiter = web.LoginFailureLimiter(clock=lambda: now[0])
+        token = self.client.csrf_for("/api/login")
+        hasher = self.running.users._password_hasher
+
+        with mock.patch.object(hasher, "verify", wraps=hasher.verify) as verify:
+            for _ in range(4):
+                response = self.client.post_json(
+                    "/api/login", {"username": "admin", "password": "wrong-password"}, csrf=token
+                )
+                self.assertEqual(response.status, 401)
+            now[0] = 120.0
+            fifth = self.client.post_json(
+                "/api/login", {"username": "admin", "password": "wrong-password"}, csrf=token
+            )
+            self.assertEqual(fifth.status, 429)
+            self.assertEqual(fifth.headers["Retry-After"], "60")
+            self.assertEqual(fifth.json()["lock_seconds"], 60)
+            now[0] = 150.2
+            blocked = self.client.post_json(
+                "/api/login", {"username": "admin", "password": ADMIN_PASSWORD}, csrf=token
+            )
+            self.assertEqual(blocked.status, 429)
+            self.assertEqual(blocked.json()["lock_seconds"], 30)
+            self.assertEqual(verify.call_count, 5)
+
+            now[0] = 180.0
+            allowed = self.client.post_json(
+                "/api/login", {"username": "admin", "password": ADMIN_PASSWORD}, csrf=token
+            )
+            self.assertEqual(allowed.status, 200)
 
     def test_login_rotating_usernames_is_stopped_by_independent_ip_budget(self):
         self.assertEqual(
@@ -476,11 +543,10 @@ class WebAuthenticationTest(unittest.TestCase):
                     )
                     self.assertEqual(response.status, 401)
 
-        login_keys = [
-            key
-            for key in self.running.server.application.rate_limiter._attempts
-            if isinstance(key, tuple) and str(key[0]).startswith("login")
-        ]
+        application = self.running.server.application
+        login_keys = list(application.rate_limiter._attempts) + list(
+            application.login_failure_limiter._failures
+        )
 
         def strings(value):
             if isinstance(value, str):
@@ -525,16 +591,16 @@ class WebAuthenticationTest(unittest.TestCase):
                 )
                 statuses.append(response.status)
 
-        self.assertEqual(statuses, [401] * 5 + [429])
+        self.assertEqual(statuses, [401] * 4 + [429] * 2)
         self.assertEqual(verify.call_count, 5)
         log_exception.assert_not_called()
         invalid_identity = ("invalid", "<invalid>")
         client_ip = "127.0.0.1"
-        for key in (
+        self.assertIn(
             ("login-account-ip", invalid_identity, client_ip),
-            ("login-ip", client_ip),
-            ("login-global",),
-        ):
+            application.login_failure_limiter._locked_until,
+        )
+        for key in (("login-ip", client_ip), ("login-global",)):
             with self.subTest(key=key):
                 self.assertEqual(len(application.rate_limiter._attempts[key]), 5)
 
@@ -593,7 +659,7 @@ class WebAuthenticationTest(unittest.TestCase):
         )
         self.assertEqual(len(limiter_identity[1]), 64)
 
-        for _ in range(5):
+        for _ in range(4):
             self.assertEqual(
                 self.client.post_json(
                     "/api/login",
@@ -602,6 +668,9 @@ class WebAuthenticationTest(unittest.TestCase):
                 ).status,
                 401,
             )
+        self.assertEqual(self.client.post_json(
+            "/api/login", {"username": None, "password": "wrong-password"}, csrf=token
+        ).status, 429)
 
         response = self.client.post_json(
             "/api/login",
@@ -656,7 +725,7 @@ class WebAuthenticationTest(unittest.TestCase):
             ).status,
             200,
         )
-        for _ in range(5):
+        for _ in range(4):
             self.assertEqual(
                 self.client.post_json(
                     "/api/login", {"username": "Admin", "password": "wrong-password"},
@@ -680,8 +749,9 @@ class WebAuthenticationTest(unittest.TestCase):
         payload = response.json()
         self.assertEqual(
             set(payload["user"]),
-            {"id", "username", "real_name", "department", "role", "must_change_password"},
+            {"id", "username", "real_name", "department", "role", "status", "must_change_password"},
         )
+        self.assertEqual(payload["user"]["status"], "active")
         self.assertTrue(payload["csrf_token"])
         serialized = response.body.lower()
         for forbidden in (b"password_version", b"status_version", b"password_hash", b"password_salt"):
@@ -697,6 +767,7 @@ class WebAuthenticationTest(unittest.TestCase):
             "/api/login", {"username": "alice", "password": temporary_password}
         ).status, 200)
         self.assertEqual(self.client.get("/api/session").status, 200)
+        self.assertNotIn("release_notes_version", self.client.get("/api/session").json())
         self.assertEqual(self.client.get("/change-password").status, 200)
         root = self.client.get("/", follow_redirects=False)
         self.assertEqual((root.status, root.headers["Location"]), (303, "/change-password"))
@@ -761,6 +832,65 @@ class WebAuthenticationTest(unittest.TestCase):
         self.assertEqual(user_login.json()["next"], "/")
         self.assertEqual(user_client.get("/").status, 200)
         self.assertEqual(user_client.get("/login", follow_redirects=False).headers["Location"], "/")
+
+    def test_authenticated_pages_render_repository_version_without_marker(self):
+        self.setup_admin()
+        admin_login = self.client.post_json(
+            "/api/login", {"username": "admin", "password": ADMIN_PASSWORD}
+        )
+        self.assertEqual(admin_login.status, 200)
+        registration_client = self.running.new_client()
+        self.assertEqual(registration_client.post_json(
+            "/api/register",
+            {
+                "username": "alice",
+                "password": USER_PASSWORD,
+                "real_name": "张三",
+                "department": "技术部",
+            },
+        ).status, 201)
+        self.approve_user()
+        user_client = self.running.new_client()
+        self.assertEqual(user_client.post_json(
+            "/api/login", {"username": "alice", "password": USER_PASSWORD}
+        ).status, 200)
+        version = (ROOT / "VERSION").read_text(encoding="utf-8").strip()
+
+        for client, path in (
+            (user_client, "/"),
+            (user_client, "/history"),
+            (self.client, "/admin"),
+        ):
+            with self.subTest(path=path):
+                response = client.get(path)
+                self.assertEqual(response.status, 200)
+                self.assertIn(
+                    f'<div class="sidebar-version">版本：<button id="version-details-trigger" class="version-details-trigger" type="button" aria-haspopup="dialog" aria-controls="version-details-dialog" aria-label="查看版本更新详情"><span id="app-version">{version}</span></button></div>',
+                    response.text,
+                )
+                self.assertNotIn("__APP_VERSION__", response.text)
+
+    def test_release_notes_show_once_after_successful_login_for_admin_and_new_user(self):
+        self.setup_admin()
+        self.register()
+        self.approve_user()
+        version = (ROOT / "VERSION").read_text(encoding="utf-8").strip()
+        for username, password, client in (
+            ("admin", ADMIN_PASSWORD, self.client),
+            ("alice", USER_PASSWORD, self.running.new_client()),
+        ):
+            with self.subTest(username=username):
+                login = client.post_json("/api/login", {"username": username, "password": password})
+                self.assertEqual(login.status, 200)
+                session = client.get("/api/session")
+                self.assertEqual(session.json().get("release_notes_version"), version)
+                self.assertEqual(client.post_json("/api/release-notes/seen", {"version": version}, csrf=False).status, 403)
+                self.assertEqual(client.post_json("/api/release-notes/seen", {"version": "v0.0.0"}).status, 400)
+                self.assertEqual(client.post_json("/api/release-notes/seen", {"version": version}).status, 200)
+                self.assertNotIn("release_notes_version", client.get("/api/session").json())
+                second = self.running.new_client()
+                self.assertEqual(second.post_json("/api/login", {"username": username, "password": password}).status, 200)
+                self.assertNotIn("release_notes_version", second.get("/api/session").json())
 
     def test_json_parsing_rejects_size_content_type_syntax_and_non_objects(self):
         self.setup_admin()
@@ -1020,6 +1150,86 @@ class AdminApiTest(unittest.TestCase):
             "real_name": "张三", "department": "技术部",
         }).status, 201)
 
+    def test_delete_user_requires_admin_password_and_removes_records_files_and_session(self):
+        user = self.approved()
+        member = self.login_user()
+        other = self.pending("bob")
+        other = self.running.users.approve(self.admin.id, other.id)
+        record_id = "1d6dc850-2907-4c83-8d63-e96a9005da13"
+        trashed_id = "771b1c5d-787f-440b-900d-7b3ad37fc0ac"
+        owner_dir = self.running.data_dir / "users" / str(user.id)
+        record_dir = owner_dir / record_id
+        record_dir.mkdir(parents=True)
+        (record_dir / "claim.xlsx").write_bytes(b"xlsx")
+        (record_dir / "claim.pdf").write_bytes(b"pdf")
+        (record_dir / "invoice.pdf").write_bytes(b"invoice")
+        trashed_dir = owner_dir / trashed_id
+        trashed_dir.mkdir()
+        (trashed_dir / "old.pdf").write_bytes(b"old")
+        other_dir = self.running.data_dir / "users" / str(other.id)
+        other_dir.mkdir(parents=True)
+        (other_dir / "keep.txt").write_text("keep")
+        with self.running.server.database.transaction(immediate=True) as connection:
+            connection.execute(
+                """INSERT INTO reimbursements(id, user_id, display_name, xlsx_path,
+                pdf_path, created_at, deleted_at) VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (record_id, user.id, "claim.xlsx", f"users/{user.id}/{record_id}/claim.xlsx",
+                 f"users/{user.id}/{record_id}/claim.pdf", "2026-10-01T00:00:00+00:00", None),
+            )
+            connection.execute(
+                """INSERT INTO reimbursements(id, user_id, display_name, xlsx_path,
+                pdf_path, created_at, deleted_at) VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (trashed_id, user.id, "old.xlsx", f"users/{user.id}/{trashed_id}/old.xlsx",
+                 f"users/{user.id}/{trashed_id}/old.pdf", "2026-09-01T00:00:00+00:00",
+                 "2026-09-02T00:00:00+00:00"),
+            )
+        path = f"/api/admin/users/{user.id}/delete"
+        self.assertEqual(self.client.post_json(path, {"password": ADMIN_PASSWORD}, csrf=False).status, 403)
+        self.assertEqual(self.client.post_json(path, {"password": "wrong-password"}).status, 403)
+        self.assertTrue(owner_dir.exists())
+        self.assertEqual(member.get("/api/session").status, 200)
+        response = self.client.post_json(path, {"password": ADMIN_PASSWORD})
+        self.assertEqual(response.status, 200, response.text)
+        self.assertEqual(self.client.get("/api/admin/users").json()["users"][0]["id"], other.id)
+        self.assertFalse(owner_dir.exists())
+        self.assertEqual(list((self.running.data_dir / "users").glob(".deleting-*")), [])
+        self.assertTrue((other_dir / "keep.txt").exists())
+        self.assertEqual(member.get("/api/session").status, 401)
+        with self.running.server.database.transaction() as connection:
+            self.assertIsNone(connection.execute("SELECT id FROM users WHERE id = ?", (user.id,)).fetchone())
+            self.assertIsNone(connection.execute("SELECT id FROM reimbursements WHERE user_id = ?", (user.id,)).fetchone())
+        self.assertEqual(self.client.post_json(path, {"password": ADMIN_PASSWORD}).status, 404)
+
+    def test_delete_user_rejects_admin_target_and_bad_payload(self):
+        user = self.approved()
+        for payload in ({}, {"password": ""}, {"password": ADMIN_PASSWORD, "confirm": True}):
+            self.assertEqual(self.client.post_json(f"/api/admin/users/{user.id}/delete", payload).status, 400)
+        self.assertEqual(self.client.post_json(
+            f"/api/admin/users/{self.admin.id}/delete", {"password": ADMIN_PASSWORD}
+        ).status, 403)
+        self.assertEqual(self.running.users.get(user.id).status, "active")
+
+    def test_delete_user_reports_when_file_cleanup_fails_after_account_removal(self):
+        user = self.approved()
+        owner_dir = self.running.data_dir / "users" / str(user.id)
+        owner_dir.mkdir(parents=True)
+        (owner_dir / "private.txt").write_text("private")
+        with mock.patch("users.shutil.rmtree", side_effect=OSError("storage failure")), mock.patch("users._LOGGER"):
+            response = self.client.post_json(
+                f"/api/admin/users/{user.id}/delete", {"password": ADMIN_PASSWORD}
+            )
+        self.assertEqual(response.status, 500)
+        self.assertIn("用户已删除", response.json()["error"])
+        self.assertNotIn(user.id, [item["id"] for item in self.client.get("/api/admin/users").json()["users"]])
+
+    def test_delete_user_password_guesses_are_rate_limited(self):
+        user = self.approved()
+        path = f"/api/admin/users/{user.id}/delete"
+        for _ in range(5):
+            self.assertEqual(self.client.post_json(path, {"password": "wrong-password"}).status, 403)
+        self.assertEqual(self.client.post_json(path, {"password": ADMIN_PASSWORD}).status, 429)
+        self.assertEqual(self.running.users.get(user.id).id, user.id)
+
     def test_every_admin_route_requires_active_admin(self):
         user = self.approved()
         member = self.login_user()
@@ -1030,6 +1240,7 @@ class AdminApiTest(unittest.TestCase):
             ("POST", f"/api/admin/users/{user.id}/profile"),
             ("POST", f"/api/admin/users/{user.id}/status"),
             ("POST", f"/api/admin/users/{user.id}/reset-password"),
+            ("POST", f"/api/admin/users/{user.id}/delete"),
         ]
         anonymous = self.running.new_client()
         for client, expected in ((anonymous, 401), (member, 403)):
@@ -1051,6 +1262,7 @@ class AdminApiTest(unittest.TestCase):
             (f"/api/admin/users/{pending.id}/profile", "update_profile"),
             (f"/api/admin/users/{pending.id}/status", "set_enabled"),
             (f"/api/admin/users/{pending.id}/reset-password", "reset_password"),
+            (f"/api/admin/users/{pending.id}/delete", "delete_user"),
         ]
         for path, operation in cases:
             with self.subTest(path=path), mock.patch.object(self.running.users, operation) as action:
@@ -1067,6 +1279,7 @@ class AdminApiTest(unittest.TestCase):
             ("registrations", "approve", {}), ("registrations", "reject", {}),
             ("users", "profile", {"real_name": "攻击", "department": "攻击"}),
             ("users", "status", {"enabled": False}), ("users", "reset-password", {}),
+            ("users", "delete", {"password": ADMIN_PASSWORD}),
         ]
         before = self.running.users.get(self.admin.id)
         for section, action, payload in cases:
@@ -1089,7 +1302,7 @@ class AdminApiTest(unittest.TestCase):
                     self.assertEqual(response.status, 404)
         for path in ("/api/admin/users/1/approve", "/api/admin/registrations/1/status",
                      "/api/admin/users/1/reset-password/extra", "/api/admin/users/1/reset-password/",
-                     "/api/admin/users//status", "/api/admin/users/1/delete"):
+                     "/api/admin/users//status", "/api/admin/users/1/unknown"):
             with self.subTest(path=path):
                 self.assertEqual(self.client.post_json(path, {}, csrf=False).status, 404)
         response = self.client.post_json("/api/admin/users/9223372036854775807/reset-password", {})

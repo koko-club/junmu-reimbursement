@@ -46,12 +46,12 @@ class PasswordHasherTest(unittest.TestCase):
     def test_hash_rejects_non_strings_and_out_of_range_unicode_lengths(self):
         hasher = PasswordHasher()
 
-        for value in (None, b"password", 1234, "a" * 7, "a" * 129):
+        for value in (None, b"password", 1234, "a" * 5, "a" * 129):
             with self.subTest(value=value):
                 with self.assertRaises(ValueError):
                     hasher.hash(value)
 
-        self.assertTrue(hasher.verify("a" * 8, hasher.hash("a" * 8)))
+        self.assertTrue(hasher.verify("a" * 6, hasher.hash("a" * 6)))
         self.assertTrue(hasher.verify("a" * 128, hasher.hash("a" * 128)))
 
     def test_verify_uses_the_parameters_stored_with_material(self):

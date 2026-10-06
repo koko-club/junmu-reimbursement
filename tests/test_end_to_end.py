@@ -16,14 +16,10 @@ if str(APP_DIR) not in sys.path:
     sys.path.insert(0, str(APP_DIR))
 
 from generator import generate_workbook
-from office import OfficeError, export_pdf, find_soffice
+from office import BUNDLED_SOFFICE, OfficeError, export_pdf, find_soffice
 
 
 TEMPLATE = APP_DIR / "resources" / "差旅报销单模板.xlsx"
-BUNDLED_SOFFICE = Path(
-    "/Users/koko/.cache/codex-runtimes/codex-primary-runtime/"
-    "dependencies/bin/override/soffice"
-)
 
 
 def complete_payload() -> dict:
@@ -99,7 +95,7 @@ class EndToEndTest(unittest.TestCase):
             try:
                 self.assertEqual(workbook.sheetnames, ["差旅报销单", "里程截图01", "里程截图02"])
                 ws = workbook["差旅报销单"]
-                self.assertEqual(ws.max_row, 62)
+                self.assertEqual(ws.max_row, 23)
                 self.assertEqual(ws["A3"].value, "报销日期：2026/09/04")
                 self.assertEqual(ws["B4"].value, "技术部")
                 self.assertEqual(ws["B5"].value, long_traveler)
@@ -107,7 +103,7 @@ class EndToEndTest(unittest.TestCase):
                 self.assertEqual(ws["J7"].value, 2)
                 self.assertEqual(ws["K7"].value, "=J7*77.5")
                 self.assertEqual(ws["L5"].value, "附\n单\n据\n\n张")
-                self.assertEqual(ws["A25"].value, "详见后附里程截图，共 2 张")
+                self.assertEqual(ws.print_area, "'差旅报销单'!$A$1:$L$23")
 
                 self.assertEqual(ws["G9"].value, '=IF(F9*1=0,"",F9*1)')
                 self.assertEqual(ws["G10"].value, '=IF(F10*1=0,"",F10*1)')
@@ -156,12 +152,68 @@ class EndToEndTest(unittest.TestCase):
                 if PdfReader is not None:
                     reader = PdfReader(str(first_pdf))
                     self.assertGreaterEqual(len(reader.pages), 3)
+                    first_page = reader.pages[0]
+                    self.assertAlmostEqual(float(first_page.mediabox.width), 595.28, delta=1)
+                    self.assertAlmostEqual(float(first_page.mediabox.height), 841.89, delta=1)
+                    text_positions = {}
+
+                    def collect_text(text, cm, tm, _font, _size):
+                        if text.strip() in {"差旅费用报销单", "审核人"}:
+                            text_positions[text.strip()] = cm[5] + tm[5]
+
+                    first_page.extract_text(visitor_text=collect_text)
+                    page_height = float(first_page.mediabox.height)
+                    form_top = page_height - text_positions["差旅费用报销单"]
+                    form_bottom = page_height - text_positions["审核人"]
+                    self.assertAlmostEqual((form_top + form_bottom) / 2, page_height / 4, delta=12)
+                    from pypdf.generic import ContentStream
+
+                    operations = ContentStream(first_page.get_contents(), reader).operations
+                    midpoint = page_height / 2
+                    guide_points = [
+                        (op, float(args[0]), float(args[1]))
+                        for args, op in operations
+                        if op in (b"m", b"l") and len(args) == 2
+                        and abs(float(args[1]) - midpoint) < 1
+                    ]
+                    self.assertEqual([point[0] for point in guide_points], [b"m", b"l"])
+                    self.assertAlmostEqual(guide_points[1][1] - guide_points[0][1], 72 * 2 / 25.4, delta=0.5)
+                    self.assertAlmostEqual(guide_points[1][1], float(first_page.mediabox.width) - 18, delta=1)
+                    strokes = []
+                    stroke_width = None
+                    start = end = None
+                    for args, operator in operations:
+                        if operator == b"w":
+                            stroke_width = float(args[0])
+                        elif operator == b"m":
+                            start = tuple(map(float, args))
+                        elif operator == b"l":
+                            end = tuple(map(float, args))
+                        elif operator == b"S" and start and end:
+                            strokes.append((*start, *end, stroke_width))
+                            start = end = None
+                    right_edge = [
+                        line for line in strokes
+                        if 560 < line[0] < 563 and abs(line[0] - line[2]) < 0.1
+                        and abs(line[1] - line[3]) > 10
+                    ]
+                    self.assertTrue(right_edge)
+                    self.assertGreater(max(abs(line[1] - line[3]) for line in right_edge), 200)
+                    self.assertTrue(all(line[4] >= 1.5 for line in right_edge), "right outer border is thin")
+                    full_width_lines = [
+                        line for line in strokes
+                        if line[0] < 30 and line[2] > 550 and abs(line[1] - line[3]) < 0.1
+                    ]
+                    bottom_edge = min(full_width_lines, key=lambda line: line[1])
+                    self.assertGreaterEqual(bottom_edge[4], 1.5, "bottom outer border is thin")
                     first_text = reader.pages[0].extract_text() or ""
                     self.assertIn("差旅费用报销单", first_text)
                     self.assertIn("2026/09/04", first_text)
                     self.assertIn(long_traveler, first_text)
                     self.assertNotIn("Err:502", first_text)
                     self.assertIn("伍佰陆拾柒元伍角", first_text)
+                    self.assertNotIn("里程粘贴区", first_text)
+                    self.assertNotIn("详见后附里程截图", first_text)
                     appendix_one_text = reader.pages[1].extract_text() or ""
                     appendix_two_text = reader.pages[2].extract_text() or ""
                     self.assertIn("1/2", appendix_one_text)

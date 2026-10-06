@@ -75,8 +75,10 @@ class GeneratorTest(unittest.TestCase):
             wb = load_workbook(result["path"], data_only=False)
             self.assertEqual(wb.sheetnames, ["差旅报销单"])
             ws = wb["差旅报销单"]
-            self.assertEqual(ws.max_row, 62)
-            self.assertEqual(ws.print_area, "'差旅报销单'!$A$1:$L$62")
+            self.assertEqual(ws.max_row, 23)
+            self.assertEqual(ws.print_area, "'差旅报销单'!$A$1:$L$23")
+            self.assertNotIn("A25:K62", {str(merged) for merged in ws.merged_cells.ranges})
+            self.assertIsNone(ws["L23"].border.bottom)
             self.assertFalse(ws.sheet_view.showGridLines)
             self.assertAlmostEqual(ws.page_margins.top, 0.1)
             self.assertEqual(ws["A3"].value, "报销日期：2026/09/04")
@@ -86,7 +88,6 @@ class GeneratorTest(unittest.TestCase):
             self.assertEqual(ws["J7"].value, 2)
             self.assertEqual(ws["K7"].value, "=J7*50")
             self.assertEqual(ws["L5"].value, "附\n单\n据\n\n张")
-            self.assertEqual(ws["A25"].value, "详见后附里程截图，共 0 张")
             self.assertEqual(ws["A22"].value, "审核人:")
             self.assertEqual(ws["J22"].value, "报销人:")
             self.assertEqual(ws["A9"].value, "2026-09-01")
@@ -113,7 +114,7 @@ class GeneratorTest(unittest.TestCase):
             ws = wb["差旅报销单"]
             self.assertEqual(ws["K7"].value, "=J7*77.5")
             self.assertEqual(ws["L5"].value, "附\n单\n据\n\n张")
-            self.assertEqual(ws["A25"].value, "详见后附里程截图，共 1 张")
+            self.assertEqual(ws.max_row, 23)
             self.assertEqual(result["screenshot_count"], 1)
 
     def test_blank_dates_remain_blank_in_generated_form(self):

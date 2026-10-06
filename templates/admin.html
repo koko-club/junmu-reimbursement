@@ -3,17 +3,23 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>系统管理</title>
+  <title>在线报销系统</title>
+  <link rel="icon" type="image/png" href="/static/favicon.png">
+  <script src="/static/sidebar.js?v=20261001-release-notes-onboarding"></script>
   <link rel="stylesheet" href="/static/styles.css?v=20260909-account">
+  <link rel="stylesheet" href="/static/ui-tokens.css">
+  <link rel="stylesheet" href="/static/ui-components.css?v=20261001-release-notes">
 </head>
 <body class="app-body" data-csrf="__CSRF_TOKEN__">
   <aside id="app-sidebar" class="app-sidebar" aria-label="主导航">
     <div class="brand"><img class="brand-logo" src="/static/logo.png" alt="" aria-hidden="true"><span>君牧在线报销系统</span></div>
-    <nav><a href="/admin" aria-current="page">系统管理</a><a href="/change-password">修改密码</a></nav>
+    <nav><a href="/admin" aria-label="系统管理" aria-current="page"><svg class="ui-icon" aria-hidden="true"><use href="/static/icons.svg#user-round"></use></svg><span>系统管理</span></a><a href="/change-password" aria-label="修改密码"><svg class="ui-icon" aria-hidden="true"><use href="/static/icons.svg?v=20261001-collapse#key-round"></use></svg><span>修改密码</span></a></nav>
     <div class="sidebar-account" aria-live="polite"><span>当前登录：</span><strong id="current-user">加载中</strong></div>
-    <button id="logout" type="button" class="secondary">退出登录</button>
+    <div class="sidebar-version">版本：<button id="version-details-trigger" class="version-details-trigger" type="button" aria-haspopup="dialog" aria-controls="version-details-dialog" aria-label="查看版本更新详情"><span id="app-version">__APP_VERSION__</span></button></div>
+    <button id="logout" type="button" class="secondary" aria-label="退出登录"><svg class="ui-icon" aria-hidden="true"><use href="/static/icons.svg?v=20261001-collapse#log-out"></use></svg><span>退出登录</span></button>
   </aside>
   <button id="sidebar-toggle" class="sidebar-toggle" type="button" aria-controls="app-sidebar" aria-expanded="false">菜单</button>
+  <button id="sidebar-collapse" class="sidebar-collapse" type="button" aria-controls="app-sidebar" aria-expanded="false" aria-label="展开侧边栏"><svg class="ui-icon" aria-hidden="true"><use href="/static/icons.svg?v=20261001-double-chevron#chevrons-right"></use></svg></button>
   <main class="page-shell admin-page">
     <header class="page-header"><h1>系统管理</h1><p>审批注册申请并维护普通用户账号。</p></header>
     <section class="form-section" aria-labelledby="pending-heading">
@@ -26,11 +32,13 @@
       <div class="section-heading"><h2 id="users-heading">用户管理</h2></div>
       <div id="users-error" class="result error" role="alert" aria-live="assertive"></div>
       <div id="users-empty" class="empty-state" hidden>暂无普通用户</div>
-      <div class="table-wrap"><table class="admin-table"><thead><tr><th>账号</th><th>姓名</th><th>部门</th><th>状态</th><th>操作</th></tr></thead><tbody id="users-rows"></tbody></table></div>
+      <div class="table-wrap"><table class="admin-table users-table"><thead><tr><th>账号</th><th>姓名</th><th>部门</th><th>状态</th><th>操作</th></tr></thead><tbody id="users-rows"></tbody></table></div>
     </section>
     <dialog id="profile-dialog" aria-labelledby="profile-title"><form method="dialog" class="dialog-form" data-profile-form><h2 id="profile-title">编辑用户资料</h2><input type="hidden" name="user_id"><label for="profile-real-name">姓名<input id="profile-real-name" name="real_name" required></label><label for="profile-department">部门<input id="profile-department" name="department" required></label><p class="form-message" data-dialog-message aria-live="polite"></p><div class="dialog-actions"><button type="submit" value="cancel" class="secondary">取消</button><button type="submit" value="save">保存</button></div></form></dialog>
-    <dialog id="temporary-password-dialog" aria-labelledby="temporary-password-title"><form method="dialog" class="dialog-form" data-password-form><h2 id="temporary-password-title">临时密码</h2><p>请将临时密码交给用户，并提醒其登录后立即修改。</p><output id="temporary-password" class="temporary-password" aria-live="polite"></output><div class="dialog-actions"><button type="button" class="secondary" data-copy-password>复制密码</button><button type="submit" value="close">关闭</button></div></form></dialog>
+    <dialog id="temporary-password-dialog" aria-labelledby="temporary-password-title"><form method="dialog" class="dialog-form" data-password-form><h2 id="temporary-password-title">临时密码</h2><p>请将临时密码交给用户，并提醒其登录后立即修改。</p><output id="temporary-password" class="temporary-password" aria-live="polite"></output><div class="dialog-actions"><button type="button" class="secondary" data-copy-password>复制密码</button><button type="submit" value="close" class="secondary">关闭</button></div></form></dialog>
+    <dialog id="delete-warning-dialog" aria-labelledby="delete-warning-title"><div class="dialog-form"><h2 id="delete-warning-title">危险！</h2><p>此操作会删除当前用户所有数据，包括全部报销记录和文件，且无法恢复。</p><p>即将删除：<strong id="delete-target-name"></strong></p><div class="dialog-actions"><button type="button" class="secondary" data-delete-cancel>取消</button><button type="button" class="danger" data-delete-continue>确定</button></div></div></dialog>
+    <dialog id="delete-verify-dialog" aria-labelledby="delete-verify-title"><form class="dialog-form" id="delete-verify-form"><h2 id="delete-verify-title">验证管理员账号</h2><p>请输入当前管理员账号的密码，验证通过后将永久删除该用户。</p><label for="delete-admin-password">管理员密码<input id="delete-admin-password" name="password" type="password" autocomplete="current-password" required></label><p class="form-message error" id="delete-verify-error" role="alert" aria-live="assertive"></p><div class="dialog-actions"><button type="button" class="secondary" data-delete-verify-cancel>取消</button><button type="submit" class="danger">最终删除</button></div></form></dialog>
   </main>
-  <script src="/static/common.js?v=20260909-account" defer></script><script src="/static/admin.js" defer></script>
+  <script src="/static/common.js?v=20261001-release-notes-onboarding" defer></script><script src="/static/admin.js" defer></script>
 </body>
 </html>
